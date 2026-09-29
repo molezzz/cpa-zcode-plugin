@@ -1,3 +1,6 @@
 # 本地 checkout 的嵌套仓库，不纳入本仓库版本管理
 # 上游: git@github.com:liu5269/zcode2api.git
 docs/zcode2api/
+
+# 上游: git@github.com:rensumo/cpa-plugin-zcode.git
+docs/cpa-plugin-zcode/
