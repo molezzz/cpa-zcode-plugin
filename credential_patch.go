@@ -12,9 +12,11 @@ const zcodeNamespace = "zcode"
 
 // patchZcodeNamespace decodes the host auth document losslessly, hands the
 // plugin-owned zcode namespace to fn for mutation, and re-encodes the whole
-// document. Unknown fields anywhere in the document and numeric precision
-// survive the round trip: numbers are decoded as json.Number and re-marshaled
-// byte-exact. An empty document starts a fresh one containing only the
+// document. Unknown fields anywhere in the document survive the round trip,
+// and numeric literals keep their exact text (including big integers beyond
+// float64 range) because values are decoded as json.Number. Note that Go
+// re-encoding may normalize object key order; only values are guaranteed
+// byte-identical. An empty document starts a fresh one containing only the
 // namespace. The input document is never mutated; when fn returns an error no
 // output is produced.
 func patchZcodeNamespace(doc []byte, fn func(zcode map[string]any) error) ([]byte, error) {

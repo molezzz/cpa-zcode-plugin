@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -146,6 +148,35 @@ func TestLifecycleMethodsAcknowledge(t *testing.T) {
 		env := callMethod(t, method, nil)
 		if !env.OK {
 			t.Errorf("%s failed: %+v", method, env.Error)
+		}
+	}
+}
+
+// TestConfigFieldsMatchConfigSchema guards the single source of truth: the
+// config fields advertised at registration must be exactly the yaml keys of
+// the config snapshot, so renaming one side fails here instead of rotting.
+func TestConfigFieldsMatchConfigSchema(t *testing.T) {
+	declared := map[string]bool{}
+	for _, field := range pluginRegistration().Metadata.ConfigFields {
+		declared[field.Name] = true
+	}
+	yamlKeys := map[string]bool{}
+	configType := reflect.TypeOf(Config{})
+	for i := 0; i < configType.NumField(); i++ {
+		tag := configType.Field(i).Tag.Get("yaml")
+		name := strings.Split(tag, ",")[0]
+		if name != "" && name != "-" {
+			yamlKeys[name] = true
+		}
+	}
+	for name := range declared {
+		if !yamlKeys[name] {
+			t.Errorf("declared config field %q has no yaml key in Config", name)
+		}
+	}
+	for name := range yamlKeys {
+		if !declared[name] {
+			t.Errorf("config yaml key %q is not advertised in registration ConfigFields", name)
 		}
 	}
 }

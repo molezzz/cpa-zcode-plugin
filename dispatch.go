@@ -160,10 +160,15 @@ func okEnvelope(value any) ([]byte, error) {
 }
 
 func errorEnvelope(code, message string, status int) []byte {
-	raw, _ := json.Marshal(pluginabi.Envelope{
+	raw, err := json.Marshal(pluginabi.Envelope{
 		OK:    false,
 		Error: &pluginabi.Error{Code: code, Message: message, HTTPStatus: status},
 	})
+	if err != nil {
+		// Marshalling a plain struct cannot fail in practice; the fallback
+		// keeps the ABI contract "a non-zero return code carries an envelope".
+		return []byte(`{"ok":false,"error":{"code":"plugin_error","message":"plugin error envelope failed to encode"}}`)
+	}
 	return raw
 }
 

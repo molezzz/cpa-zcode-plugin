@@ -56,11 +56,15 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
+
+// maxABIErrorMessage bounds error text before it crosses the ABI boundary.
+const maxABIErrorMessage = 512
 
 // cliproxy_plugin_init is the single entry point the CPA host resolves after
 // dlopen. It stores the host callback table and fills the plugin function
@@ -98,7 +102,8 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		writeResponse(response, errorEnvelope("invalid_method", "method is required", http.StatusBadRequest))
 		return 1
 	}
-	if requestLen > C.size_t(int(^uint(0)>>1)) {
+	// C.GoBytes takes a C.int, so requests beyond int32 cannot be copied.
+	if requestLen > C.size_t(math.MaxInt32) {
 		writeResponse(response, errorEnvelope("invalid_request", "request too large", http.StatusBadRequest))
 		return 1
 	}
@@ -110,7 +115,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 
 	raw, err := invokeWithRecover(C.GoString(method), requestBytes)
 	if err != nil {
-		writeResponse(response, errorEnvelope("plugin_error", truncateForLog(err.Error(), 512), http.StatusInternalServerError))
+		writeResponse(response, errorEnvelope("plugin_error", truncateForLog(err.Error(), maxABIErrorMessage), http.StatusInternalServerError))
 		return 1
 	}
 	writeResponse(response, raw)
@@ -161,6 +166,9 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 type cgoHostCaller struct{}
 
 func (cgoHostCaller) call(method string, request []byte) ([]byte, error) {
+	if len(request) > math.MaxInt32 {
+		return nil, fmt.Errorf("host call %s request exceeds %d bytes", method, math.MaxInt32)
+	}
 	cMethod := C.CString(method)
 	defer C.free(unsafe.Pointer(cMethod))
 

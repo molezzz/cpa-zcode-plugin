@@ -34,7 +34,8 @@ func (e *hostCallError) Error() string {
 }
 
 // Host exposes the host capabilities the plugin consumes, isolated from the
-// C ABI. Concrete DTOs mirror the current CPA plugin protocol.
+// C ABI. Contexts are accepted now for future cancellation wiring; the
+// current C bridge carries no cancellation, so calls are uninterruptible.
 type Host interface {
 	AuthStore() AuthStore
 	Streams() StreamSink
@@ -64,8 +65,8 @@ type rpcHost struct {
 	caller hostCaller
 }
 
-func (h rpcHost) AuthStore() AuthStore { return authStore{caller: h.caller} }
-func (h rpcHost) Streams() StreamSink  { return streamSink{caller: h.caller} }
+func (h rpcHost) AuthStore() AuthStore { return authStore{rpcHost{caller: h.caller}} }
+func (h rpcHost) Streams() StreamSink  { return streamSink{rpcHost{caller: h.caller}} }
 
 // invoke marshals request (nil sends an empty payload), performs the host
 // call, decodes the envelope, and returns the result payload.
@@ -98,14 +99,21 @@ func (h rpcHost) invoke(method string, request any) (json.RawMessage, error) {
 	return env.Result, nil
 }
 
-type authStore struct {
-	caller hostCaller
+// requireValue rejects blank identifiers before they cross the host boundary.
+func requireValue(value, field string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", fmt.Errorf("%s is required", field)
+	}
+	return trimmed, nil
 }
 
-func (s authStore) host() rpcHost { return rpcHost{caller: s.caller} }
+type authStore struct {
+	rpcHost
+}
 
 func (s authStore) List(ctx context.Context) ([]pluginapi.HostAuthFileEntry, error) {
-	result, err := s.host().invoke(pluginabi.MethodHostAuthList, nil)
+	result, err := s.invoke(pluginabi.MethodHostAuthList, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -119,10 +127,10 @@ func (s authStore) List(ctx context.Context) ([]pluginapi.HostAuthFileEntry, err
 }
 
 func (s authStore) Get(ctx context.Context, authIndex string) (json.RawMessage, error) {
-	if strings.TrimSpace(authIndex) == "" {
-		return nil, fmt.Errorf("auth index is required")
+	if _, err := requireValue(authIndex, "auth index"); err != nil {
+		return nil, err
 	}
-	result, err := s.host().invoke(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: authIndex})
+	result, err := s.invoke(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: authIndex})
 	if err != nil {
 		return nil, err
 	}
@@ -134,10 +142,10 @@ func (s authStore) Get(ctx context.Context, authIndex string) (json.RawMessage, 
 }
 
 func (s authStore) GetRuntime(ctx context.Context, authIndex string) (pluginapi.HostAuthFileEntry, error) {
-	if strings.TrimSpace(authIndex) == "" {
-		return pluginapi.HostAuthFileEntry{}, fmt.Errorf("auth index is required")
+	if _, err := requireValue(authIndex, "auth index"); err != nil {
+		return pluginapi.HostAuthFileEntry{}, err
 	}
-	result, err := s.host().invoke(pluginabi.MethodHostAuthGetRuntime, pluginapi.HostAuthGetRequest{AuthIndex: authIndex})
+	result, err := s.invoke(pluginabi.MethodHostAuthGetRuntime, pluginapi.HostAuthGetRequest{AuthIndex: authIndex})
 	if err != nil {
 		return pluginapi.HostAuthFileEntry{}, err
 	}
@@ -152,15 +160,13 @@ func (s authStore) Save(ctx context.Context, name string, document json.RawMessa
 	if !strings.HasSuffix(name, ".json") {
 		return fmt.Errorf("auth file name %q must end with .json", name)
 	}
-	_, err := s.host().invoke(pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{Name: name, JSON: document})
+	_, err := s.invoke(pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{Name: name, JSON: document})
 	return err
 }
 
 type streamSink struct {
-	caller hostCaller
+	rpcHost
 }
-
-func (s streamSink) host() rpcHost { return rpcHost{caller: s.caller} }
 
 // streamEmitRequest mirrors the host-side RPC schema for stream chunks.
 type streamEmitRequest struct {
@@ -176,17 +182,17 @@ type streamCloseRequest struct {
 }
 
 func (s streamSink) Emit(ctx context.Context, streamID string, payload []byte) error {
-	if strings.TrimSpace(streamID) == "" {
-		return fmt.Errorf("stream id is required")
+	if _, err := requireValue(streamID, "stream id"); err != nil {
+		return err
 	}
-	_, err := s.host().invoke(pluginabi.MethodHostStreamEmit, streamEmitRequest{StreamID: streamID, Payload: payload})
+	_, err := s.invoke(pluginabi.MethodHostStreamEmit, streamEmitRequest{StreamID: streamID, Payload: payload})
 	return err
 }
 
 func (s streamSink) Close(ctx context.Context, streamID, errorMessage string) error {
-	if strings.TrimSpace(streamID) == "" {
-		return fmt.Errorf("stream id is required")
+	if _, err := requireValue(streamID, "stream id"); err != nil {
+		return err
 	}
-	_, err := s.host().invoke(pluginabi.MethodHostStreamClose, streamCloseRequest{StreamID: streamID, Error: errorMessage})
+	_, err := s.invoke(pluginabi.MethodHostStreamClose, streamCloseRequest{StreamID: streamID, Error: errorMessage})
 	return err
 }

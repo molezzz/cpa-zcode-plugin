@@ -18,7 +18,7 @@ ifeq ($(GOOS),linux)
 SMOKE_LDFLAGS = -ldl
 endif
 
-.PHONY: build test vet fmt smoke check clean
+.PHONY: build test vet fmt smoke test-bridge check clean
 
 build:
 	mkdir -p $(BUILD_DIR)
@@ -26,6 +26,11 @@ build:
 
 test:
 	go test ./...
+
+# The plugin->host C bridge round trip needs cgo, which this toolchain does
+# not allow in _test.go files; the driver lives behind the cgobridge_test tag.
+test-bridge:
+	go test -tags cgobridge_test ./...
 
 vet:
 	go vet ./...
@@ -37,7 +42,7 @@ smoke: build
 	$(CC) test/abi_smoke.c -o $(SMOKE_BIN) $(SMOKE_LDFLAGS)
 	$(SMOKE_BIN) $(PLUGIN_OUTPUT)
 
-check: vet test smoke
+check: vet test test-bridge smoke
 
 clean:
 	rm -rf $(BUILD_DIR)
