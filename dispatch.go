@@ -81,13 +81,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Provider: pluginID,
 			Models:   staticModels(currentConfig()),
 		})
-	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
-		// model.for_auth serves the static catalog until identity-scoped
-		// dynamic discovery lands; no dynamic result exists at this baseline.
+	case pluginabi.MethodModelStatic:
 		return okEnvelope(pluginapi.ModelResponse{
 			Provider: pluginID,
 			Models:   staticModels(currentConfig()),
 		})
+	case pluginabi.MethodModelForAuth:
+		return handleModelForAuth(request)
 	case pluginabi.MethodAuthIdentifier:
 		return handleAuthIdentifier()
 	case pluginabi.MethodAuthParse:

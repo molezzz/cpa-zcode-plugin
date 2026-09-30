@@ -8,8 +8,22 @@ import (
 
 const pluginID = "zcode"
 
+// modelInfo builds one catalog entry. Config-provided models are marked
+// user-defined; dynamically discovered supplements are not.
+func modelInfo(id string, userDefined bool) pluginapi.ModelInfo {
+	return pluginapi.ModelInfo{
+		ID:                         id,
+		Object:                     "model",
+		OwnedBy:                    pluginID,
+		DisplayName:                id,
+		Name:                       id,
+		SupportedGenerationMethods: []string{"chat"},
+		UserDefined:                userDefined,
+	}
+}
+
 // staticModels builds the always-available model catalog from the config
-// snapshot. Dynamic discovery (later milestone) may only extend this list.
+// snapshot. Dynamic discovery may only extend this list.
 func staticModels(cfg Config) []pluginapi.ModelInfo {
 	ids := normalizeModelIDs(cfg.Models)
 	if len(ids) == 0 {
@@ -17,15 +31,7 @@ func staticModels(cfg Config) []pluginapi.ModelInfo {
 	}
 	models := make([]pluginapi.ModelInfo, 0, len(ids))
 	for _, id := range ids {
-		models = append(models, pluginapi.ModelInfo{
-			ID:                         id,
-			Object:                     "model",
-			OwnedBy:                    pluginID,
-			DisplayName:                id,
-			Name:                       id,
-			SupportedGenerationMethods: []string{"chat"},
-			UserDefined:                true,
-		})
+		models = append(models, modelInfo(id, true))
 	}
 	return models
 }
