@@ -120,27 +120,32 @@ func quotaGet(ctx context.Context, url string, jwt string) ([]byte, int, error) 
 
 // quotaAuthFailure maps one billing HTTP outcome onto the credential
 // conclusion it implies. Only credential-rejecting statuses conclude
-// something; the classification mirrors the Messages endpoint's rules — a
-// captcha-bearing 403 is a verification block, any other 401/403 rejects the
-// credential, and the 402 status itself is the payment verdict. Everything
-// else is a transport or schema concern, not a credential state.
+// something, and the class rules are the shared credentialRejectionClass —
+// the same ruleset the Messages executor applies, so a billing rejection and
+// a Messages rejection of the same credential always classify alike. The
+// quota-specific codes and messages name the billing surface; everything else
+// is a transport or schema concern, not a credential state.
 func quotaAuthFailure(status int, body []byte) *upstreamFailure {
-	switch {
-	case status == http.StatusForbidden && containsMarker(string(body), captchaMarkers):
+	class, rejected := credentialRejectionClass(status, string(body))
+	if !rejected {
+		return nil
+	}
+	switch class {
+	case failureVerificationBlocked:
 		return &upstreamFailure{
 			Class:          failureVerificationBlocked,
 			UpstreamStatus: status,
 			Code:           "quota_verification_required",
 			Message:        "upstream verification is required before the Coding Plan credential can be used; no verification is automated",
 		}
-	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+	case failureInvalid:
 		return &upstreamFailure{
 			Class:          failureInvalid,
 			UpstreamStatus: status,
 			Code:           "quota_credential_invalid",
 			Message:        "upstream rejected the credential during the quota check; refresh it or complete the ZCode login again",
 		}
-	case status == http.StatusPaymentRequired:
+	case failureExhausted:
 		return &upstreamFailure{
 			Class:          failureExhausted,
 			UpstreamStatus: status,
@@ -192,7 +197,7 @@ func fetchQuotaEvidence(ctx context.Context, jwt string) quotaEvidence {
 	}
 
 	evidence.Verdict, evidence.Reason = balanceVerdict(balances)
-	evidence.finish()
+	evidence.renderView()
 	return evidence
 }
 
@@ -376,10 +381,10 @@ func balanceVerdict(balances []quotaBalance) (quotaVerdict, string) {
 	}
 }
 
-// finish renders the normalized management view of the evidence: the
-// subscription summary and the per-balance metrics and buckets. Only explicit
-// numbers are rendered; nothing defaults to zero.
-func (e *quotaEvidence) finish() {
+// renderView renders the normalized host/management view of the evidence into
+// its Subscription, Summary, and Groups fields. Only explicit numbers are
+// rendered; nothing defaults to zero.
+func (e *quotaEvidence) renderView() {
 	if e.Plan != "" {
 		e.Subscription = &pluginapi.QuotaSubscription{Plan: e.Plan}
 	}
@@ -440,10 +445,18 @@ func quotaStateUpdates(evidence quotaEvidence, now time.Time) []recordedState {
 	}
 	switch evidence.Verdict {
 	case verdictExhausted:
+		// The balance reading is explicit zero evidence, but it was gathered
+		// before this write: a credential the Messages endpoint has since
+		// rejected (invalid) must not be silently cleared by the older
+		// reading, because invalid recovers through a credential refresh or a
+		// re-login only. Cooldown, verification-blocked, and active states may
+		// be overwritten — a billing endpoint that authenticated and reported
+		// the balance is the stronger, fresher statement about those.
 		return []recordedState{{
-			Kind:   CredentialJWT,
-			Status: jwtStatusExhausted,
-			Code:   "quota_exhausted",
+			Kind:        CredentialJWT,
+			Status:      jwtStatusExhausted,
+			Code:        "quota_exhausted",
+			NotIfStatus: jwtStatusInvalid,
 		}}
 	case verdictAvailable:
 		// Explicit positive balance restores an exhausted credential — the

@@ -251,9 +251,6 @@ func TestManagementHandleServesPageAndUnknownRoutes(t *testing.T) {
 	if !strings.Contains(page, "textContent") {
 		t.Error("the page must write dynamic content through textContent")
 	}
-	if !strings.Contains(page, "innerHTML") {
-		// reversed check below; innerHTML must not be used at all
-	}
 	if strings.Contains(page, "innerHTML") {
 		t.Error("the page must not use innerHTML")
 	}
@@ -741,5 +738,99 @@ func TestOAuthRetryUpstreamFailureIsSanitized(t *testing.T) {
 	}
 	if data["error"].(map[string]any)["code"] != "oauth_upstream_failed" {
 		t.Fatalf("error = %v, want oauth_upstream_failed", data["error"])
+	}
+}
+
+func TestRefreshCredentialRestoresExhaustedAPIKey(t *testing.T) {
+	fixture := newManagementFixture(t)
+	fixture.accountDoc(t, "auth-keyexp", "zcode-keyexp-user", "active", "key-material-exp")
+
+	// Mark the managed API key exhausted the way an upstream 402 would.
+	doc := fixture.savedDoc(t, "auth-keyexp")
+	zcode := doc["zcode"].(map[string]any)
+	zcode["api_key"].(map[string]any)["status"] = apiKeyStatusExhausted
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.store.mu.Lock()
+	fixture.store.docs["auth-keyexp"] = raw
+	fixture.store.mu.Unlock()
+
+	// The billing surface does not exist for the managed key, so the
+	// credential refresh's successful probe is the only recovery evidence.
+	status, data := fixture.callAction(t, actionRefreshCredential, "auth-keyexp")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body %v, want 200", status, data)
+	}
+	credentials := data["credentials"].([]any)
+	var keyOutcome map[string]any
+	for _, item := range credentials {
+		view := item.(map[string]any)
+		if view["credential"] == "api_key" {
+			keyOutcome = view
+		}
+	}
+	if keyOutcome == nil || keyOutcome["status"] != apiKeyStatusActive {
+		t.Fatalf("api_key outcome = %v, want %q", keyOutcome, apiKeyStatusActive)
+	}
+	saved := fixture.savedDoc(t, "auth-keyexp")
+	savedKey := saved["zcode"].(map[string]any)["api_key"].(map[string]any)
+	if savedKey["status"] != apiKeyStatusActive {
+		t.Fatalf("persisted api_key status = %v, want active", savedKey["status"])
+	}
+}
+
+func TestRefreshQuotaExhaustedDoesNotOverwriteInvalid(t *testing.T) {
+	fixture := newManagementFixture(t)
+	fixture.accountDoc(t, "auth-stale", "zcode-stale-user", "invalid", "key-material-stale")
+	// Explicit zero-balance evidence fetched while the persisted conclusion
+	// is invalid: the older quota reading must not clear the newer invalid
+	// state, because invalid recovers through a credential refresh only.
+	fixture.billBody = balanceBody(balanceRow("GLM Coding", 100.0, 100.0, 0.0))
+
+	status, data := fixture.callAction(t, actionRefreshQuota, "auth-stale")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body %v, want 200", status, data)
+	}
+	if got := jwtStatusOf(t, fixture.savedDoc(t, "auth-stale")); got != jwtStatusInvalid {
+		t.Fatalf("persisted jwt status = %q, want invalid to survive the stale quota write", got)
+	}
+}
+
+func TestQuotaViewKeepsMalformedBalanceRowsVisible(t *testing.T) {
+	fixture := newManagementFixture(t)
+	fixture.accountDoc(t, "auth-drift", "zcode-drift-user", "active", "key-material-drift")
+	// One drifted row (string remaining_units) next to a well-typed row: the
+	// drift shrinks that row's evidence to unknown but must not hide it.
+	fixture.billBody = balanceBody(
+		balanceRow("GLM Coding", 100.0, 30.0, 70.0),
+		`{"show_name":"GLM Vision","remaining_units":"60"}`,
+	)
+
+	status, data := fixture.callAction(t, actionRefreshQuota, "auth-drift")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body %v, want 200", status, data)
+	}
+	quota := data["quota"].(map[string]any)
+	if quota["state"] != "ok" {
+		t.Fatalf("quota state = %v, want ok from the well-typed row", quota)
+	}
+	balances := quota["balances"].([]any)
+	var drifted map[string]any
+	for _, item := range balances {
+		view := item.(map[string]any)
+		if view["name"] == "GLM Vision" {
+			drifted = view
+		}
+	}
+	if drifted == nil {
+		t.Fatalf("balances = %v, want the drifted row to stay visible", balances)
+	}
+	if drifted["malformed"] != true {
+		t.Fatalf("drifted row = %v, want the malformed marker", drifted)
+	}
+	if drifted["remaining"] != nil || drifted["total"] != nil {
+		t.Fatalf("drifted row = %v, want no coerced numbers", drifted)
 	}
 }

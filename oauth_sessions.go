@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -96,7 +97,7 @@ func (s *authSession) pollUpstream(ctx context.Context, baseURL string, maxBytes
 	client := s.client
 	s.mu.Unlock()
 	if secret == "" || flowID == "" || client == nil {
-		return nil, 0, fmt.Errorf("authorization session is no longer usable")
+		return nil, 0, errors.New("authorization session is no longer usable")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pollEndpointURL(baseURL, flowID), nil)
 	if err != nil {

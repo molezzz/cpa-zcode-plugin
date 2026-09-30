@@ -142,7 +142,6 @@ type managementService struct {
 	recorder *credentialStateRecorder
 	catalog  *modelCatalog
 	cfg      Config
-	now      func() time.Time
 }
 
 func defaultManagementService() managementService {
@@ -152,7 +151,6 @@ func defaultManagementService() managementService {
 		recorder: credentialStates.forStore(store),
 		catalog:  activeModelCatalog,
 		cfg:      currentConfig(),
-		now:      time.Now,
 	}
 }
 
@@ -253,6 +251,10 @@ type quotaBalanceView struct {
 	Used      *float64 `json:"used,omitempty"`
 	Remaining *float64 `json:"remaining,omitempty"`
 	ExpiresAt string   `json:"expires_at,omitempty"`
+	// Malformed marks a row whose numeric fields drifted from the observed
+	// schema. It stays visible with its unknown values instead of vanishing,
+	// so the page shows the drift rather than silently hiding a balance.
+	Malformed bool `json:"malformed,omitempty"`
 }
 
 // accountView reads one auth record and renders its redacted view. A record
@@ -371,15 +373,13 @@ func quotaViewFor(observation quotaObservation) *quotaView {
 		Plan:      observation.Plan,
 	}
 	for _, balance := range observation.Balances {
-		if balance.Malformed {
-			continue
-		}
 		view.Balances = append(view.Balances, quotaBalanceView{
 			Name:      balance.Name,
 			Total:     balance.Total,
 			Used:      balance.Used,
 			Remaining: balance.Remaining,
 			ExpiresAt: balance.ExpiresAt,
+			Malformed: balance.Malformed,
 		})
 	}
 	return view
@@ -530,13 +530,19 @@ func refreshCredentialsForAccount(ctx context.Context, recorder *credentialState
 		view.Attempted = true
 		failure := probeCredential(ctx, target)
 		if failure == nil {
-			// A successful probe proves the credential authenticates; it says
-			// nothing about quota, so it never clears exhausted — that
-			// recovery belongs to the quota refresh alone.
+			// A successful probe proves the credential authenticates. For the
+			// JWT that is no evidence about quota — exhausted recovers through
+			// the quota refresh alone, so the conclusion is guarded against
+			// clearing it. The managed API key has no billing surface at all,
+			// so its probe is the only explicit recovery evidence that exists:
+			// after a 402 the same endpoint accepting the key again is what
+			// "the exhaustion cleared" observably means.
 			conclusion := recordedState{
-				Kind:        kind,
-				Status:      activeStatusFor(kind),
-				NotIfStatus: jwtStatusExhausted,
+				Kind:   kind,
+				Status: activeStatusFor(kind),
+			}
+			if kind == CredentialJWT {
+				conclusion.NotIfStatus = jwtStatusExhausted
 			}
 			writeErr := recordConclusion(ctx, recorder, authIndex, snap, doc, conclusion)
 			view.Status = conclusion.Status
@@ -656,7 +662,11 @@ func (s managementService) refreshModels(ctx context.Context, authIndex string, 
 // It creates a fresh authorization session through the same path the host's
 // native login entry uses, returns the browser authorization link, and lets
 // the plugin's own bounded poll loop complete the login into the host auth
-// store — the management page is a second entry, never a third flow.
+// store — the management page is a second entry, never a third flow. The
+// authorize URL is returned here deliberately: it is the one artifact the
+// operator must open to finish the retry, it belongs to this session alone,
+// and it dies with the session TTL. The redacted state views still never
+// carry it.
 func (s managementService) oauthRetry(authIndex string) pluginapi.ManagementResponse {
 	session, err := startAuthorizationSession(s.cfg)
 	if err != nil {
@@ -909,7 +919,14 @@ func (r *oauthRetryRunner) run(ctx context.Context, session *authSession, store 
 			// session TTL ends the flow.
 			continue
 		}
-		outcome := applyPollVerdict(pollCtx, session, body, func(identityID string, storage []byte) error {
+		outcome := applyPollVerdict(session, body, func(identityID string, storage []byte) error {
+			// The completed login replaces the record's document wholesale, so
+			// the save must hold the same per-identity lock the credential
+			// recorder holds across its read-patch-save: without it, a request
+			// whose state write was snapshotted before this save could land
+			// last and clobber the fresh login with the stale document.
+			unlock := identityLockRegistry.lock(identityLockKey(identityID, ""))
+			defer unlock()
 			return store.Save(ctx, authFileNameFor(identityID), json.RawMessage(storage))
 		})
 		if outcome.Kind != pollPending {

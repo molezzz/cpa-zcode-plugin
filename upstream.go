@@ -188,46 +188,71 @@ func containsMarker(body string, markers []string) bool {
 	return false
 }
 
+// credentialRejectionClass reports the failure class one upstream status
+// implies about the credential itself, as opposed to the request or the
+// transport. The captcha-bearing 403 is a verification block, any other
+// 401/403 rejects the credential, and the 402 status itself is the payment
+// verdict. Everything else — rate limits, 5xx, request problems — says
+// nothing about the credential, so ok is false. Every caller that maps an
+// upstream rejection onto a credential conclusion shares this one ruleset,
+// so the Messages executor and the billing checks cannot drift apart.
+func credentialRejectionClass(status int, bodyText string) (failureClass, bool) {
+	switch {
+	case status == http.StatusForbidden && containsMarker(bodyText, captchaMarkers):
+		return failureVerificationBlocked, true
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return failureInvalid, true
+	case status == http.StatusPaymentRequired:
+		return failureExhausted, true
+	default:
+		return "", false
+	}
+}
+
 // classifyUpstreamFailure turns a non-2xx upstream response into a sanitized,
 // classified failure. The body is used only for classification and, for plain
 // request-rejection classes, a bounded structured excerpt.
 func classifyUpstreamFailure(status int, body []byte) *upstreamFailure {
 	bodyText := string(body)
+	if class, rejected := credentialRejectionClass(status, bodyText); rejected {
+		switch class {
+		case failureVerificationBlocked:
+			// A verification requirement is a definitive conclusion about this
+			// credential, so the request moves on to the fallback credential
+			// instead of repeating the primary.
+			return &upstreamFailure{
+				Class:                 failureVerificationBlocked,
+				UpstreamStatus:        status,
+				ClientStatus:          http.StatusForbidden,
+				Code:                  "upstream_verification_required",
+				Message:               "upstream verification is required before the Coding Plan credential can be used; no verification is automated",
+				RetryableBeforeOutput: true,
+			}
+		case failureInvalid:
+			return &upstreamFailure{
+				Class:                 failureInvalid,
+				UpstreamStatus:        status,
+				ClientStatus:          status,
+				Code:                  "credential_invalid",
+				Message:               "upstream rejected the credential; refresh it or complete the ZCode login again",
+				RetryableBeforeOutput: true,
+			}
+		case failureExhausted:
+			// A 402 is the upstream's own payment conclusion, so the credential
+			// is recorded as exhausted regardless of what the body says: the
+			// state machine spells the status itself as the quota verdict, and
+			// the fallback key takes over the request.
+			return &upstreamFailure{
+				Class:                 failureExhausted,
+				UpstreamStatus:        status,
+				ClientStatus:          http.StatusPaymentRequired,
+				Code:                  "upstream_quota_exhausted",
+				Message:               "upstream quota is exhausted for this credential; refresh the quota to restore it",
+				RetryableBeforeOutput: true,
+			}
+		}
+	}
 	switch {
-	case status == http.StatusForbidden && containsMarker(bodyText, captchaMarkers):
-		// A verification requirement is a definitive conclusion about this
-		// credential, so the request moves on to the fallback credential
-		// instead of repeating the primary.
-		return &upstreamFailure{
-			Class:                 failureVerificationBlocked,
-			UpstreamStatus:        status,
-			ClientStatus:          http.StatusForbidden,
-			Code:                  "upstream_verification_required",
-			Message:               "upstream verification is required before the Coding Plan credential can be used; no verification is automated",
-			RetryableBeforeOutput: true,
-		}
-	case status == http.StatusUnauthorized || status == http.StatusForbidden:
-		return &upstreamFailure{
-			Class:                 failureInvalid,
-			UpstreamStatus:        status,
-			ClientStatus:          status,
-			Code:                  "credential_invalid",
-			Message:               "upstream rejected the credential; refresh it or complete the ZCode login again",
-			RetryableBeforeOutput: true,
-		}
-	case status == http.StatusPaymentRequired:
-		// A 402 is the upstream's own payment conclusion, so the credential is
-		// recorded as exhausted regardless of what the body says: the state
-		// machine spells the status itself as the quota verdict, and the
-		// fallback key takes over the request.
-		return &upstreamFailure{
-			Class:                 failureExhausted,
-			UpstreamStatus:        status,
-			ClientStatus:          http.StatusPaymentRequired,
-			Code:                  "upstream_quota_exhausted",
-			Message:               "upstream quota is exhausted for this credential; refresh the quota to restore it",
-			RetryableBeforeOutput: true,
-		}
 	case status == http.StatusTooManyRequests:
 		return &upstreamFailure{
 			Class:                 failureCooldown,

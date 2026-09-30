@@ -150,6 +150,7 @@ const managementPageHTML = `<!DOCTYPE html>
   function runAction(action, authIndex, button, row) {
     if (button.disabled) { return; }
     generation += 1;              // in-flight replies from earlier renders are void
+    var localGeneration = generation;
     busy += 1;
     setBatchDisabled(true);
     if (row) { setRowDisabled(row, true); }
@@ -161,6 +162,9 @@ const managementPageHTML = `<!DOCTYPE html>
     }).then(function (reply) {
       return reply.json().then(function (data) { return { ok: reply.ok, data: data }; });
     }).then(function (outcome) {
+      // A newer action or state fetch superseded this reply; rendering it
+      // would put a stale result over a fresh one.
+      if (localGeneration !== generation) { return; }
       if (outcome.ok) {
         show("Action " + action + (authIndex ? " for " + authIndex : "") + " finished: " +
           JSON.stringify(outcome.data, null, 2));
@@ -171,6 +175,7 @@ const managementPageHTML = `<!DOCTYPE html>
         showError("Action " + action + " failed: " + (error.message || error.code || "unknown error"));
       }
     }).catch(function () {
+      if (localGeneration !== generation) { return; }
       showError("Action " + action + " could not be sent");
     }).then(function () {
       busy -= 1;
@@ -223,7 +228,7 @@ const managementPageHTML = `<!DOCTYPE html>
     if (account.quota && account.quota.balances && account.quota.balances.length) {
       account.quota.balances.forEach(function (balance) {
         quotaCell.appendChild(el("br"));
-        text(quotaCell, balance.name + ": " +
+        text(quotaCell, balance.name + (balance.malformed ? " (schema drift)" : "") + ": " +
           (balance.remaining === null || balance.remaining === undefined ? "unknown" : balance.remaining) +
           " / " + (balance.total === null || balance.total === undefined ? "unknown" : balance.total));
       });

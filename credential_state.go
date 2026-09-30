@@ -79,10 +79,15 @@ type stateStore interface {
 // state write, so a slow store cannot hold a request hostage.
 const credentialStateStoreTimeout = 5 * time.Second
 
-// identityLocks is the plugin-wide registry of per-upstream-identity mutexes.
-// Every serialized-per-identity consumer — the credential state recorder and
-// the management actions — shares one instance, so a management refresh and a
-// request-side state write for the same account can never interleave.
+// identityLocks is a registry of per-upstream-identity mutexes. Two
+// registries exist by design: identityLockRegistry serializes the credential
+// state recorder's read-patch-save against the OAuth completion save — the
+// two writers that replace or patch the same document — while the management
+// plane holds its own registry (managementLocks) across long upstream probes.
+// The split keeps a slow management probe from stalling request-side state
+// writes; the interleaving it allows is made safe by the guarded conclusions
+// (OnlyIfStatus/NotIfStatus), which re-check the persisted state inside the
+// recorder's lock before applying.
 type identityLocks struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -134,8 +139,8 @@ func (l *identityLocks) mutexFor(key string) *sync.Mutex {
 	return lock
 }
 
-// identityLockRegistry is the shared instance. It exists at package level so
-// recorders built through forStore and management services built per request
+// identityLockRegistry is the recorder-side instance. It exists at package
+// level so recorders built through forStore and the OAuth completion save
 // serialize against the same mutexes.
 var identityLockRegistry = newIdentityLocks()
 

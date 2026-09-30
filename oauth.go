@@ -102,7 +102,7 @@ func oauthInit(ctx context.Context, client *http.Client, baseURL, pollSecret str
 	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("authorization upstream unreachable")
+		return "", "", errors.New("authorization upstream unreachable")
 	}
 	defer drainAndClose(resp.Body)
 	body, err := readLimited(resp.Body, maxOAuthBodyBytes)
@@ -199,7 +199,7 @@ func startAuthorizationSession(cfg Config) (*authSession, error) {
 	pollSecret, err := randomHexToken(pollSecretBytes)
 	if err != nil {
 		client.CloseIdleConnections()
-		return nil, fmt.Errorf("could not create authorization session")
+		return nil, errors.New("could not create authorization session")
 	}
 	flowID, authorizeURL, err := oauthInit(context.Background(), client, oauthUpstreamBase, pollSecret)
 	if err != nil {
@@ -212,7 +212,7 @@ func startAuthorizationSession(cfg Config) (*authSession, error) {
 	session, err := activeSessions.create(flowID, authorizeURL, pollSecret, client, time.Duration(cfg.OAuth.SessionTTLSeconds)*time.Second)
 	if err != nil {
 		client.CloseIdleConnections()
-		return nil, fmt.Errorf("could not create authorization session")
+		return nil, errors.New("could not create authorization session")
 	}
 	return session, nil
 }
@@ -321,8 +321,8 @@ type pollOutcome struct {
 // renders the poll reply. The credentials persist through the host: a
 // successful poll carries the completed auth record back to the host, which
 // stores it.
-func interpretPollBody(ctx context.Context, session *authSession, body []byte) ([]byte, error) {
-	return pollOutcomeReply(session, applyPollVerdict(ctx, session, body, nil)), nil
+func interpretPollBody(_ context.Context, session *authSession, body []byte) ([]byte, error) {
+	return pollOutcomeReply(session, applyPollVerdict(session, body, nil)), nil
 }
 
 // applyPollVerdict applies one upstream poll body to the session. The persist
@@ -332,7 +332,7 @@ func interpretPollBody(ctx context.Context, session *authSession, body []byte) (
 // failure fails the session: an unpersisted OAuth result must not look like a
 // completed login. A nil persist keeps the native behavior, where the host
 // persists from the poll reply.
-func applyPollVerdict(ctx context.Context, session *authSession, body []byte, persist func(identityID string, storage []byte) error) pollOutcome {
+func applyPollVerdict(session *authSession, body []byte, persist func(identityID string, storage []byte) error) pollOutcome {
 	var parsed oauthPollResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return pollOutcome{Kind: pollPending, Message: "waiting for authorization"}
