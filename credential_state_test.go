@@ -173,9 +173,6 @@ func (f *recordingForwarder) OutputStarted() bool {
 	return f.startAfter > 0 && len(f.frames) >= f.startAfter
 }
 
-// finish satisfies answerForwarder; these tests read the frames directly.
-func (f *recordingForwarder) finish() ([]byte, error) { return nil, nil }
-
 // stateRecorderStub captures the persisted state transitions without touching
 // the host auth store.
 type stateRecorderStub struct {
@@ -226,13 +223,12 @@ func runFallbackAttempt(t *testing.T, doc []byte, forwarder *recordingForwarder)
 	cfg := normalizeConfig(defaultConfig())
 	plan := executionPlan(doc, cfg, "GLM-5.2", nil, time.Now())
 	scope.Primary = plan.Primary
-	scope.SkipBlock = plan.SkipBlock
-	scope.SkipBlockStatus, scope.SkipBlockRetry = skipBlockConclusion(doc, plan.SkipBlock, fixedNow())
+	scope.SkipBlockStatus, scope.SkipBlockRetry = skipBlockConclusion(doc, plan.SkipBlockStatus, fixedNow())
 	if plan.Failure != nil {
 		return plan.Failure, nil, recorder
 	}
-	outcome, _ := runExecution(context.Background(), scope, plan.Attempts, testRequestPayload(), func() answerForwarder {
-		return forwarder
+	outcome, _ := runExecution(context.Background(), scope, plan.Attempts, testRequestPayload(), func() answerSink {
+		return answerSink{forwarder: forwarder}
 	})
 	return outcome.Failure, forwarder.frames, recorder
 }
@@ -387,8 +383,9 @@ func TestUpstreamStreamErrorEventRecordsNoState(t *testing.T) {
 	}
 	// The aggregate forwarder is the one that turns the error event into the
 	// loop's failure, so the loop must be driven through it.
-	outcome, _ := runExecution(context.Background(), scope, plan.Attempts, testRequestPayload(), func() answerForwarder {
-		return newAggregateForwarder(cfg.Upstream.MaxResponseBytes)
+	outcome, _ := runExecution(context.Background(), scope, plan.Attempts, testRequestPayload(), func() answerSink {
+		agg := newAggregateForwarder(cfg.Upstream.MaxResponseBytes)
+		return answerSink{forwarder: agg, render: agg.finish}
 	})
 	if outcome.Failure == nil || outcome.Failure.Code != "upstream_stream_error" {
 		t.Fatalf("failure = %+v, want the upstream stream error", outcome.Failure)
@@ -671,7 +668,7 @@ func TestDowngradedRequestsDoNotSlideTheRetryWindow(t *testing.T) {
 	var first time.Time
 	for _, elapsed := range []time.Duration{time.Minute, 2 * time.Minute, 3 * time.Minute} {
 		now := blockedAt.Add(elapsed)
-		status, retry := skipBlockConclusion(doc, &upstreamFailure{Code: "credential_verification_blocked"}, now)
+		status, retry := skipBlockConclusion(doc, jwtStatusVerificationBlocked, now)
 		if status != jwtStatusVerificationBlocked {
 			t.Fatalf("status = %q, want the blocked state preserved", status)
 		}
@@ -699,12 +696,12 @@ func TestDowngradedRequestsDoNotSlideTheRetryWindow(t *testing.T) {
 	}
 }
 
-// TestUnknownPreconditionCodeRecordsNothing keeps a state this build does not
+// TestUnknownSkipStatusRecordsNothing keeps a state this build does not
 // recognize from stranding an account: an unhandled conclusion is left to the
 // upstream rather than recorded as a permanent one.
-func TestUnknownPreconditionCodeRecordsNothing(t *testing.T) {
+func TestUnknownSkipStatusRecordsNothing(t *testing.T) {
 	status, retry := skipBlockConclusion(testFallbackDoc(jwtStatusActive, apiKeyStatusActive),
-		&upstreamFailure{Code: "a_code_this_build_does_not_know"}, fixedNow())
+		"a_status_this_build_does_not_know", fixedNow())
 	if status != "" || !retry.IsZero() {
 		t.Fatalf("an unknown precondition recorded %q with window %v, want nothing", status, retry)
 	}
@@ -888,24 +885,25 @@ func TestCredentialStateClassificationMatrix(t *testing.T) {
 			wantSuccessPath: false,
 		},
 		{
-			// Exhaustion carries no retry window, so it must be confirmed by the
-			// body rather than assumed from the status: a 402 raised for another
-			// reason would otherwise disable the credential until a quota
-			// refresh recovered it.
-			name:         "a 402 without an exhaustion marker records no credential state",
-			primary:      upstreamScript{status: http.StatusPaymentRequired, body: `{"error":{"message":"this account requires a billing profile"}}`},
-			wantAttempts: 1,
-			wantNoState:  true,
-			wantCode:     "upstream_rejected",
-			wantClient:   http.StatusPaymentRequired,
+			// A 402 is the upstream's own payment conclusion, so the status
+			// itself — not a body marker — decides the exhausted state. The
+			// managed key takes over the request either way.
+			name:            "a 402 without an exhaustion marker records exhaustion",
+			primary:         upstreamScript{status: http.StatusPaymentRequired, body: `{"error":{"message":"this account requires a billing profile"}}`},
+			fallback:        upstreamScript{frames: completeAnthropicSSE()},
+			wantAttempts:    2,
+			wantJWTStatus:   jwtStatusExhausted,
+			wantKeyStatus:   apiKeyStatusActive,
+			wantSuccessPath: true,
 		},
 		{
-			name:         "a 402 with an unparsable body records no credential state",
-			primary:      upstreamScript{status: http.StatusPaymentRequired, body: `payment required`},
-			wantAttempts: 1,
-			wantNoState:  true,
-			wantCode:     "upstream_rejected",
-			wantClient:   http.StatusPaymentRequired,
+			name:            "a 402 with an unparsable body records exhaustion",
+			primary:         upstreamScript{status: http.StatusPaymentRequired, body: `payment required`},
+			fallback:        upstreamScript{frames: completeAnthropicSSE()},
+			wantAttempts:    2,
+			wantJWTStatus:   jwtStatusExhausted,
+			wantKeyStatus:   apiKeyStatusActive,
+			wantSuccessPath: true,
 		},
 		{
 			name:            "a successful primary never touches the fallback key",
@@ -1047,29 +1045,19 @@ func TestNoFallbackOnceOutputReachedTheCaller(t *testing.T) {
 // TestBlockedPrimarySkipsUpstreamAndFallsBack covers the states persisted by
 // an earlier request: a blocked JWT must not reach the upstream at all.
 func TestBlockedPrimarySkipsUpstreamAndFallsBack(t *testing.T) {
-	cases := map[string]struct {
-		jwtStatus string
-		wantCode  string
-		wantClass failureClass
-	}{
-		"invalid":              {jwtStatusInvalid, "credential_invalid", failureInvalid},
-		"exhausted":            {jwtStatusExhausted, "credential_quota_exhausted", failureExhausted},
-		"verification_blocked": {jwtStatusVerificationBlocked, "credential_verification_blocked", failureVerificationBlocked},
-		"cooldown":             {jwtStatusCooldown, "credential_cooling_down", failureCooldown},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			doc := blockedWithFallback(t, tc.jwtStatus, apiKeyStatusActive)
+	for _, jwtStatus := range []string{jwtStatusInvalid, jwtStatusExhausted, jwtStatusVerificationBlocked, jwtStatusCooldown} {
+		t.Run(jwtStatus, func(t *testing.T) {
+			doc := blockedWithFallback(t, jwtStatus, apiKeyStatusActive)
 			upstream := newScriptedUpstream(t, upstreamScript{frames: completeAnthropicSSE()})
 			failure, _, recorder := runFallbackAttempt(t, doc, &recordingForwarder{})
 			if failure != nil {
 				t.Fatalf("the fallback credential should have served the request, got %+v", failure)
 			}
-			// The block that skipped the primary is persisted rather than
-			// substituted for the fallback's own conclusion.
+			// The state that skipped the primary is carried by the plan itself,
+			// so recording it never depends on failure-code spelling.
 			cfg := normalizeConfig(defaultConfig())
-			if skip := executionPlan(doc, cfg, "GLM-5.2", nil, time.Now()).SkipBlock; skip == nil || skip.Code != tc.wantCode || skip.Class != tc.wantClass {
-				t.Fatalf("skip block = %+v, want code %s class %s", skip, tc.wantCode, tc.wantClass)
+			if skip := executionPlan(doc, cfg, "GLM-5.2", nil, time.Now()).SkipBlockStatus; skip != jwtStatus {
+				t.Fatalf("skip block status = %q, want %q", skip, jwtStatus)
 			}
 			calls := upstream.calls()
 			if len(calls) != 1 {
@@ -1081,7 +1069,7 @@ func TestBlockedPrimarySkipsUpstreamAndFallsBack(t *testing.T) {
 			// The primary keeps its own block — with a window, so it recovers
 			// on its own — and the fallback records its own success. Neither
 			// conclusion touches the other credential.
-			assertRecordedState(t, recorder.forKind(CredentialJWT), tc.jwtStatus, isWindowedState(tc.jwtStatus))
+			assertRecordedState(t, recorder.forKind(CredentialJWT), jwtStatus, isWindowedState(jwtStatus))
 			assertRecordedState(t, recorder.forKind(CredentialAPIKey), apiKeyStatusActive, false)
 		})
 	}
@@ -1152,9 +1140,10 @@ func TestVerificationBlockRetryWindowElapses(t *testing.T) {
 	if plan.Primary.CredentialKind != CredentialAPIKey || len(plan.Attempts) != 1 || plan.Attempts[0].CredentialKind != CredentialAPIKey {
 		t.Fatalf("inside the retry window the jwt must be skipped: %+v", plan)
 	}
-	// The block that skipped the jwt is persisted so the loop can record it.
-	if plan.SkipBlock == nil || plan.SkipBlock.Code != "credential_verification_blocked" {
-		t.Fatalf("inside the retry window the jwt block must be carried as the skip, got %+v", plan.SkipBlock)
+	// The state that skipped the jwt is carried by the plan so the loop can
+	// record it.
+	if plan.SkipBlockStatus != jwtStatusVerificationBlocked {
+		t.Fatalf("inside the retry window the jwt block must be carried as the skip, got %q", plan.SkipBlockStatus)
 	}
 
 	// After the window the JWT is primary again, and its recorded state is
@@ -1175,8 +1164,8 @@ func TestVerificationBlockRetryWindowElapses(t *testing.T) {
 		plan.Attempts[0].CredentialKind != CredentialJWT || plan.Attempts[1].CredentialKind != CredentialAPIKey {
 		t.Fatalf("after the retry window: %+v", plan)
 	}
-	if plan.SkipBlock != nil {
-		t.Fatalf("a recovered jwt blocks nothing, want no skip block, got %+v", plan.SkipBlock)
+	if plan.SkipBlockStatus != "" {
+		t.Fatalf("a recovered jwt blocks nothing, want no skip status, got %q", plan.SkipBlockStatus)
 	}
 }
 
@@ -1230,7 +1219,7 @@ func TestCredentialStatesPersistIndependently(t *testing.T) {
 		t.Fatalf("record: %v", err)
 	}
 	if len(saved) != 1 {
-		t.Fatalf("saved %d documents, want exactly 1 per attempt", len(saved))
+		t.Fatalf("saved %d documents, want exactly 1 per request", len(saved))
 	}
 	if names[0] != "zcode-abc.json" {
 		t.Fatalf("save name = %q, want the host auth file name", names[0])

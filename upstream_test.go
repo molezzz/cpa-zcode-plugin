@@ -142,10 +142,10 @@ func TestPumpUpstreamClassifiesNon2xx(t *testing.T) {
 		{"captcha", 403, `{"error":{"message":"captcha verification required"}}`, failureVerificationBlocked, "upstream_verification_required", 403},
 		{"verify token", 403, "verify token missing", failureVerificationBlocked, "upstream_verification_required", 403},
 		{"payment required with a confirmed quota", 402, `{"error":{"message":"insufficient balance"}}`, failureExhausted, "upstream_quota_exhausted", 402},
-		// A 402 whose body names another reason is not exhaustion: the exhausted
-		// state has no retry window, so a guess would disable the credential.
-		{"payment required for another reason", 402, `{"error":{"message":"this account requires a billing profile"}}`, failureRejected, "upstream_rejected", 402},
-		{"payment required with an empty body", 402, `{}`, failureRejected, "upstream_rejected", 402},
+		// A 402 is the upstream's own payment conclusion, so the status itself
+		// — not a body marker — records the exhausted state.
+		{"payment required for another reason", 402, `{"error":{"message":"this account requires a billing profile"}}`, failureExhausted, "upstream_quota_exhausted", 402},
+		{"payment required with an empty body", 402, `{}`, failureExhausted, "upstream_quota_exhausted", 402},
 		{"verification required", 403, `{"error":{"message":"verification required"}}`, failureVerificationBlocked, "upstream_verification_required", 403},
 		{"verify token missing", 403, `{"error":{"message":"verify token missing"}}`, failureVerificationBlocked, "upstream_verification_required", 403},
 		{"quota keyword on 400 stays a rejection", 400, `{"error":{"message":"quota insufficient for this request"}}`, failureRejected, "upstream_rejected", 400},

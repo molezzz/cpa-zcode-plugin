@@ -3,9 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 )
+
+// errSSEFrameWithoutData marks a frame that carries no data payload (comments
+// and keepalives), which callers treat as "nothing to interpret" rather than
+// as an error.
+var errSSEFrameWithoutData = errors.New("sse frame has no data payload")
 
 // messageAggregator rebuilds one Anthropic Messages response object from the
 // upstream SSE event stream. It is the non-streaming side of the shared
@@ -36,8 +42,8 @@ func newMessageAggregator(limit int64) *messageAggregator {
 // observe consumes one SSE frame. Frames without data (comments, pings) are
 // ignored. A malformed or oversized stream returns an *upstreamFailure.
 func (a *messageAggregator) observe(frame []byte) error {
-	event, data, ok := parseSSEFrame(frame)
-	if !ok {
+	eventType, data, payload, err := decodeSSEEvent(frame)
+	if errors.Is(err, errSSEFrameWithoutData) {
 		return nil
 	}
 	if a.consumed+int64(len(data)) > a.limit {
@@ -49,21 +55,13 @@ func (a *messageAggregator) observe(frame []byte) error {
 		}
 	}
 	a.consumed += int64(len(data))
-
-	var payload map[string]any
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	if err := dec.Decode(&payload); err != nil {
+	if err != nil {
 		return &upstreamFailure{
 			Class:        failureInterrupted,
 			ClientStatus: http.StatusBadGateway,
 			Code:         "upstream_stream_invalid",
 			Message:      "upstream stream contained a malformed event",
 		}
-	}
-	eventType := sseString(payload["type"])
-	if eventType == "" {
-		eventType = event
 	}
 	switch eventType {
 	case "message_start":
@@ -116,6 +114,28 @@ func (a *messageAggregator) observe(frame []byte) error {
 	return nil
 }
 
+// decodeSSEEvent splits one frame and decodes its data payload as a JSON
+// object, resolving the event type from the payload's own "type" field and
+// falling back to the frame's event name. Frames without data fail with
+// errSSEFrameWithoutData; a malformed payload fails with the decode error.
+// data is returned in both cases, so a caller can still measure the frame.
+func decodeSSEEvent(frame []byte) (eventType string, data []byte, payload map[string]any, err error) {
+	event, data, ok := parseSSEFrame(frame)
+	if !ok {
+		return "", nil, nil, errSSEFrameWithoutData
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&payload); err != nil {
+		return "", data, nil, err
+	}
+	eventType = sseString(payload["type"])
+	if eventType == "" {
+		eventType = event
+	}
+	return eventType, data, payload, nil
+}
+
 // frameFailure classifies an upstream SSE frame that reports a failure in
 // band. The streaming forwarder consults it before emitting, because a stream
 // the upstream itself ends with an error event is not a successful stream and
@@ -123,21 +143,8 @@ func (a *messageAggregator) observe(frame []byte) error {
 // verdict in its own event dispatch, which is where the rest of the stream is
 // interpreted.
 func frameFailure(frame []byte) error {
-	event, data, ok := parseSSEFrame(frame)
-	if !ok {
-		return nil
-	}
-	var payload map[string]any
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	if err := dec.Decode(&payload); err != nil {
-		return nil
-	}
-	eventType := sseString(payload["type"])
-	if eventType == "" {
-		eventType = event
-	}
-	if eventType != "error" {
+	eventType, _, payload, err := decodeSSEEvent(frame)
+	if err != nil || eventType != "error" {
 		return nil
 	}
 	return upstreamErrorEvent(payload)

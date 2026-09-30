@@ -68,7 +68,7 @@ const credentialStateStoreTimeout = 5 * time.Second
 
 // credentialStateRecorder writes credential state transitions back to the
 // host auth store. Transitions are serialized per upstream identity, and one
-// attempt's conclusions land as exactly one lossless save, so concurrent
+// request's conclusions land as exactly one lossless save, so concurrent
 // requests for the same identity can neither interleave nor lose the other
 // credential's state.
 type credentialStateRecorder struct {
@@ -97,7 +97,7 @@ func newCredentialStateRecorderOver(store stateStore) *credentialStateRecorder {
 	}
 }
 
-// record applies every transition of one attempt in a single save. The
+// record applies every transition of one request in a single save. The
 // document is re-read inside the identity lock, so the write never depends on
 // the caller's snapshot and a concurrent management action that rewrote the
 // record between the attempt's start and its conclusion is not lost. A save
@@ -168,14 +168,14 @@ func (r *credentialStateRecorder) forStore(store stateStore) *credentialStateRec
 func (r *credentialStateRecorder) currentDocument(ctx context.Context, ref credentialRef) ([]byte, string, bool, error) {
 	derived := authFileNameFor(ref.IdentityID)
 	if strings.TrimSpace(ref.AuthIndex) == "" {
-		document, err := r.snapshotDocument(ref, derived)
+		document, err := r.snapshotDocument(ref)
 		return document, derived, false, err
 	}
 	readCtx, cancel := context.WithTimeout(ctx, credentialStateStoreTimeout)
 	defer cancel()
 	entry, err := r.store.GetRuntime(readCtx, ref.AuthIndex)
 	if err != nil {
-		document, snapshotErr := r.snapshotDocument(ref, derived)
+		document, snapshotErr := r.snapshotDocument(ref)
 		return document, derived, false, snapshotErr
 	}
 	name := strings.TrimSpace(entry.Name)
@@ -190,7 +190,7 @@ func (r *credentialStateRecorder) currentDocument(ctx context.Context, ref crede
 		// provider does not own, and patching it would claim an account the
 		// plugin never created. The attempt's own snapshot is the only
 		// known-good input.
-		document, snapshotErr := r.snapshotDocument(ref, name)
+		document, snapshotErr := r.snapshotDocument(ref)
 		return document, name, hostNamed, snapshotErr
 	}
 	return document, name, hostNamed, nil
@@ -217,8 +217,8 @@ func documentIsPluginRecord(doc []byte, identityID string) bool {
 }
 
 // snapshotDocument is the fallback read: the document the request already
-// carries, under the file name the host is known to use.
-func (r *credentialStateRecorder) snapshotDocument(ref credentialRef, name string) ([]byte, error) {
+// carries, under whatever file name the caller resolved for it.
+func (r *credentialStateRecorder) snapshotDocument(ref credentialRef) ([]byte, error) {
 	if len(bytes.TrimSpace(ref.Document)) == 0 {
 		return nil, errNoCredential
 	}
@@ -303,7 +303,13 @@ func applyStateSection(zcode map[string]any, conclusion recordedState, now time.
 	}
 	merged["status"] = conclusion.Status
 	setOrDrop(merged, "retry_after", formatRetryAfter(conclusion.RetryAfter))
-	setOrDrop(merged, "last_error_code", conclusion.Code)
+	// A conclusion with no code — the skip block re-asserting a state the
+	// record already holds — leaves the persisted reason untouched: the
+	// reason belongs to the failure that produced the state, not to the
+	// request that re-asserted it.
+	if conclusion.Code != "" {
+		merged["last_error_code"] = conclusion.Code
+	}
 	merged[credentialCheckedAtField(conclusion.Kind)] = now.UTC().Format(time.RFC3339)
 
 	// A recorded window is only ever kept while it still says something true.
@@ -325,7 +331,8 @@ func applyStateSection(zcode map[string]any, conclusion recordedState, now time.
 // stateAlreadyRecorded reports whether the persisted section already expresses
 // this conclusion, so a repeat of the same outcome is not rewritten. The
 // checked-at stamp is deliberately ignored: it only records that a conclusion
-// was reached, not that anything about the credential changed.
+// was reached, not that anything about the credential changed. A conclusion
+// with no code asserts no reason, so the recorded one is not compared either.
 func stateAlreadyRecorded(existing map[string]any, conclusion recordedState) bool {
 	if existing == nil {
 		return false
@@ -333,7 +340,7 @@ func stateAlreadyRecorded(existing map[string]any, conclusion recordedState) boo
 	if normalizeStatus(stringField(existing, "status")) != conclusion.Status {
 		return false
 	}
-	if stringField(existing, "last_error_code") != conclusion.Code {
+	if conclusion.Code != "" && stringField(existing, "last_error_code") != conclusion.Code {
 		return false
 	}
 	// A conclusion with no window must find no window recorded, and one with

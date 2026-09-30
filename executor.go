@@ -114,13 +114,14 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 
 	// The aggregate of the attempt that answered the request is the one the
 	// caller receives, so the loop hands it back with the outcome.
-	outcome, answer := runExecution(ctx, scope, profiles, payload, func() answerForwarder {
-		return newAggregateForwarder(scope.Primary.MaxResponseBytes)
+	outcome, sink := runExecution(ctx, scope, profiles, payload, func() answerSink {
+		agg := newAggregateForwarder(scope.Primary.MaxResponseBytes)
+		return answerSink{forwarder: agg, render: agg.finish}
 	})
 	if outcome.Failure != nil {
 		return failureEnvelope(outcome.Failure), nil
 	}
-	payloadOut, err := answer.finish()
+	payloadOut, err := sink.render()
 	if err != nil {
 		return failureEnvelope(failureFromError(err)), nil
 	}
@@ -146,15 +147,14 @@ func newExecutionScope(req executorRequestRPC, cfg Config, model string) (execut
 	// deadline forward indefinitely and a sustained stream of fallback traffic
 	// would keep the primary blocked forever.
 	skipBlockStatus, skipBlockRetry := "", time.Time{}
-	if plan.SkipBlock != nil {
-		skipBlockStatus, skipBlockRetry = skipBlockConclusion(req.StorageJSON, plan.SkipBlock, now)
+	if plan.SkipBlockStatus != "" {
+		skipBlockStatus, skipBlockRetry = skipBlockConclusion(req.StorageJSON, plan.SkipBlockStatus, now)
 	}
 	return executionScope{
 		AuthIndex:       strings.TrimSpace(req.AuthID),
 		IdentityID:      plan.Primary.IdentityID,
 		Document:        req.StorageJSON,
 		Primary:         plan.Primary,
-		SkipBlock:       plan.SkipBlock,
 		SkipBlockStatus: skipBlockStatus,
 		SkipBlockRetry:  skipBlockRetry,
 		Recorder:        credentialStates.forStore(authStoreProvider()),
@@ -190,8 +190,8 @@ func handleExecutorExecuteStream(request []byte) ([]byte, error) {
 	go func() {
 		defer remove()
 		defer cancel()
-		outcome, _ := runExecution(ctx, scope, profiles, payload, func() answerForwarder {
-			return newStreamForwarder(sink, streamID)
+		outcome, _ := runExecution(ctx, scope, profiles, payload, func() answerSink {
+			return answerSink{forwarder: newStreamForwarder(sink, streamID)}
 		})
 		closer := newStreamCloser(sink, streamID)
 		if outcome.Failure != nil {
@@ -258,7 +258,7 @@ func prepareUpstreamPayload(payload []byte, model string, catalog []string) ([]b
 }
 
 // credentialPlan is what one request resolved to before any upstream call: the
-// credential to try first, the ordered attempts, the block that caused a
+// credential to try first, the ordered attempts, the state that caused a
 // downgrade, and the failure when no credential is usable at all.
 type credentialPlan struct {
 	// Primary is the credential the request runs on, which is the fallback
@@ -266,10 +266,13 @@ type credentialPlan struct {
 	Primary ResolvedProfile
 	// Attempts are the profiles to try, in order.
 	Attempts []ResolvedProfile
-	// SkipBlock is the classified block that kept the Coding Plan JWT out of
-	// this request, so the attempt loop can persist that block even though the
-	// loop never runs the primary.
-	SkipBlock *upstreamFailure
+	// SkipBlockStatus is the recorded JWT state that kept the Coding Plan JWT
+	// out of this request, so the attempt loop can persist that state even
+	// though the loop never runs the primary. It travels as the state itself
+	// rather than as a re-rendered failure, so recording it never depends on
+	// failure-code spelling, and it carries no code of its own: the persisted
+	// reason belongs to the failure that produced the state.
+	SkipBlockStatus string
 	// Failure is non-nil only when no credential could be attempted at all.
 	Failure *upstreamFailure
 }
@@ -301,10 +304,12 @@ func executionPlan(doc []byte, cfg Config, model string, callerHeaders http.Head
 		}
 		return credentialPlan{Primary: primary, Attempts: attempts}
 	case fallbackErr == nil:
+		var blocked credentialStatusError
+		_ = errors.As(primaryErr, &blocked)
 		return credentialPlan{
-			Primary:   fallback,
-			Attempts:  []ResolvedProfile{fallback},
-			SkipBlock: credentialProfileFailure(primaryErr),
+			Primary:         fallback,
+			Attempts:        []ResolvedProfile{fallback},
+			SkipBlockStatus: blocked.Status,
 		}
 	default:
 		// Neither credential can be attempted. The primary's own conclusion is
@@ -366,13 +371,14 @@ func credentialProfileFailure(err error) *upstreamFailure {
 }
 
 // skipBlockConclusion is the primary's recorded state, together with the
-// window already on the record that the skip was decided against. A block whose
-// code this build does not know concludes nothing: recording a permanent
-// conclusion for an unrecognized code would strand the account, which is worse
-// than recording nothing.
-func skipBlockConclusion(doc []byte, skipBlock *upstreamFailure, now time.Time) (string, time.Time) {
-	status := skipBlockStatus(skipBlock)
-	if status == "" {
+// window already on the record that the skip was decided against. A state
+// this build does not know concludes nothing: recording a permanent
+// conclusion for an unrecognized status would strand the account, which is
+// worse than recording nothing.
+func skipBlockConclusion(doc []byte, status string, now time.Time) (string, time.Time) {
+	switch status {
+	case jwtStatusVerificationBlocked, jwtStatusExhausted, jwtStatusCooldown, jwtStatusInvalid:
+	default:
 		return "", time.Time{}
 	}
 	snap, err := readCredentialSnapshot(doc)
@@ -388,27 +394,6 @@ func skipBlockConclusion(doc []byte, skipBlock *upstreamFailure, now time.Time) 
 		return status, recordedRetryAfter(snap.JWTRetryAfter, now)
 	}
 	return status, time.Time{}
-}
-
-// skipBlockStatus recovers the primary state a skip block describes, so the
-// loop can record that state without re-reading the document. The codes are
-// the ones jwtStateFailure renders; anything else maps to no state at all.
-func skipBlockStatus(skipBlock *upstreamFailure) string {
-	if skipBlock == nil {
-		return ""
-	}
-	switch skipBlock.Code {
-	case "credential_verification_blocked":
-		return jwtStatusVerificationBlocked
-	case "credential_quota_exhausted":
-		return jwtStatusExhausted
-	case "credential_cooling_down":
-		return jwtStatusCooldown
-	case "credential_invalid":
-		return jwtStatusInvalid
-	default:
-		return ""
-	}
 }
 
 // recordedRetryAfter recovers a persisted retry window as an instant. An
@@ -483,13 +468,13 @@ type frameForwarder interface {
 	OutputStarted() bool
 }
 
-// answerForwarder is a frameForwarder that also holds the non-streaming
-// response it aggregated. The attempt loop hands back the forwarder that
-// actually produced the answer, so a caller is never served an aggregate that
-// a discarded attempt had already written into.
-type answerForwarder interface {
-	frameForwarder
-	finish() ([]byte, error)
+// answerSink is one attempt's output target: the frame forwarder the pump
+// feeds, plus the render step for a forwarder that aggregates the answer. The
+// streaming path closes through the host stream callback instead, so its
+// render is nil and the returned sink is discarded.
+type answerSink struct {
+	forwarder frameForwarder
+	render    func() ([]byte, error)
 }
 
 // executionOutcome reports one credential attempt loop's result.
@@ -508,21 +493,51 @@ type executionScope struct {
 	IdentityID string
 	Document   []byte
 	Primary    ResolvedProfile
-	// SkipBlock is the classified block that skipped the primary, together with
-	// the block's retry window. It is the reason this request is running on a
-	// credential it would not otherwise use, so the loop records it as the
-	// windowed state even when the fallback that served the request itself
-	// failed for a reason of its own.
-	SkipBlock       *upstreamFailure
+	// SkipBlockStatus is the recorded JWT state that skipped the primary,
+	// together with the block's retry window. It is the reason this request is
+	// running on a credential it would not otherwise use, so the loop records
+	// it as the windowed state even when the fallback that served the request
+	// itself failed for a reason of its own.
 	SkipBlockStatus string
 	SkipBlockRetry  time.Time
 	Recorder        credentialRecorder
-	Now             func() time.Time
+	// batch is the request's own conclusion accumulator, built by runExecution
+	// so a request that tries both credentials still lands one save.
+	batch *stateBatch
+	Now   func() time.Time
 }
 
 // credentialRef projects the scope onto the host auth record.
 func (s executionScope) credentialRef() credentialRef {
 	return credentialRef{AuthIndex: s.AuthIndex, IdentityID: s.IdentityID, Document: s.Document}
+}
+
+// stateBatch accumulates one request's credential conclusions so a request
+// that tries both credentials still lands its states as exactly one lossless
+// save. add tolerates a nil batch so the attempt loop needs no guards.
+type stateBatch struct {
+	recorder credentialRecorder
+	ref      credentialRef
+	pending  []recordedState
+}
+
+func (b *stateBatch) add(state recordedState) {
+	if b == nil {
+		return
+	}
+	b.pending = append(b.pending, state)
+}
+
+// flush persists every accumulated conclusion in one recorder call. The write
+// outlives the request on purpose: a conclusion reached as a stream ends must
+// still land, and state is a recovery input rather than part of the caller's
+// response, so a host store that cannot take the write leaves this request's
+// upstream result exactly as it was.
+func (b *stateBatch) flush(ctx context.Context) {
+	if b == nil || b.recorder == nil {
+		return
+	}
+	_ = b.recorder.record(context.WithoutCancel(ctx), b.ref, b.pending...)
 }
 
 // runExecution performs the credential attempt loop over the immutable
@@ -532,28 +547,35 @@ func (s executionScope) credentialRef() credentialRef {
 // failure is final: a response must never mix output from two upstream
 // attempts.
 //
-// newForwarder builds the sink for one attempt. Each attempt gets its own, so
-// a failed attempt's partial output is discarded rather than merged into the
-// next credential's answer.
-func runExecution(ctx context.Context, scope executionScope, profiles []ResolvedProfile, payload []byte, newForwarder func() answerForwarder) (executionOutcome, answerForwarder) {
-	// The payload is the request exactly as the caller built it. Every
-	// credential attempt replays this one buffer, so a fallback can never
-	// mutate what the caller sent.
-	request := payload
-	var lastFailure *upstreamFailure
-	for _, profile := range profiles {
+// newSink builds the output target of one attempt. Each attempt gets its own,
+// so a failed attempt's partial output is discarded rather than merged into
+// the next credential's answer.
+func runExecution(ctx context.Context, scope executionScope, profiles []ResolvedProfile, payload []byte, newSink func() answerSink) (executionOutcome, answerSink) {
+	// Every conclusion this request reaches — the skip block and both
+	// credentials' outcomes — lands as exactly one save, taken after the loop
+	// so one request can never interleave two state writes for one identity.
+	scope.batch = &stateBatch{recorder: scope.Recorder, ref: scope.credentialRef()}
+	defer scope.batch.flush(ctx)
+
+	if scope.SkipBlockStatus != "" {
 		// The primary's block is recorded once, before the first attempt runs:
 		// it is the reason this request is running on a credential it would not
-		// otherwise use, and repeating it per attempt would take the identity
-		// lock once per credential for a conclusion that never changes.
-		scope.recordSkipBlock(ctx)
-		forwarder := newForwarder()
-		outcome := attemptProfile(ctx, scope, profile, request, forwarder)
+		// otherwise use. The window it carries was resolved from the record, so
+		// the flush re-asserts it instead of re-anchoring it.
+		scope.batch.add(recordedState{Kind: CredentialJWT, Status: scope.SkipBlockStatus, RetryAfter: scope.SkipBlockRetry})
+	}
+	// The payload is the request exactly as the caller built it. Every
+	// credential attempt below replays this one buffer, so a fallback can
+	// never mutate what the caller sent.
+	var lastFailure *upstreamFailure
+	for _, profile := range profiles {
+		sink := newSink()
+		outcome := attemptProfile(ctx, scope, profile, payload, sink.forwarder)
 		if outcome.Failure == nil {
-			return executionOutcome{OutputStarted: outcome.OutputStarted}, forwarder
+			return executionOutcome{OutputStarted: outcome.OutputStarted}, sink
 		}
 		if outcome.OutputStarted || !outcome.Failure.RetryableBeforeOutput {
-			return outcome, forwarder
+			return outcome, sink
 		}
 		lastFailure = outcome.Failure
 	}
@@ -565,53 +587,24 @@ func runExecution(ctx context.Context, scope executionScope, profiles []Resolved
 			Message:      "execution failed without a classified upstream error",
 		}
 	}
-	return executionOutcome{Failure: lastFailure}, nil
+	return executionOutcome{Failure: lastFailure}, answerSink{}
 }
 
 // attemptProfile runs one upstream attempt against an immutable profile, reports
-// whether output reached the caller, and records the credential's conclusion
-// before the next credential is considered.
+// whether output reached the caller, and queues the credential's conclusion for
+// the request's single save.
 func attemptProfile(ctx context.Context, scope executionScope, profile ResolvedProfile, payload []byte, forwarder frameForwarder) executionOutcome {
 	client := upstreamClient(profile)
 	err := pumpUpstream(ctx, client, profile, payload, func(frame []byte) error {
 		return forwarder.Forward(ctx, frame)
 	})
-	kind := profile.CredentialKind
 	if err == nil {
-		scope.record(ctx, recordedState{Kind: kind, Status: activeStatusFor(kind)})
+		scope.batch.add(recordedState{Kind: profile.CredentialKind, Status: activeStatusFor(profile.CredentialKind)})
 		return executionOutcome{OutputStarted: forwarder.OutputStarted()}
 	}
 	failure := failureFromError(err)
-	scope.record(ctx, conclusionFor(kind, failure, scope.Now()))
+	scope.batch.add(conclusionFor(profile.CredentialKind, failure, scope.Now()))
 	return executionOutcome{Failure: failure, OutputStarted: forwarder.OutputStarted()}
-}
-
-// recordSkipBlock persists the primary's own block. The attempt loop never runs
-// the primary, so without this the state that caused the downgrade would exist
-// only in memory and the next request would repeat the blocked credential. The
-// recorder is a no-op when the persisted state already says the same thing.
-func (s executionScope) recordSkipBlock(ctx context.Context) {
-	if s.Recorder == nil || s.SkipBlock == nil || s.SkipBlockStatus == "" {
-		return
-	}
-	_ = s.Recorder.record(context.WithoutCancel(ctx), s.credentialRef(), recordedState{
-		Kind:       CredentialJWT,
-		Status:     s.SkipBlockStatus,
-		RetryAfter: s.SkipBlockRetry,
-		Code:       s.SkipBlock.Code,
-	})
-}
-
-// record persists one credential's conclusion. The write outlives the request
-// on purpose: a conclusion reached as a stream ends must still land, and state
-// is a recovery input rather than part of the caller's response, so a host
-// store that cannot take the write leaves this request's upstream result
-// exactly as it was.
-func (s executionScope) record(ctx context.Context, state recordedState) {
-	if s.Recorder == nil {
-		return
-	}
-	_ = s.Recorder.record(context.WithoutCancel(ctx), s.credentialRef(), state)
 }
 
 // activeStatusFor is the conclusion of a successful attempt: the credential is
@@ -649,39 +642,31 @@ func conclusionFor(kind CredentialKind, failure *upstreamFailure, now time.Time)
 	return conclusion
 }
 
-// statusForClass translates a failure class into one credential's own state
-// vocabulary. A class the upstream did not attribute to the credential records
-// nothing: an error event the upstream streams is a statement about that
-// request, not about the credential that sent it. The fallback key is never
-// verification-gated the way the Coding Plan JWT is, so a verification
-// requirement against it is recorded as the temporary condition it actually is.
+// statusVocabulary is each credential kind's translation of a failure class
+// into its own state vocabulary. The fallback key is never verification-gated
+// the way the Coding Plan JWT is, so a verification requirement against it is
+// recorded as the temporary condition it actually is.
+var statusVocabulary = map[CredentialKind]map[failureClass]string{
+	CredentialJWT: {
+		failureVerificationBlocked: jwtStatusVerificationBlocked,
+		failureInvalid:             jwtStatusInvalid,
+		failureExhausted:           jwtStatusExhausted,
+		failureCooldown:            jwtStatusCooldown,
+	},
+	CredentialAPIKey: {
+		failureVerificationBlocked: apiKeyStatusCooldown,
+		failureInvalid:             apiKeyStatusInvalid,
+		failureExhausted:           apiKeyStatusExhausted,
+		failureCooldown:            apiKeyStatusCooldown,
+	},
+}
+
+// statusForClass is the state one failure class implies for one credential. A
+// class the upstream did not attribute to the credential records nothing: an
+// error event the upstream streams is a statement about that request, not
+// about the credential that sent it.
 func statusForClass(kind CredentialKind, class failureClass) string {
-	if kind == CredentialAPIKey {
-		switch class {
-		case failureVerificationBlocked:
-			return apiKeyStatusCooldown
-		case failureInvalid:
-			return apiKeyStatusInvalid
-		case failureExhausted:
-			return apiKeyStatusExhausted
-		case failureCooldown:
-			return apiKeyStatusCooldown
-		default:
-			return ""
-		}
-	}
-	switch class {
-	case failureVerificationBlocked:
-		return jwtStatusVerificationBlocked
-	case failureInvalid:
-		return jwtStatusInvalid
-	case failureExhausted:
-		return jwtStatusExhausted
-	case failureCooldown:
-		return jwtStatusCooldown
-	default:
-		return ""
-	}
+	return statusVocabulary[kind][class]
 }
 
 // retryWindowFor is the automatic recovery delay of a windowed state. Only the
@@ -769,11 +754,6 @@ func (f *aggregateForwarder) Forward(_ context.Context, frame []byte) error {
 func (f *aggregateForwarder) OutputStarted() bool { return false }
 
 func (f *aggregateForwarder) finish() ([]byte, error) { return f.agg.finish() }
-
-// finish satisfies answerForwarder for the streaming path, where it is never
-// called: a stream's frames were emitted as they arrived, so there is no
-// aggregate to render and the forwarder the loop hands back is discarded.
-func (f *streamForwarder) finish() ([]byte, error) { return nil, nil }
 
 // streamCloser closes a host stream exactly once, no matter how the pump
 // ended.

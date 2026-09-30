@@ -173,21 +173,10 @@ var captchaMarkers = []string{
 	"risk control",
 }
 
-// exhaustionMarkers are the body markers that confirm a 402 really is quota
-// exhaustion. A 402 with no marker, or one whose body names a different reason,
-// is not exhaustion: the exhausted state has no retry window, so recording it
-// on a guess would disable the credential until a quota refresh.
-var exhaustionMarkers = []string{
-	"quota",
-	"insufficient",
-	"exceed",
-	"balance",
-	"arrears",
-	"欠费",
-	"额度",
-	"余额",
-	"配额",
-}
+// exhaustion is concluded from the 402 status itself, not from body markers:
+// the credential state machine spells the 402 payment requirement as the
+// quota-exhausted verdict, so any 402 records it. Exhaustion recovers through
+// a quota refresh rather than through time or a retry.
 
 func containsMarker(body string, markers []string) bool {
 	lower := strings.ToLower(body)
@@ -226,11 +215,11 @@ func classifyUpstreamFailure(status int, body []byte) *upstreamFailure {
 			Message:               "upstream rejected the credential; refresh it or complete the ZCode login again",
 			RetryableBeforeOutput: true,
 		}
-	case status == http.StatusPaymentRequired && containsMarker(bodyText, exhaustionMarkers):
-		// Exhaustion is recorded only when the 402 body confirms it. A payment
-		// requirement for some other reason is a plain request rejection, because
-		// the exhausted state is permanent: recording it for the wrong reason
-		// would strand the credential until a quota refresh recovered it.
+	case status == http.StatusPaymentRequired:
+		// A 402 is the upstream's own payment conclusion, so the credential is
+		// recorded as exhausted regardless of what the body says: the state
+		// machine spells the status itself as the quota verdict, and the
+		// fallback key takes over the request.
 		return &upstreamFailure{
 			Class:                 failureExhausted,
 			UpstreamStatus:        status,
