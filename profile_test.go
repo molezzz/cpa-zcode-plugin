@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"net/http"
 	"strings"
 	"testing"
@@ -205,41 +204,5 @@ func TestNormalizeRequestModel(t *testing.T) {
 		if got := normalizeRequestModel(input, catalog); got != want {
 			t.Errorf("normalizeRequestModel(%q) = %q, want %q", input, got, want)
 		}
-	}
-}
-
-func TestNormalizeRequestModelInPayload(t *testing.T) {
-	payload := []byte(`{"model":"glm-5.2","max_tokens":17000000000000000000,"messages":[{"role":"user","content":"hi"}]}`)
-	out, model, err := normalizeRequestModelInPayload(payload, []string{"GLM-5.2", "GLM-5-Turbo"})
-	if err != nil {
-		t.Fatalf("normalize: %v", err)
-	}
-	if model != "GLM-5.2" {
-		t.Fatalf("model = %q", model)
-	}
-	if !bytes.Contains(out, []byte(`17000000000000000000`)) {
-		t.Fatalf("big integer precision lost: %s", out)
-	}
-	if !bytes.Contains(out, []byte(`"messages"`)) {
-		t.Fatalf("messages lost: %s", out)
-	}
-}
-
-func TestNormalizeRequestModelInPayloadPassThrough(t *testing.T) {
-	// Missing model and unknown models keep the payload byte-identical.
-	for _, payload := range [][]byte{
-		[]byte(`{"messages":[]}`),
-		[]byte(`{"model":"custom-model","messages":[]}`),
-	} {
-		out, _, err := normalizeRequestModelInPayload(payload, []string{"GLM-5.2"})
-		if err != nil {
-			t.Fatalf("normalize(%s): %v", payload, err)
-		}
-		if !bytes.Equal(out, payload) {
-			t.Errorf("payload %s changed to %s", payload, out)
-		}
-	}
-	if _, _, err := normalizeRequestModelInPayload([]byte(`not json`), nil); err == nil {
-		t.Error("invalid payload must be rejected")
 	}
 }

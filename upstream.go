@@ -33,13 +33,16 @@ var sseFrameTooLarge = errors.New("upstream stream frame exceeds the response si
 // final frame. Every line and every frame is bounded by limit, so a hostile
 // or malformed upstream cannot grow memory without bound.
 type sseFrameReader struct {
-	scanner *bufio.Reader
-	limit   int64
-	buf     bytes.Buffer
+	reader *bufio.Reader
+	limit  int64
+	buf    bytes.Buffer
+	// onProgress, when set, runs after every successful line read so the
+	// caller's idle watchdog sees progress inside long frames.
+	onProgress func()
 }
 
 func newSSEFrameReader(reader io.Reader, limit int64) *sseFrameReader {
-	return &sseFrameReader{scanner: bufio.NewReader(reader), limit: limit}
+	return &sseFrameReader{reader: bufio.NewReader(reader), limit: limit}
 }
 
 // next returns the next complete frame. io.EOF signals a clean stream end.
@@ -47,8 +50,11 @@ func (r *sseFrameReader) next() ([]byte, error) {
 	r.buf.Reset()
 	sawContent := false
 	for {
-		line, err := r.scanner.ReadBytes('\n')
+		line, err := r.reader.ReadBytes('\n')
 		if len(line) > 0 {
+			if r.onProgress != nil {
+				r.onProgress()
+			}
 			if int64(len(line)) > r.limit || int64(r.buf.Len())+int64(len(line)) > r.limit {
 				return nil, sseFrameTooLarge
 			}
@@ -150,13 +156,10 @@ type upstreamFailure struct {
 
 func (f *upstreamFailure) Error() string { return f.Message }
 
-// Observed upstream rejection markers. The upstream signals verification
-// requirements and quota exhaustion inside response bodies rather than only
-// in status codes.
-var (
-	captchaMarkers   = []string{"captcha", "verify token", "verify failed"}
-	exhaustedMarkers = []string{"quota", "insufficient", "balance", "exhaust", "额度", "余额不足"}
-)
+// captchaMarkers are the observed upstream body markers for verification
+// rejections. The upstream signals verification requirements inside the
+// response body rather than only in the status code.
+var captchaMarkers = []string{"captcha", "verify token", "verify failed"}
 
 func containsMarker(body string, markers []string) bool {
 	lower := strings.ToLower(body)
@@ -190,18 +193,15 @@ func classifyUpstreamFailure(status int, body []byte) *upstreamFailure {
 			Code:           "credential_invalid",
 			Message:        "upstream rejected the credential; refresh it or complete the ZCode login again",
 		}
-	case status == http.StatusPaymentRequired || containsMarker(bodyText, exhaustedMarkers):
-		class := failureExhausted
-		clientStatus := http.StatusPaymentRequired
-		if status < 200 || status > 299 {
-			// Exhaustion markers outside a 402 still mean exhaustion for the
-			// credential state machine, but the client sees the real status.
-			clientStatus = status
-		}
+	case status == http.StatusPaymentRequired:
+		// Exhaustion is confirmed only by the observed 402 signal. Quota
+		// keywords inside other statuses stay with that status's class, so
+		// a schema rejection that merely mentions quota is never recorded
+		// as exhaustion.
 		return &upstreamFailure{
-			Class:          class,
+			Class:          failureExhausted,
 			UpstreamStatus: status,
-			ClientStatus:   clientStatus,
+			ClientStatus:   http.StatusPaymentRequired,
 			Code:           "upstream_quota_exhausted",
 			Message:        "upstream quota is exhausted for this credential; refresh the quota to restore it",
 		}
@@ -379,6 +379,9 @@ func pumpUpstream(ctx context.Context, client *http.Client, profile ResolvedProf
 	}()
 
 	reader := newSSEFrameReader(resp.Body, profile.MaxResponseBytes)
+	// Refresh the idle clock per line, not per frame: a slow, healthy
+	// trickle inside one long frame must not trip the watchdog.
+	reader.onProgress = func() { lastReadNano.Store(time.Now().UnixNano()) }
 	var pumpErr error
 	for {
 		frame, err := reader.next()
@@ -389,7 +392,6 @@ func pumpUpstream(ctx context.Context, client *http.Client, profile ResolvedProf
 			pumpErr = err
 			break
 		}
-		lastReadNano.Store(time.Now().UnixNano())
 		if err := onFrame(frame); err != nil {
 			pumpErr = err
 			break

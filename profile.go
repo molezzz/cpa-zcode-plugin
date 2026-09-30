@@ -41,8 +41,9 @@ const (
 type CredentialKind string
 
 const (
-	CredentialJWT    CredentialKind = "jwt"
-	CredentialAPIKey CredentialKind = "api_key"
+	// CredentialJWT is the primary credential kind used in this slice; the
+	// managed API key fallback kind arrives with the fallback milestone.
+	CredentialJWT CredentialKind = "jwt"
 )
 
 // JWT credential states persisted in the zcode namespace. Only jwtStatusActive
@@ -239,34 +240,4 @@ func normalizeRequestModel(model string, catalog []string) string {
 		return canonical
 	}
 	return trimmed
-}
-
-// normalizeRequestModelInPayload rewrites only the payload's model field.
-// The rest of the request body is preserved verbatim (numeric precision
-// included via json.Number); a payload without a model field is returned
-// unchanged so the upstream produces the authoritative validation error.
-func normalizeRequestModelInPayload(payload []byte, catalog []string) ([]byte, string, error) {
-	if len(bytes.TrimSpace(payload)) == 0 {
-		return payload, "", nil
-	}
-	var body map[string]any
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	dec.UseNumber()
-	if err := dec.Decode(&body); err != nil {
-		return nil, "", fmt.Errorf("request payload is not valid JSON")
-	}
-	raw, ok := body["model"].(string)
-	if !ok || strings.TrimSpace(raw) == "" {
-		return payload, "", nil
-	}
-	normalized := normalizeRequestModel(raw, catalog)
-	if normalized == raw {
-		return payload, raw, nil
-	}
-	body["model"] = normalized
-	out, err := json.Marshal(body)
-	if err != nil {
-		return nil, "", fmt.Errorf("encode normalized request payload: %w", err)
-	}
-	return out, normalized, nil
 }

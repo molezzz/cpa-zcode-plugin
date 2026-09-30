@@ -141,7 +141,7 @@ func TestPumpUpstreamClassifiesNon2xx(t *testing.T) {
 		{"captcha", 403, `{"error":{"message":"captcha verification required"}}`, failureVerificationBlocked, "upstream_verification_required", 403},
 		{"verify token", 403, "verify token missing", failureVerificationBlocked, "upstream_verification_required", 403},
 		{"payment required", 402, `{}`, failureExhausted, "upstream_quota_exhausted", 402},
-		{"quota keyword", 400, `{"error":{"message":"quota insufficient for this request"}}`, failureExhausted, "upstream_quota_exhausted", 400},
+		{"quota keyword on 400 stays a rejection", 400, `{"error":{"message":"quota insufficient for this request"}}`, failureRejected, "upstream_rejected", 400},
 		{"rate limited", 429, `{}`, failureCooldown, "upstream_rate_limited", 429},
 		{"server error", 500, `{}`, failureCooldown, "upstream_unavailable", 502},
 		{"bad request", 400, `{"error":{"message":"messages: field required"}}`, failureRejected, "upstream_rejected", 400},
@@ -381,4 +381,41 @@ func TestMessageAggregatorFailures(t *testing.T) {
 			t.Fatalf("observe = %v, want cooldown", err)
 		}
 	})
+}
+
+func TestPumpUpstreamSlowTrickleKeepsStreamAlive(t *testing.T) {
+	// Lines trickle in slower than the idle window would allow per frame,
+	// but each line arrives well inside the window: per-line progress must
+	// keep the stream alive until it completes.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		parts := []string{
+			"event: message_start\n",
+			`data: {"type":"message_start","message":{"id":"m"}}` + "\n",
+			"\n",
+			"event: message_stop\n",
+			`data: {"type":"message_stop"}` + "\n",
+			"\n",
+		}
+		for _, part := range parts {
+			fmt.Fprint(w, part)
+			flusher.Flush()
+			time.Sleep(100 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	var frames int
+	profile := testProfile(t, srv.URL, func(p *ResolvedProfile) { p.IdleReadTimeout = 150 * time.Millisecond })
+	err := pumpUpstream(context.Background(), srv.Client(), profile, []byte(`{}`), func([]byte) error {
+		frames++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("pumpUpstream: %v", err)
+	}
+	if frames != 2 {
+		t.Fatalf("frames = %d, want 2", frames)
+	}
 }
