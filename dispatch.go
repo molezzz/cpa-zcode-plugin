@@ -88,6 +88,16 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Provider: pluginID,
 			Models:   staticModels(currentConfig()),
 		})
+	case pluginabi.MethodAuthIdentifier:
+		return handleAuthIdentifier()
+	case pluginabi.MethodAuthParse:
+		return handleAuthParse(request)
+	case pluginabi.MethodAuthLoginStart:
+		return handleAuthLoginStart(request)
+	case pluginabi.MethodAuthLoginPoll:
+		return handleAuthLoginPoll(request)
+	case pluginabi.MethodAuthRefresh:
+		return handleAuthRefresh(request)
 	case pluginabi.MethodPluginQuiesce:
 		return okEnvelope(struct{}{})
 	case pluginabi.MethodPluginShutdown:
@@ -147,6 +157,9 @@ func pluginRegistration() registration {
 			// Implemented and contract-tested in this baseline.
 			ModelRegistrar: true,
 			ModelProvider:  true,
+			// Native provider authentication: authorization sessions with
+			// browser login, pollable status, and JWT credential storage.
+			AuthProvider: true,
 		},
 	}
 }
@@ -172,11 +185,14 @@ func errorEnvelope(code, message string, status int) []byte {
 	return raw
 }
 
-// runShutdown tears down plugin-owned runtime state exactly once. The
-// baseline owns no sessions, streams, or timers yet; later milestones must
-// extend this hook (OAuth sessions, active streams, host callback contexts).
+// runShutdown tears down plugin-owned runtime state exactly once. Later
+// milestones must extend this hook (active streams, host callback contexts).
 var shutdownOnce sync.Once
 
 func runShutdown() {
-	shutdownOnce.Do(func() {})
+	shutdownOnce.Do(func() {
+		// Authorization sessions hold OAuth secrets and must never outlive
+		// the plugin.
+		activeSessions.shutdownAll()
+	})
 }

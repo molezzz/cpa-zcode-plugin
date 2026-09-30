@@ -7,3 +7,6 @@ docs/cpa-plugin-zcode/
 
 # 构建产物
 dist/
+# go build ./... 在模块根目录留下的二进制
+go build output binary
+cpa-zcode-plugin

@@ -45,11 +45,10 @@ func TestRegisterReturnsImplementedCapabilitiesOnly(t *testing.T) {
 		t.Fatalf("unexpected metadata: %+v", reg.Metadata)
 	}
 	caps := reg.Capabilities
-	if !caps.ModelRegistrar || !caps.ModelProvider {
+	if !caps.ModelRegistrar || !caps.ModelProvider || !caps.AuthProvider {
 		t.Fatalf("implemented capabilities missing: %+v", caps)
 	}
 	for name, value := range map[string]bool{
-		"auth_provider":          caps.AuthProvider,
 		"executor":               caps.Executor,
 		"model_router":           caps.ModelRouter,
 		"scheduler":              caps.Scheduler,
@@ -122,10 +121,6 @@ func TestUnimplementedCapabilityMethodsAreUnknown(t *testing.T) {
 		pluginabi.MethodExecutorExecute,
 		pluginabi.MethodExecutorExecuteStream,
 		pluginabi.MethodExecutorIdentifier,
-		pluginabi.MethodAuthIdentifier,
-		pluginabi.MethodAuthLoginStart,
-		pluginabi.MethodAuthLoginPoll,
-		pluginabi.MethodAuthRefresh,
 		pluginabi.MethodManagementRegister,
 		pluginabi.MethodManagementHandle,
 		pluginabi.MethodQuotaFetch,
