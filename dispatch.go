@@ -1,0 +1,177 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sync"
+	"sync/atomic"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+// pluginVersion is overridden at build time via -ldflags "-X main.pluginVersion=...".
+var pluginVersion = "0.1.0"
+
+var activeConfig atomic.Value // stores Config
+
+func init() {
+	activeConfig.Store(defaultConfig())
+}
+
+// lifecycleRequest mirrors the host RPC schema for plugin.register and
+// plugin.reconfigure.
+type lifecycleRequest struct {
+	ConfigYAML []byte `json:"config_yaml"`
+}
+
+// registration mirrors the host RPC schema of the plugin.register result.
+// Capabilities must stay aligned with what this plugin actually implements
+// and contract-tests; never declare a capability for an unimplemented method.
+type registration struct {
+	SchemaVersion uint32                   `json:"schema_version"`
+	Metadata      pluginapi.Metadata       `json:"metadata"`
+	Capabilities  registrationCapabilities `json:"capabilities"`
+}
+
+// registrationCapabilities mirrors the host-side RPC schema field for field.
+type registrationCapabilities struct {
+	ModelRegistrar                bool                         `json:"model_registrar"`
+	ModelProvider                 bool                         `json:"model_provider"`
+	AuthProvider                  bool                         `json:"auth_provider"`
+	FrontendAuthProvider          bool                         `json:"frontend_auth_provider"`
+	FrontendAuthProviderExclusive bool                         `json:"frontend_auth_provider_exclusive"`
+	Scheduler                     bool                         `json:"scheduler"`
+	SchedulerAcrossPriorities     bool                         `json:"scheduler_across_priorities,omitempty"`
+	ModelRouter                   bool                         `json:"model_router"`
+	Executor                      bool                         `json:"executor"`
+	ExecutorModelScope            pluginapi.ExecutorModelScope `json:"executor_model_scope"`
+	ExecutorInputFormats          []string                     `json:"executor_input_formats,omitempty"`
+	ExecutorOutputFormats         []string                     `json:"executor_output_formats,omitempty"`
+	RequestTranslator             bool                         `json:"request_translator"`
+	RequestNormalizer             bool                         `json:"request_normalizer"`
+	RequestInterceptor            bool                         `json:"request_interceptor"`
+	RequestLifecyclePlugin        bool                         `json:"request_lifecycle_plugin"`
+	ResponseTranslator            bool                         `json:"response_translator"`
+	ResponseBeforeTranslator      bool                         `json:"response_before_translator"`
+	ResponseAfterTranslator       bool                         `json:"response_after_translator"`
+	ResponseInterceptor           bool                         `json:"response_interceptor"`
+	StreamChunkInterceptor        bool                         `json:"response_stream_interceptor"`
+	WebSocketResponseObserver     bool                         `json:"websocket_response_observer"`
+	ThinkingApplier               bool                         `json:"thinking_applier"`
+	UsagePlugin                   bool                         `json:"usage_plugin"`
+	CommandLinePlugin             bool                         `json:"command_line_plugin"`
+	ManagementAPI                 bool                         `json:"management_api"`
+	QuotaProvider                 bool                         `json:"quota_provider"`
+}
+
+// handleMethod routes one host RPC method. It always returns an envelope for
+// handled methods; a Go error means the ABI layer must synthesize a generic
+// plugin_error envelope instead.
+func handleMethod(method string, request []byte) ([]byte, error) {
+	switch method {
+	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		if err := configure(request); err != nil {
+			return errorEnvelope("invalid_config", err.Error(), http.StatusBadRequest), nil
+		}
+		return okEnvelope(pluginRegistration())
+	case pluginabi.MethodModelRegister:
+		return okEnvelope(pluginapi.ModelRegistrationResponse{
+			Provider: pluginID,
+			Models:   staticModels(currentConfig()),
+		})
+	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
+		// model.for_auth serves the static catalog until identity-scoped
+		// dynamic discovery lands; no dynamic result exists at this baseline.
+		return okEnvelope(pluginapi.ModelResponse{
+			Provider: pluginID,
+			Models:   staticModels(currentConfig()),
+		})
+	case pluginabi.MethodPluginQuiesce:
+		return okEnvelope(struct{}{})
+	case pluginabi.MethodPluginShutdown:
+		runShutdown()
+		return okEnvelope(struct{}{})
+	default:
+		// Anything not explicitly implemented above — including methods of
+		// undeclared capabilities such as executor.* or auth.* — is refused.
+		return errorEnvelope("unknown_method", "unknown method: "+method, 0), nil
+	}
+}
+
+// configure decodes the config YAML override and stores a normalized snapshot.
+func configure(request []byte) error {
+	var req lifecycleRequest
+	if len(request) > 0 {
+		if err := json.Unmarshal(request, &req); err != nil {
+			return fmt.Errorf("decode lifecycle request: %w", err)
+		}
+	}
+	override, err := parseConfig(req.ConfigYAML)
+	if err != nil {
+		return fmt.Errorf("parse plugin config: %w", err)
+	}
+	activeConfig.Store(normalizeConfig(mergeConfig(defaultConfig(), override)))
+	return nil
+}
+
+func currentConfig() Config {
+	if cfg, ok := activeConfig.Load().(Config); ok {
+		return cfg
+	}
+	return defaultConfig()
+}
+
+// pluginRegistration is the single source of truth for what this plugin
+// declares to the host: metadata, config fields, and capabilities.
+func pluginRegistration() registration {
+	return registration{
+		SchemaVersion: pluginabi.SchemaVersion,
+		Metadata: pluginapi.Metadata{
+			Name:             "ZCode",
+			Version:          pluginVersion,
+			Author:           "molezz",
+			GitHubRepository: "https://github.com/molezzz/cpa-zcode-plugin",
+			ConfigFields: []pluginapi.ConfigField{
+				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable the ZCode provider plugin."},
+				{Name: "priority", Type: pluginapi.ConfigFieldTypeInteger, Description: "Provider priority relative to other host providers."},
+				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Static fallback model IDs, always available when discovery is off or fails."},
+				{Name: "model_discovery", Type: pluginapi.ConfigFieldTypeObject, Description: "Identity-scoped dynamic model discovery settings (enabled, success_ttl_seconds, failure_cooldown_seconds)."},
+				{Name: "oauth", Type: pluginapi.ConfigFieldTypeObject, Description: "Authorization session settings (session_ttl_seconds, managed_key_name_prefix, organization_id, project_id)."},
+				{Name: "upstream", Type: pluginapi.ConfigFieldTypeObject, Description: "Upstream HTTP limits (connect_timeout_seconds, request_timeout_seconds, max_response_bytes)."},
+				{Name: "quota", Type: pluginapi.ConfigFieldTypeObject, Description: "Quota refresh settings (refresh_concurrency)."},
+			},
+		},
+		Capabilities: registrationCapabilities{
+			// Implemented and contract-tested in this baseline.
+			ModelRegistrar: true,
+			ModelProvider:  true,
+		},
+	}
+}
+
+func okEnvelope(value any) ([]byte, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(pluginabi.Envelope{OK: true, Result: raw})
+}
+
+func errorEnvelope(code, message string, status int) []byte {
+	raw, _ := json.Marshal(pluginabi.Envelope{
+		OK:    false,
+		Error: &pluginabi.Error{Code: code, Message: message, HTTPStatus: status},
+	})
+	return raw
+}
+
+// runShutdown tears down plugin-owned runtime state exactly once. The
+// baseline owns no sessions, streams, or timers yet; later milestones must
+// extend this hook (OAuth sessions, active streams, host callback contexts).
+var shutdownOnce sync.Once
+
+func runShutdown() {
+	shutdownOnce.Do(func() {})
+}

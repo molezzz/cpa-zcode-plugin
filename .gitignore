@@ -4,3 +4,6 @@ docs/zcode2api/
 
 # 上游: git@github.com:rensumo/cpa-plugin-zcode.git
 docs/cpa-plugin-zcode/
+
+# 构建产物
+dist/
