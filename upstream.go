@@ -1,0 +1,433 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+// maxUpstreamErrorBodyBytes bounds how much of a non-2xx upstream body is read
+// for classification. Only classified excerpts may survive into error
+// messages; the raw body never does.
+const maxUpstreamErrorBodyBytes = 64 << 10
+
+// maxSanitizedExcerpt bounds an extracted upstream error message before it may
+// appear in a sanitized error envelope.
+const maxSanitizedExcerpt = 200
+
+// sseFrameTooLarge reports an upstream frame beyond the configured read limit.
+var sseFrameTooLarge = errors.New("upstream stream frame exceeds the response size limit")
+
+// sseFrameReader splits an upstream SSE body into frames verbatim, including
+// each frame's terminating blank line. Frames are separated by a blank line
+// ("\n\n" or "\r\n\r\n"); a trailing partial frame at EOF is returned as a
+// final frame. Every line and every frame is bounded by limit, so a hostile
+// or malformed upstream cannot grow memory without bound.
+type sseFrameReader struct {
+	scanner *bufio.Reader
+	limit   int64
+	buf     bytes.Buffer
+}
+
+func newSSEFrameReader(reader io.Reader, limit int64) *sseFrameReader {
+	return &sseFrameReader{scanner: bufio.NewReader(reader), limit: limit}
+}
+
+// next returns the next complete frame. io.EOF signals a clean stream end.
+func (r *sseFrameReader) next() ([]byte, error) {
+	r.buf.Reset()
+	sawContent := false
+	for {
+		line, err := r.scanner.ReadBytes('\n')
+		if len(line) > 0 {
+			if int64(len(line)) > r.limit || int64(r.buf.Len())+int64(len(line)) > r.limit {
+				return nil, sseFrameTooLarge
+			}
+			r.buf.Write(line)
+			if !isBlankSSELine(line) {
+				sawContent = true
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			if !sawContent {
+				return nil, io.EOF
+			}
+			frame := make([]byte, r.buf.Len())
+			copy(frame, r.buf.Bytes())
+			return frame, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if isBlankSSELine(line) {
+			if !sawContent {
+				// A stray blank line between frames terminates an empty
+				// event; skip it instead of forwarding an empty frame.
+				r.buf.Reset()
+				continue
+			}
+			frame := make([]byte, r.buf.Len())
+			copy(frame, r.buf.Bytes())
+			return frame, nil
+		}
+	}
+}
+
+func isBlankSSELine(line []byte) bool {
+	switch len(line) {
+	case 1:
+		return line[0] == '\n'
+	case 2:
+		return line[0] == '\r' && line[1] == '\n'
+	default:
+		return false
+	}
+}
+
+// parseSSEFrame extracts the event name and joined data payload of one SSE
+// frame. ok is false for frames without data (comments and keepalives), which
+// carry nothing to aggregate.
+func parseSSEFrame(frame []byte) (event string, data []byte, ok bool) {
+	var dataBuf bytes.Buffer
+	for _, rawLine := range bytes.Split(frame, []byte("\n")) {
+		line := strings.TrimSuffix(string(rawLine), "\r")
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			if event == "" {
+				event = strings.TrimSpace(line[len("event:"):])
+			}
+		case strings.HasPrefix(line, "data:"):
+			value := strings.TrimPrefix(line[len("data:"):], " ")
+			if dataBuf.Len() > 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(value)
+		}
+	}
+	if dataBuf.Len() == 0 {
+		return event, nil, false
+	}
+	return event, dataBuf.Bytes(), true
+}
+
+// failureClass is the observable classification of an upstream attempt
+// failure. Classes map onto the credential state machine and onto the
+// sanitized message the caller receives.
+type failureClass string
+
+const (
+	failureVerificationBlocked failureClass = "verification_blocked"
+	failureInvalid             failureClass = "invalid"
+	failureExhausted           failureClass = "exhausted"
+	failureCooldown            failureClass = "cooldown"
+	failureRejected            failureClass = "upstream_rejected"
+	failureUnavailable         failureClass = "upstream_unavailable"
+	failureInterrupted         failureClass = "stream_interrupted"
+	failureTooLarge            failureClass = "response_too_large"
+)
+
+// upstreamFailure is a sanitized upstream outcome. Message is bounded and
+// free of credentials, upstream bodies, URLs, and prompt content.
+type upstreamFailure struct {
+	Class          failureClass
+	UpstreamStatus int
+	ClientStatus   int
+	Code           string
+	Message        string
+	// RetryableBeforeOutput reports whether the failure classification would
+	// allow another credential attempt while nothing has been output yet.
+	RetryableBeforeOutput bool
+}
+
+func (f *upstreamFailure) Error() string { return f.Message }
+
+// Observed upstream rejection markers. The upstream signals verification
+// requirements and quota exhaustion inside response bodies rather than only
+// in status codes.
+var (
+	captchaMarkers   = []string{"captcha", "verify token", "verify failed"}
+	exhaustedMarkers = []string{"quota", "insufficient", "balance", "exhaust", "额度", "余额不足"}
+)
+
+func containsMarker(body string, markers []string) bool {
+	lower := strings.ToLower(body)
+	for _, marker := range markers {
+		if strings.Contains(lower, strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyUpstreamFailure turns a non-2xx upstream response into a sanitized,
+// classified failure. The body is used only for classification and, for plain
+// request-rejection classes, a bounded structured excerpt.
+func classifyUpstreamFailure(status int, body []byte) *upstreamFailure {
+	bodyText := string(body)
+	switch {
+	case status == http.StatusForbidden && containsMarker(bodyText, captchaMarkers):
+		return &upstreamFailure{
+			Class:          failureVerificationBlocked,
+			UpstreamStatus: status,
+			ClientStatus:   http.StatusForbidden,
+			Code:           "upstream_verification_required",
+			Message:        "upstream verification is required before the Coding Plan credential can be used; no verification is automated",
+		}
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return &upstreamFailure{
+			Class:          failureInvalid,
+			UpstreamStatus: status,
+			ClientStatus:   status,
+			Code:           "credential_invalid",
+			Message:        "upstream rejected the credential; refresh it or complete the ZCode login again",
+		}
+	case status == http.StatusPaymentRequired || containsMarker(bodyText, exhaustedMarkers):
+		class := failureExhausted
+		clientStatus := http.StatusPaymentRequired
+		if status < 200 || status > 299 {
+			// Exhaustion markers outside a 402 still mean exhaustion for the
+			// credential state machine, but the client sees the real status.
+			clientStatus = status
+		}
+		return &upstreamFailure{
+			Class:          class,
+			UpstreamStatus: status,
+			ClientStatus:   clientStatus,
+			Code:           "upstream_quota_exhausted",
+			Message:        "upstream quota is exhausted for this credential; refresh the quota to restore it",
+		}
+	case status == http.StatusTooManyRequests:
+		return &upstreamFailure{
+			Class:                 failureCooldown,
+			UpstreamStatus:        status,
+			ClientStatus:          status,
+			Code:                  "upstream_rate_limited",
+			Message:               "upstream rate limit reached; retry later",
+			RetryableBeforeOutput: true,
+		}
+	case status >= 500:
+		return &upstreamFailure{
+			Class:                 failureCooldown,
+			UpstreamStatus:        status,
+			ClientStatus:          http.StatusBadGateway,
+			Code:                  "upstream_unavailable",
+			Message:               "upstream is temporarily unavailable",
+			RetryableBeforeOutput: true,
+		}
+	default:
+		return &upstreamFailure{
+			Class:          failureRejected,
+			UpstreamStatus: status,
+			ClientStatus:   status,
+			Code:           "upstream_rejected",
+			Message:        sanitizedRejectionMessage(status, body),
+		}
+	}
+}
+
+// sanitizedRejectionMessage builds the message for plain request rejections
+// (typically 4xx schema errors). It extracts only a bounded, single-line
+// message field from a JSON error body; unparsable bodies stay generic so
+// raw upstream content can never reach the caller.
+func sanitizedRejectionMessage(status int, body []byte) string {
+	base := fmt.Sprintf("upstream rejected the request (http %d)", status)
+	var parsed struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(body), &parsed); err != nil {
+		return base
+	}
+	excerpt := parsed.Error.Message
+	if strings.TrimSpace(excerpt) == "" {
+		excerpt = parsed.Message
+	}
+	excerpt = strings.TrimSpace(singleLine(excerpt))
+	if excerpt == "" {
+		return base
+	}
+	return base + ": " + truncateForLog(excerpt, maxSanitizedExcerpt)
+}
+
+func singleLine(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+// transportFailure classifies connection and read failures. Cancellation is
+// reported distinctly so it is never mistaken for an upstream problem.
+func transportFailure(err error) *upstreamFailure {
+	if errors.Is(err, context.Canceled) {
+		return &upstreamFailure{
+			Class:        failureInterrupted,
+			ClientStatus: http.StatusBadGateway,
+			Code:         "request_canceled",
+			Message:      "request canceled",
+		}
+	}
+	if errors.Is(err, sseFrameTooLarge) {
+		return &upstreamFailure{
+			Class:        failureTooLarge,
+			ClientStatus: http.StatusBadGateway,
+			Code:         "response_too_large",
+			Message:      "upstream response exceeds the configured size limit",
+		}
+	}
+	return &upstreamFailure{
+		Class:                 failureCooldown,
+		ClientStatus:          http.StatusBadGateway,
+		Code:                  "upstream_unreachable",
+		Message:               "upstream is unreachable or the stream ended unexpectedly",
+		RetryableBeforeOutput: true,
+	}
+}
+
+// upstreamClient builds the HTTP client one execution attempt uses. Limits
+// come from the immutable profile; streaming bodies are never bounded by a
+// total timeout, only by the idle-read watchdog and caller cancellation.
+func upstreamClient(profile ResolvedProfile) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: profile.ConnectTimeout}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   profile.ConnectTimeout,
+			ResponseHeaderTimeout: profile.HeaderTimeout,
+		},
+	}
+}
+
+// pumpUpstream performs one upstream attempt: it posts the payload as an SSE
+// request and forwards every response frame to onFrame. Non-2xx responses
+// become classified failures. The returned error is either nil, an
+// *upstreamFailure, or a raw transport error for attemptProfile to classify;
+// onFrame may abort the pump by returning any error.
+func pumpUpstream(ctx context.Context, client *http.Client, profile ResolvedProfile, payload []byte, onFrame func(frame []byte) error) error {
+	// The pump context is bound to the request so the idle watchdog and the
+	// caller's cancellation both interrupt in-flight body reads.
+	pumpCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pumpCtx, http.MethodPost, profile.MessagesURL, bytes.NewReader(payload))
+	if err != nil {
+		return &upstreamFailure{
+			Class:        failureRejected,
+			ClientStatus: http.StatusInternalServerError,
+			Code:         "invalid_request",
+			Message:      "upstream request could not be built",
+		}
+	}
+	for name, values := range profile.Headers {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return transportFailure(err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		body, readErr := readLimited(resp.Body, min(profile.MaxResponseBytes, maxUpstreamErrorBodyBytes))
+		drainAndClose(resp.Body)
+		if readErr != nil {
+			return transportFailure(readErr)
+		}
+		return classifyUpstreamFailure(resp.StatusCode, body)
+	}
+
+	// Idle watchdog: cancel the pump context when the upstream stops
+	// producing bytes for longer than the configured idle window.
+	var lastReadNano atomic.Int64
+	lastReadNano.Store(time.Now().UnixNano())
+	var watchdogFired atomic.Bool
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		tick := profile.IdleReadTimeout / 4
+		if tick > 250*time.Millisecond {
+			tick = 250 * time.Millisecond
+		}
+		if tick < 10*time.Millisecond {
+			tick = 10 * time.Millisecond
+		}
+		ticker := time.NewTicker(tick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pumpCtx.Done():
+				return
+			case <-ticker.C:
+				last := time.Since(time.Unix(0, lastReadNano.Load()))
+				if last > profile.IdleReadTimeout {
+					watchdogFired.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	reader := newSSEFrameReader(resp.Body, profile.MaxResponseBytes)
+	var pumpErr error
+	for {
+		frame, err := reader.next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			pumpErr = err
+			break
+		}
+		lastReadNano.Store(time.Now().UnixNano())
+		if err := onFrame(frame); err != nil {
+			pumpErr = err
+			break
+		}
+	}
+	// Stop the watchdog, then wait for it to observe the cancel, so the
+	// response body and context are released without a use-after-cancel
+	// race on the connection.
+	cancel()
+	<-watchDone
+	drainAndClose(resp.Body)
+	if pumpErr != nil {
+		var hostErr hostStreamError
+		if errors.As(pumpErr, &hostErr) {
+			// Forwarder aborts (host stream failures) are never upstream
+			// problems; the executor classifies them.
+			return pumpErr
+		}
+		if watchdogFired.Load() && ctx.Err() == nil {
+			// The watchdog canceled the pump: the upstream stalled
+			// mid-stream while the caller was still waiting.
+			return stalledFailure()
+		}
+		var failure *upstreamFailure
+		if errors.As(pumpErr, &failure) {
+			return failure
+		}
+		return transportFailure(pumpErr)
+	}
+	return nil
+}
+
+// stalledFailure classifies an idle-watchdog shutdown of the stream.
+func stalledFailure() *upstreamFailure {
+	return &upstreamFailure{
+		Class:        failureCooldown,
+		ClientStatus: http.StatusBadGateway,
+		Code:         "upstream_stream_stalled",
+		Message:      "upstream stream stalled and timed out",
+	}
+}

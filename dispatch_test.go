@@ -48,8 +48,17 @@ func TestRegisterReturnsImplementedCapabilitiesOnly(t *testing.T) {
 	if !caps.ModelRegistrar || !caps.ModelProvider || !caps.AuthProvider {
 		t.Fatalf("implemented capabilities missing: %+v", caps)
 	}
+	if !caps.Executor {
+		t.Fatal("executor capability missing: the executor methods are implemented and contract-tested")
+	}
+	if caps.ExecutorModelScope != pluginapi.ExecutorModelScopeBoth {
+		t.Fatalf("executor_model_scope = %q, want both", caps.ExecutorModelScope)
+	}
+	if len(caps.ExecutorInputFormats) != 1 || caps.ExecutorInputFormats[0] != "claude" ||
+		len(caps.ExecutorOutputFormats) != 1 || caps.ExecutorOutputFormats[0] != "claude" {
+		t.Fatalf("executor formats = %v / %v, want claude/claude", caps.ExecutorInputFormats, caps.ExecutorOutputFormats)
+	}
 	for name, value := range map[string]bool{
-		"executor":               caps.Executor,
 		"model_router":           caps.ModelRouter,
 		"scheduler":              caps.Scheduler,
 		"management_api":         caps.ManagementAPI,
@@ -116,11 +125,9 @@ func TestModelMethodsReturnStaticCatalog(t *testing.T) {
 }
 
 func TestUnimplementedCapabilityMethodsAreUnknown(t *testing.T) {
-	// 契约：未声明的能力对应的方法绝不路由到任何实现。
+	// 契约：未声明的能力对应的方法绝不路由到任何实现。executor.* 属于
+	// 已实现的 Executor 能力，在 executor_test.go 中单独覆盖。
 	for _, method := range []string{
-		pluginabi.MethodExecutorExecute,
-		pluginabi.MethodExecutorExecuteStream,
-		pluginabi.MethodExecutorIdentifier,
 		pluginabi.MethodManagementRegister,
 		pluginabi.MethodManagementHandle,
 		pluginabi.MethodQuotaFetch,

@@ -98,6 +98,16 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleAuthLoginPoll(request)
 	case pluginabi.MethodAuthRefresh:
 		return handleAuthRefresh(request)
+	case pluginabi.MethodExecutorIdentifier:
+		return handleExecutorIdentifier()
+	case pluginabi.MethodExecutorExecute:
+		return handleExecutorExecute(request)
+	case pluginabi.MethodExecutorExecuteStream:
+		return handleExecutorExecuteStream(request)
+	case pluginabi.MethodExecutorCountTokens:
+		return handleExecutorCountTokens()
+	case pluginabi.MethodExecutorHTTPRequest:
+		return handleExecutorHTTPRequest()
 	case pluginabi.MethodPluginQuiesce:
 		return okEnvelope(struct{}{})
 	case pluginabi.MethodPluginShutdown:
@@ -160,6 +170,13 @@ func pluginRegistration() registration {
 			// Native provider authentication: authorization sessions with
 			// browser login, pollable status, and JWT credential storage.
 			AuthProvider: true,
+			// Anthropic Messages executor over the Coding Plan JWT primary
+			// credential; the upstream speaks the claude format, so the host
+			// translates other client formats in and out.
+			Executor:              true,
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
+			ExecutorInputFormats:  []string{"claude"},
+			ExecutorOutputFormats: []string{"claude"},
 		},
 	}
 }
@@ -194,5 +211,8 @@ func runShutdown() {
 		// Authorization sessions hold OAuth secrets and must never outlive
 		// the plugin.
 		activeSessions.shutdownAll()
+		// In-flight executions pump into host callbacks; cancel them so the
+		// shared library unloads without calling a stopped host.
+		activeExecutions.cancelAll()
 	})
 }

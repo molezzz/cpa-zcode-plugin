@@ -123,7 +123,8 @@ int main(int argc, char** argv) {
 	check(contains(&response, "\"ok\":true"), "plugin.register envelope is ok");
 	check(contains(&response, "\"model_registrar\":true"), "registration declares model_registrar");
 	check(contains(&response, "\"model_provider\":true"), "registration declares model_provider");
-	check(contains(&response, "\"executor\":false"), "registration does not declare executor");
+	check(contains(&response, "\"executor\":true"), "registration declares executor");
+	check(contains(&response, "\"executor_input_formats\":[\"claude\"]"), "registration declares claude input format");
 	plugin.free_buffer(response.ptr, response.len);
 	response.ptr = NULL;
 	response.len = 0;
@@ -137,7 +138,7 @@ int main(int argc, char** argv) {
 	response.ptr = NULL;
 	response.len = 0;
 
-	char bogus_method[] = "executor.execute";
+	char bogus_method[] = "management.handle";
 	rc = plugin.call(bogus_method, NULL, 0, &response);
 	check(contains(&response, "\"ok\":false"), "undeclared capability refused with error envelope");
 	check(contains(&response, "unknown_method"), "refusal carries unknown_method code");
