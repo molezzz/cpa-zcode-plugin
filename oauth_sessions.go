@@ -62,6 +62,11 @@ type authSession struct {
 	state   authSessionState
 	message string
 	result  *completedLogin
+	// finalizing marks the one poll that claimed the right to process an
+	// upstream "ready" verdict. The claimant runs the credential completion,
+	// including the managed key exchange; overlapping polls of the same
+	// session stay pending instead of racing a duplicate exchange.
+	finalizing bool
 }
 
 // newState builds a session with its own random identifiers, HTTP client,
@@ -130,6 +135,21 @@ func (s *authSession) sessionRequestContext(parent context.Context, timeout time
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	return ctx, cancel, true
+}
+
+// beginFinalization claims the one-time right to process an upstream "ready"
+// verdict for this session. Exactly one caller wins; every other concurrent
+// poll must report pending so the host retries and observes the single,
+// consistent completion — the ready path performs upstream side effects
+// (the managed key exchange), so it must never run twice.
+func (s *authSession) beginFinalization() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizing {
+		return false
+	}
+	s.finalizing = true
+	return true
 }
 
 // complete transitions a pending session to completed exactly once and

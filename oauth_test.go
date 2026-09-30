@@ -80,11 +80,14 @@ func (f *fakeAuthStore) Save(_ context.Context, name string, document json.RawMe
 }
 
 // upstreamFixture wires the plugin against an httptest upstream and a fake
-// host auth store. It records every upstream request for assertions.
+// host auth store. It records every upstream request for assertions. The
+// managed key exchange endpoints live on their own fixture, reachable as
+// fixture.keys.
 type upstreamFixture struct {
 	t     *testing.T
 	srv   *httptest.Server
 	store *fakeAuthStore
+	keys  *keyExchangeFixture
 
 	mu            sync.Mutex
 	initAuth      []string
@@ -100,11 +103,13 @@ type upstreamFixture struct {
 }
 
 // newUpstreamFixture redirects oauthUpstreamBase and the auth store to test
-// doubles for the duration of the test.
+// doubles for the duration of the test. The managed key exchange upstream is
+// redirected as well, so a ready poll exercises the whole login closure.
 func newUpstreamFixture(t *testing.T) *upstreamFixture {
 	t.Helper()
 	resetSessions(t)
 	fixture := &upstreamFixture{t: t, store: &fakeAuthStore{docs: map[string]json.RawMessage{}}}
+	fixture.keys = newKeyExchangeFixture(t)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/oauth/cli/init", fixture.serveInit)
 	mux.HandleFunc("/api/v1/oauth/cli/poll/", fixture.servePoll)
@@ -411,6 +416,224 @@ func TestAuthLoginPollSuccessStoresJWTPreservingExistingAccount(t *testing.T) {
 	// it received from the poll result.
 	if len(fixture.store.saves) != 0 {
 		t.Fatalf("plugin must not save credentials directly: %v", fixture.store.saves)
+	}
+}
+
+func TestAuthLoginPollSuccessStoresManagedAPIKeyFallback(t *testing.T) {
+	fixture := newUpstreamFixture(t)
+	token := makeJWT(t, map[string]any{"sub": "user-keyed"})
+
+	fixture.queuePollReady(token)
+	start := fixture.startLogin(t)
+
+	env := pollLogin(t, start.State)
+	if !env.OK {
+		t.Fatalf("poll failed: %+v", env.Error)
+	}
+	response := decodePoll(t, env)
+	if response.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("status = %q (%s), want success", response.Status, response.Message)
+	}
+	// One host account carries both credentials of the same upstream identity.
+	var doc struct {
+		Zcode struct {
+			JWT    map[string]any `json:"jwt"`
+			APIKey map[string]any `json:"api_key"`
+		} `json:"zcode"`
+	}
+	if err := json.Unmarshal(response.Auth.StorageJSON, &doc); err != nil {
+		t.Fatalf("storage not JSON: %v", err)
+	}
+	if doc.Zcode.JWT["token"] != token || doc.Zcode.JWT["status"] != "active" {
+		t.Fatalf("primary JWT missing: %v", doc.Zcode.JWT)
+	}
+	if doc.Zcode.APIKey["status"] != apiKeyStatusActive || doc.Zcode.APIKey["managed"] != true {
+		t.Fatalf("managed fallback key missing: %v", doc.Zcode.APIKey)
+	}
+	if doc.Zcode.APIKey["key_id"] != "key-1" || doc.Zcode.APIKey["key_material"] != "key-1.secret-1" {
+		t.Fatalf("fallback key identity and material not recorded: %v", doc.Zcode.APIKey)
+	}
+	if _, _, create, _ := fixture.keys.counts(); create != 1 {
+		t.Fatalf("create calls = %d, want exactly one key creation", create)
+	}
+}
+
+func TestAuthLoginReLoginReusesManagedKeyWithoutNameSearch(t *testing.T) {
+	fixture := newUpstreamFixture(t)
+	token := makeJWT(t, map[string]any{"sub": "user-keyed"})
+
+	// The account already carries the managed key of a previous login.
+	existing := `{"type":"zcode","host_field":{"keep":1},"zcode":{"schema_version":1,` +
+		`"identity_id":"zcode-user-keyed","jwt":{"token":"old"},"api_key":{` +
+		`"status":"active","managed":true,"name":"cpa-zcode-recorded","key_id":"key-recorded",` +
+		`"key_material":"key-recorded.secret-recorded","organization_id":"org-1","project_id":"proj-1"}}}`
+	fixture.store.entries = []pluginapi.HostAuthFileEntry{{AuthIndex: "a1", Provider: pluginID, Name: "zcode-1.json"}}
+	fixture.store.docs["a1"] = json.RawMessage(existing)
+
+	fixture.queuePollReady(token)
+	start := fixture.startLogin(t)
+
+	env := pollLogin(t, start.State)
+	if !env.OK {
+		t.Fatalf("poll failed: %+v", env.Error)
+	}
+	response := decodePoll(t, env)
+	if response.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("status = %q (%s), want success", response.Status, response.Message)
+	}
+	var doc struct {
+		Zcode struct {
+			JWT    map[string]any `json:"jwt"`
+			APIKey map[string]any `json:"api_key"`
+		} `json:"zcode"`
+	}
+	if err := json.Unmarshal(response.Auth.StorageJSON, &doc); err != nil {
+		t.Fatalf("storage not JSON: %v", err)
+	}
+	if doc.Zcode.JWT["token"] != token {
+		t.Fatalf("the fresh JWT must replace the old one: %v", doc.Zcode.JWT)
+	}
+	if doc.Zcode.APIKey["key_id"] != "key-recorded" || doc.Zcode.APIKey["key_material"] != "key-recorded.secret-recorded" {
+		t.Fatalf("the recorded managed key must be reused: %v", doc.Zcode.APIKey)
+	}
+	if doc.Zcode.APIKey["name"] != "cpa-zcode-recorded" {
+		t.Fatalf("recorded key name changed: %v", doc.Zcode.APIKey)
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(response.Auth.StorageJSON, &generic); err != nil {
+		t.Fatalf("storage not JSON: %v", err)
+	}
+	if _, ok := generic["host_field"].(map[string]any); !ok {
+		t.Fatalf("unknown host field lost: %s", response.Auth.StorageJSON)
+	}
+	// Reuse means reuse: no business login, no discovery, no creation, no
+	// adoption or modification of any existing upstream key.
+	if login, info, create, copy := fixture.keys.counts(); login+info+create+copy != 0 {
+		t.Fatalf("re-login with a recorded key must not touch the key exchange upstream (login %d info %d create %d copy %d)", login, info, create, copy)
+	}
+}
+
+func TestAuthLoginPollReadyFinalizesExactlyOnce(t *testing.T) {
+	fixture := newUpstreamFixture(t)
+	token := makeJWT(t, map[string]any{"sub": "user-raced"})
+	fixture.queuePollReady(token)
+	fixture.queuePollReady(token)
+	fixture.keys.createStarted = make(chan struct{}, 1)
+	fixture.keys.blockCreate = make(chan struct{})
+	releaseCreate := func() {
+		fixture.keys.mu.Lock()
+		block := fixture.keys.blockCreate
+		fixture.keys.blockCreate = nil
+		fixture.keys.mu.Unlock()
+		if block != nil {
+			close(block)
+		}
+	}
+	defer releaseCreate()
+
+	start := fixture.startLogin(t)
+
+	first := make(chan pluginabi.Envelope, 1)
+	go func() {
+		first <- pollLogin(t, start.State)
+	}()
+
+	select {
+	case <-fixture.keys.createStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first poll never reached key creation")
+	}
+
+	// An overlapping poll of the same session must stay pending instead of
+	// racing a second exchange.
+	second := pollLogin(t, start.State)
+	if !second.OK {
+		t.Fatalf("second poll failed: %+v", second.Error)
+	}
+	if response := decodePoll(t, second); response.Status != pluginapi.AuthLoginStatusPending {
+		t.Fatalf("overlapping poll status = %q (%s), want pending while finalizing", response.Status, response.Message)
+	}
+
+	// Let the key creation finish so the finalizing poll can complete.
+	releaseCreate()
+
+	env := <-first
+	if !env.OK {
+		t.Fatalf("first poll failed: %+v", env.Error)
+	}
+	response := decodePoll(t, env)
+	if response.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("status = %q (%s), want success", response.Status, response.Message)
+	}
+	var doc struct {
+		Zcode struct {
+			APIKey map[string]any `json:"api_key"`
+		} `json:"zcode"`
+	}
+	if err := json.Unmarshal(response.Auth.StorageJSON, &doc); err != nil {
+		t.Fatalf("storage not JSON: %v", err)
+	}
+	if doc.Zcode.APIKey["key_id"] != "key-1" {
+		t.Fatalf("first success must carry the managed key: %v", doc.Zcode.APIKey)
+	}
+	if login, _, create, copy := fixture.keys.counts(); login != 1 || create != 1 || copy != 1 {
+		t.Fatalf("the ready path must exchange exactly once (login %d create %d copy %d)", login, create, copy)
+	}
+
+	// A later poll replays the completed result, managed key included.
+	replay := pollLogin(t, start.State)
+	if !replay.OK {
+		t.Fatalf("replay poll failed: %+v", replay.Error)
+	}
+	replayed := decodePoll(t, replay)
+	if replayed.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("replay status = %q, want success", replayed.Status)
+	}
+	if !strings.Contains(string(replayed.Auth.StorageJSON), `"key_id":"key-1"`) {
+		t.Fatalf("replayed result lost the managed key: %s", replayed.Auth.StorageJSON)
+	}
+}
+
+func TestAuthLoginPollSuccessSurvivesManagedKeyExchangeFailure(t *testing.T) {
+	fixture := newUpstreamFixture(t)
+	token := makeJWT(t, map[string]any{"sub": "user-failed"})
+	fixture.keys.mu.Lock()
+	fixture.keys.loginStatus = http.StatusInternalServerError
+	fixture.keys.mu.Unlock()
+
+	fixture.queuePollReady(token)
+	start := fixture.startLogin(t)
+
+	env := pollLogin(t, start.State)
+	if !env.OK {
+		t.Fatalf("poll failed: %+v", env.Error)
+	}
+	response := decodePoll(t, env)
+	if response.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("a managed key exchange failure must not fail the JWT login: %q (%s)", response.Status, response.Message)
+	}
+	var doc struct {
+		Zcode struct {
+			JWT    map[string]any `json:"jwt"`
+			APIKey map[string]any `json:"api_key"`
+		} `json:"zcode"`
+	}
+	if err := json.Unmarshal(response.Auth.StorageJSON, &doc); err != nil {
+		t.Fatalf("storage not JSON: %v", err)
+	}
+	if doc.Zcode.JWT["token"] != token || doc.Zcode.JWT["status"] != "active" {
+		t.Fatalf("the saved JWT must be untouched by the exchange failure: %v", doc.Zcode.JWT)
+	}
+	if doc.Zcode.APIKey["status"] != apiKeyStatusFailed {
+		t.Fatalf("api_key status = %v, want a diagnosable failed state", doc.Zcode.APIKey["status"])
+	}
+	raw, err := json.Marshal(doc.Zcode.APIKey["last_error"])
+	if err != nil {
+		t.Fatalf("last_error missing: %v", doc.Zcode.APIKey)
+	}
+	var failure keyOpError
+	if err := json.Unmarshal(raw, &failure); err != nil || failure.Stage != apiKeyStageLogin {
+		t.Fatalf("last_error stage = %+v, want the login stage", failure)
 	}
 }
 

@@ -298,6 +298,20 @@ func interpretPollBody(ctx context.Context, session *authSession, body []byte) (
 			session.fail("authorization completed without a coding plan credential")
 			return pollResponse(pluginapi.AuthLoginStatusError, "authorization completed without a coding plan credential", nil), nil
 		}
+		if !session.beginFinalization() {
+			// Another poll of this session is completing the credentials,
+			// including the managed key exchange; report pending so the host
+			// retries and observes the single consistent completion.
+			return pollResponse(pluginapi.AuthLoginStatusPending, "finalizing authorization", nil), nil
+		}
+		if snap := session.snapshot(); snap.State != authSessionPending {
+			// A concurrent poll expired or failed the session between the
+			// upstream read and here; report the stable terminal outcome and
+			// skip the credential completion (and its upstream side effects).
+			if reply, done := terminalPollResponse(session); done {
+				return reply, nil
+			}
+		}
 		storage, identityID, err := completeLoginStorage(token, accessToken)
 		if err != nil {
 			session.fail(err.Error())
@@ -325,8 +339,11 @@ func interpretPollBody(ctx context.Context, session *authSession, body []byte) (
 // completeLoginStorage builds the plugin-owned namespace for a fresh JWT by
 // patching the previous auth document of the same identity, so a re-login
 // never destroys host fields or the managed API key of an existing account.
-// The host store read uses its own deadline: it must not be cut short by the
-// session TTL, which only bounds upstream OAuth traffic.
+// The fresh OAuth access token, when present, is spent on the managed key
+// exchange in the same pass; its outcome is recorded as diagnosable api_key
+// state and never fails or rolls back the JWT login. The host store read uses
+// its own deadline: it must not be cut short by the session TTL, which only
+// bounds upstream OAuth traffic.
 func completeLoginStorage(token, accessToken string) ([]byte, string, error) {
 	subject, ok := zcodeSubjectFromJWT(token)
 	if !ok {
@@ -343,7 +360,7 @@ func completeLoginStorage(token, accessToken string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("authorization result could not be stored")
 	}
-	return doc, identityID, nil
+	return attachManagedAPIKey(doc, accessToken, time.Now()), identityID, nil
 }
 
 // oauthStoreReadTimeout bounds the host auth store round trip during login

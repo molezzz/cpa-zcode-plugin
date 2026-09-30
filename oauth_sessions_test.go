@@ -121,6 +121,22 @@ func TestSessionCompletesExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestSessionFinalizationIsClaimedExactlyOnce(t *testing.T) {
+	resetSessions(t)
+	session, _ := newTestSession(t, activeSessions, "flow-claim")
+
+	if !session.beginFinalization() {
+		t.Fatal("first finalization claim must win")
+	}
+	if session.beginFinalization() {
+		t.Fatal("second finalization claim must lose: the ready path must never run twice")
+	}
+	// The claim does not change the lifecycle state; completion still governs.
+	if snap := session.snapshot(); snap.State != authSessionPending {
+		t.Fatalf("state = %q after claiming, want pending", snap.State)
+	}
+}
+
 func TestSessionFailureIsFinalAndProtected(t *testing.T) {
 	resetSessions(t)
 	session, _ := newTestSession(t, activeSessions, "flow-fail")
