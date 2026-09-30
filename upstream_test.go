@@ -17,10 +17,11 @@ import (
 // testProfile builds an immutable profile aimed at an httptest server.
 func testProfile(t *testing.T, serverURL string, mutate func(*ResolvedProfile)) ResolvedProfile {
 	t.Helper()
-	profile, err := buildProfile(testAuthDoc("jwt-token-1", jwtStatusActive), testConfig(), "GLM-5.2", nil)
-	if err != nil {
-		t.Fatalf("buildProfile: %v", err)
+	plan := executionPlan(testAuthDoc("jwt-token-1", jwtStatusActive), testConfig(), "GLM-5.2", nil, time.Now())
+	if plan.Failure != nil {
+		t.Fatalf("executionPlan: %+v", plan.Failure)
 	}
+	profile := plan.Primary
 	profile.MessagesURL = serverURL + "/api/v1/zcode-plan/anthropic/v1/messages"
 	if mutate != nil {
 		mutate(&profile)
@@ -140,7 +141,13 @@ func TestPumpUpstreamClassifiesNon2xx(t *testing.T) {
 		{"forbidden", 403, `{"error":{"message":"forbidden"}}`, failureInvalid, "credential_invalid", 403},
 		{"captcha", 403, `{"error":{"message":"captcha verification required"}}`, failureVerificationBlocked, "upstream_verification_required", 403},
 		{"verify token", 403, "verify token missing", failureVerificationBlocked, "upstream_verification_required", 403},
-		{"payment required", 402, `{}`, failureExhausted, "upstream_quota_exhausted", 402},
+		{"payment required with a confirmed quota", 402, `{"error":{"message":"insufficient balance"}}`, failureExhausted, "upstream_quota_exhausted", 402},
+		// A 402 whose body names another reason is not exhaustion: the exhausted
+		// state has no retry window, so a guess would disable the credential.
+		{"payment required for another reason", 402, `{"error":{"message":"this account requires a billing profile"}}`, failureRejected, "upstream_rejected", 402},
+		{"payment required with an empty body", 402, `{}`, failureRejected, "upstream_rejected", 402},
+		{"verification required", 403, `{"error":{"message":"verification required"}}`, failureVerificationBlocked, "upstream_verification_required", 403},
+		{"verify token missing", 403, `{"error":{"message":"verify token missing"}}`, failureVerificationBlocked, "upstream_verification_required", 403},
 		{"quota keyword on 400 stays a rejection", 400, `{"error":{"message":"quota insufficient for this request"}}`, failureRejected, "upstream_rejected", 400},
 		{"rate limited", 429, `{}`, failureCooldown, "upstream_rate_limited", 429},
 		{"server error", 500, `{}`, failureCooldown, "upstream_unavailable", 502},

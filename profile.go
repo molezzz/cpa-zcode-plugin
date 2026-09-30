@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -19,9 +18,19 @@ var zcodePlanUpstreamBase = "https://zcode.z.ai"
 // Coding Plan JWT credentials.
 const zcodeMessagesPath = "/api/v1/zcode-plan/anthropic/v1/messages"
 
-// messagesEndpointURL builds the absolute upstream Messages URL.
+// zaiMessagesPath is the Z.AI business Anthropic Messages endpoint served for
+// the managed fallback API key. It shares the base with the key exchange.
+const zaiMessagesPath = "/api/anthropic/v1/messages"
+
+// messagesEndpointURL builds the absolute Coding Plan Messages URL.
 func messagesEndpointURL() string {
 	return strings.TrimRight(zcodePlanUpstreamBase, "/") + zcodeMessagesPath
+}
+
+// zaiMessagesEndpointURL builds the absolute Z.AI Messages URL used by the
+// managed fallback key.
+func zaiMessagesEndpointURL() string {
+	return strings.TrimRight(zaiAPIBase, "/") + zaiMessagesPath
 }
 
 // Observed upstream product headers. The Coding Plan endpoint routes plan
@@ -36,15 +45,24 @@ const (
 )
 
 // CredentialKind names which credential form an upstream profile authenticates
-// with. JWT is the primary credential; the managed API key is the fallback
-// introduced by a later milestone.
+// with. The Coding Plan JWT is the primary credential and the plugin-managed
+// API key is the fallback for the same upstream identity.
 type CredentialKind string
 
 const (
-	// CredentialJWT is the primary credential kind used in this slice; the
-	// managed API key fallback kind arrives with the fallback milestone.
+	// CredentialJWT is the primary credential: it is attempted first and its
+	// conclusions drive the recovery of its own state.
 	CredentialJWT CredentialKind = "jwt"
+	// CredentialAPIKey is the fallback credential: it is attempted only after
+	// the primary became unusable, and its conclusions are recorded
+	// separately from the primary's.
+	CredentialAPIKey CredentialKind = "api_key"
 )
+
+// credentialStatusCooldown is the temporary, windowed conclusion both
+// credential schemas spell identically. It is a separate constant so that a
+// switch over either vocabulary never has to list the same value twice.
+const credentialStatusCooldown = "cooldown"
 
 // JWT credential states persisted in the zcode namespace. Only jwtStatusActive
 // (or an unset status on legacy documents) allows execution attempts.
@@ -53,64 +71,128 @@ const (
 	jwtStatusInvalid             = "invalid"
 	jwtStatusExhausted           = "exhausted"
 	jwtStatusVerificationBlocked = "verification_blocked"
-	jwtStatusCooldown            = "cooldown"
+	jwtStatusCooldown            = credentialStatusCooldown
 )
 
-// credentialErrors distinguish why a profile could not be built. Both are
-// sanitized before they reach an error envelope; they never quote the
-// document or its secrets.
+// Managed API key availability conclusions. The exchange statuses describe how
+// the key material was obtained (active, failed, needs_selection, unavailable);
+// apiKeyStatusCooldown and apiKeyStatusInvalid describe what the upstream
+// concluded when the key was actually used, so a rejected key is never retried
+// on every request.
+const (
+	apiKeyStatusCooldown  = credentialStatusCooldown
+	apiKeyStatusInvalid   = "invalid"
+	apiKeyStatusExhausted = "exhausted"
+)
+
+// credentialErrors distinguish why a profile could not be built. All are
+// sanitized before they reach an error envelope; they never quote the document
+// or its secrets.
 var (
 	errNoCredential = errors.New("zcode credential is missing or incomplete; complete the ZCode login again")
-	// errCredentialUnavailable covers credentials recorded as not currently
+	// errCredentialUnavailable covers any credential recorded as not currently
 	// usable (invalid, exhausted, verification-blocked, or cooling down).
-	errCredentialUnavailable = errors.New("zcode primary credential is currently unavailable; refresh the credential or log in again")
+	errCredentialUnavailable = errors.New("zcode credential is currently unavailable; refresh the credential or log in again")
+	// errAuthDocument marks a stored record the plugin cannot read as a
+	// credential document. It carries no document content.
+	errAuthDocument = errors.New("auth document is not valid JSON")
 )
 
 // credentialSnapshot is the read-only view of the plugin-owned zcode
-// namespace of one host auth record.
+// namespace of one host auth record: both credential forms of the same
+// upstream identity, each with its own recorded state.
 type credentialSnapshot struct {
 	IdentityID string
 	JWTToken   string
 	JWTStatus  string
+	// JWTRetryAfter is the recorded retry window of a windowed JWT state; an
+	// elapsed window means the JWT is usable again.
+	JWTRetryAfter string
+	// APIKeyToken is the callable material of the plugin-managed fallback
+	// key. APIKeyStatus is its own availability conclusion, independent of
+	// the JWT's, and APIKeyRetryAfter is the window of a windowed key state.
+	APIKeyToken      string
+	APIKeyStatus     string
+	APIKeyRetryAfter string
 }
 
 // readCredentialSnapshot decodes the plugin-owned namespace of an auth
-// document. Unknown host-owned fields around it are ignored. jwtStatus is
-// empty on legacy documents that predate explicit status tracking.
+// document. Unknown host-owned fields around it are ignored. An absent status
+// is empty on legacy documents that predate explicit status tracking.
 func readCredentialSnapshot(doc []byte) (credentialSnapshot, error) {
 	var root struct {
 		Zcode struct {
 			IdentityID string `json:"identity_id"`
 			JWT        struct {
-				Token  string `json:"token"`
-				Status string `json:"status"`
+				Token      string `json:"token"`
+				Status     string `json:"status"`
+				RetryAfter string `json:"retry_after"`
 			} `json:"jwt"`
+			APIKey struct {
+				Material   string `json:"key_material"`
+				Status     string `json:"status"`
+				RetryAfter string `json:"retry_after"`
+			} `json:"api_key"`
 		} `json:"zcode"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(doc), &root); err != nil {
-		return credentialSnapshot{}, fmt.Errorf("auth document is not valid JSON")
+		return credentialSnapshot{}, errAuthDocument
 	}
 	snap := credentialSnapshot{
-		IdentityID: strings.TrimSpace(root.Zcode.IdentityID),
-		JWTToken:   strings.TrimSpace(root.Zcode.JWT.Token),
-		JWTStatus:  strings.ToLower(strings.TrimSpace(root.Zcode.JWT.Status)),
+		IdentityID:       strings.TrimSpace(root.Zcode.IdentityID),
+		JWTToken:         strings.TrimSpace(root.Zcode.JWT.Token),
+		JWTStatus:        normalizeStatus(root.Zcode.JWT.Status),
+		JWTRetryAfter:    strings.TrimSpace(root.Zcode.JWT.RetryAfter),
+		APIKeyToken:      strings.TrimSpace(root.Zcode.APIKey.Material),
+		APIKeyStatus:     normalizeStatus(root.Zcode.APIKey.Status),
+		APIKeyRetryAfter: strings.TrimSpace(root.Zcode.APIKey.RetryAfter),
 	}
-	if snap.JWTToken == "" {
+	if snap.JWTToken == "" && snap.APIKeyToken == "" {
 		return credentialSnapshot{}, errNoCredential
 	}
 	return snap, nil
 }
 
+// normalizeStatus folds a recorded status onto the lower-case form the state
+// machine compares on.
+func normalizeStatus(status string) string {
+	return strings.ToLower(strings.TrimSpace(status))
+}
+
 // jwtUsable reports whether a recorded JWT state may attempt upstream
-// execution. Unknown status strings are treated as usable: the upstream API
+// execution now. Unknown status strings are treated as usable: the upstream API
 // verifies the token on every request, so a stale or unrecognized status must
-// not strand a possibly-valid credential.
-func jwtUsable(status string) bool {
+// not strand a possibly-valid credential. A windowed state is usable again
+// once its retry window has passed, which is how a verification block
+// automatically retries after five minutes.
+func jwtUsable(status string, retryAfter string, now time.Time) bool {
 	switch status {
 	case "", jwtStatusActive:
 		return true
-	case jwtStatusInvalid, jwtStatusExhausted, jwtStatusVerificationBlocked, jwtStatusCooldown:
+	case jwtStatusInvalid, jwtStatusExhausted:
 		return false
+	case jwtStatusVerificationBlocked, jwtStatusCooldown:
+		return !retryWindowPending(retryAfter, now)
+	default:
+		return true
+	}
+}
+
+// apiKeyUsable reports whether the managed fallback key may be attempted. The
+// exchange states describe how the key material was obtained rather than what
+// the upstream concluded about it, so a key whose selection is still pending or
+// whose last exchange failed stays usable; only a key the upstream itself
+// rejected, exhausted, or rate-limited is skipped. apiKeyStatusUnavailable is
+// written only when the exchange never obtained a key identity at all, so no
+// material can exist for it.
+func apiKeyUsable(status, retryAfter string, now time.Time) bool {
+	switch status {
+	case "", apiKeyStatusActive, apiKeyStatusFailed, apiKeyStatusNeedsSelection:
+		return true
+	case apiKeyStatusInvalid, apiKeyStatusExhausted, apiKeyStatusUnavailable:
+		return false
+	case apiKeyStatusCooldown:
+		return !retryWindowPending(retryAfter, now)
 	default:
 		return true
 	}
@@ -139,39 +221,39 @@ type ResolvedProfile struct {
 	IdleReadTimeout time.Duration
 }
 
-// buildProfile resolves one execution attempt's upstream profile from a host
-// auth document, the config snapshot, and the caller request headers (filtered
-// through the allowlist). The model id is normalized against the plugin
-// catalog. Errors are credential-classified and sanitized.
-func buildProfile(doc []byte, cfg Config, model string, callerHeaders http.Header) (ResolvedProfile, error) {
-	snap, err := readCredentialSnapshot(doc)
-	if err != nil {
-		return ResolvedProfile{}, err
-	}
-	if !jwtUsable(snap.JWTStatus) {
-		return ResolvedProfile{}, credentialStatusError{Status: snap.JWTStatus}
-	}
-	cfg = normalizeConfig(cfg)
-	return ResolvedProfile{
+// newProfile builds one credential's immutable profile. Endpoint and
+// authentication depend on the credential kind alone: the primary reaches the
+// Coding Plan endpoint with a bearer JWT, the fallback reaches the Z.AI
+// endpoint with the managed key in x-api-key.
+func newProfile(snap credentialSnapshot, kind CredentialKind, cfg Config, model string, callerHeaders http.Header) ResolvedProfile {
+	profile := ResolvedProfile{
 		IdentityID:       snap.IdentityID,
-		CredentialKind:   CredentialJWT,
+		CredentialKind:   kind,
 		MessagesURL:      messagesEndpointURL(),
 		ModelID:          normalizeRequestModel(model, cfg.Models),
-		Headers:          buildUpstreamHeaders(snap.JWTToken, callerHeaders),
+		Headers:          buildUpstreamHeaders(callerHeaders),
 		MaxResponseBytes: cfg.Upstream.MaxResponseBytes,
 		ConnectTimeout:   time.Duration(cfg.Upstream.ConnectTimeoutSeconds) * time.Second,
 		HeaderTimeout:    time.Duration(cfg.Upstream.RequestTimeoutSeconds) * time.Second,
 		IdleReadTimeout:  time.Duration(cfg.Upstream.RequestTimeoutSeconds) * time.Second,
-	}, nil
+	}
+	if kind == CredentialAPIKey {
+		profile.MessagesURL = zaiMessagesEndpointURL()
+		profile.Headers.Set("x-api-key", snap.APIKeyToken)
+		return profile
+	}
+	profile.Headers.Set("Authorization", "Bearer "+snap.JWTToken)
+	return profile
 }
 
-// buildUpstreamHeaders constructs the complete upstream header set: the
-// plugin's own authentication and product headers plus exactly the allowlisted
-// caller headers. Everything else — caller credentials, cookies, proxy
-// credentials, host-control headers, and any X-ZCode-* header — is dropped.
-// The result is a fresh header map; mutating it cannot leak into other
-// profiles.
-func buildUpstreamHeaders(jwtToken string, callerHeaders http.Header) http.Header {
+// buildUpstreamHeaders constructs the product and protocol header set plus
+// exactly the allowlisted caller headers. Everything else — caller credentials,
+// cookies, proxy credentials, host-control headers, and any X-ZCode-* header —
+// is dropped. Authentication is added by newProfile from the host-managed
+// credential, so a caller Authorization/x-api-key value can never reach the
+// upstream, and the two credential forms cannot inherit each other's header. The
+// result is a fresh header map; mutating it cannot leak into other profiles.
+func buildUpstreamHeaders(callerHeaders http.Header) http.Header {
 	headers := http.Header{}
 	for name, values := range callerHeaders {
 		if !callerHeaderAllowed(name) {
@@ -190,9 +272,6 @@ func buildUpstreamHeaders(jwtToken string, callerHeaders http.Header) http.Heade
 	headers.Set("X-ZCode-App-Version", zcodeAppVersionHeader)
 	headers.Set("X-ZCode-Agent", zcodeAgentHeader)
 	headers.Set("HTTP-Referer", zcodeReferer)
-	// Authentication is constructed here from the host-managed credential;
-	// caller Authorization/x-api-key values were dropped above.
-	headers.Set("Authorization", "Bearer "+jwtToken)
 	return headers
 }
 

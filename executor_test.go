@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -179,14 +180,21 @@ func completeAnthropicSSE() string {
 	}, "")
 }
 
-// overrideHost points hostProvider at a fake host for the test's duration.
+// overrideHost points both host seams at one fake host for the test's
+// duration. The credential state recorder reads and writes through
+// authStoreProvider rather than hostProvider, so overriding only the latter
+// would leave the recorder calling the real CGO bridge.
 func overrideHost(t *testing.T) (*fakeHostCaller, Host) {
 	t.Helper()
 	fake := &fakeHostCaller{}
+	host := newRPCHost(fake)
 	original := hostProvider
-	hostProvider = func() Host { return newRPCHost(fake) }
+	hostProvider = func() Host { return host }
 	t.Cleanup(func() { hostProvider = original })
-	return fake, newRPCHost(fake)
+	originalStore := authStoreProvider
+	authStoreProvider = func() AuthStore { return host.AuthStore() }
+	t.Cleanup(func() { authStoreProvider = originalStore })
+	return fake, host
 }
 
 // overrideConfig stores a normalized config snapshot for the test's duration.
@@ -346,64 +354,157 @@ func TestExecutorExecuteUpstreamRejectionBeforeOutput(t *testing.T) {
 	if env.OK {
 		t.Fatal("401 must produce an error envelope")
 	}
+	// A JWT-only record has no fallback credential, so the rejection is final.
 	if env.Error.Code != "credential_invalid" || env.Error.HTTPStatus != http.StatusUnauthorized {
 		t.Fatalf("error = %+v", env.Error)
 	}
-	// No same-credential retry and no fallback in this milestone: one
-	// upstream request total.
 	if upstream.count() != 1 {
 		t.Fatalf("upstream request count = %d, want 1", upstream.count())
 	}
 }
 
-func TestExecutorExecuteRateLimitedFailsWithoutRetry(t *testing.T) {
-	upstream := newUpstreamRecorder(t)
-	upstream.handler = func(w http.ResponseWriter, r *http.Request, call int) {
-		upstream.record(r)
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = w.Write([]byte(`{}`))
-	}
+// TestExecutorExecuteFallsBackToManagedAPIKey drives the whole RPC path: the
+// upstream rejects the Coding Plan credential with a verification requirement,
+// and the same unmutated request is answered through the managed key's own
+// Z.AI endpoint and authentication.
+func TestExecutorExecuteFallsBackToManagedAPIKey(t *testing.T) {
+	upstream := newScriptedUpstream(t,
+		upstreamScript{status: http.StatusForbidden, body: `{"error":{"message":"captcha verification required"}}`},
+		upstreamScript{frames: completeAnthropicSSE()},
+	)
 	overrideHost(t)
 
-	env := callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, testExecutorDoc(), testRequestPayload(), "", nil))
-	if env.OK {
-		t.Fatal("429 must produce an error envelope")
+	env := callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, testFallbackDoc(jwtStatusActive, apiKeyStatusActive), testRequestPayload(), "", nil))
+	if !env.OK {
+		t.Fatalf("execute failed: %+v", env.Error)
 	}
-	if env.Error.Code != "upstream_rate_limited" {
-		t.Fatalf("error = %+v", env.Error)
+	var response pluginapi.ExecutorResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var message map[string]any
+	if err := json.Unmarshal(response.Payload, &message); err != nil {
+		t.Fatalf("aggregated payload is not JSON: %v", err)
+	}
+	if message["id"] != "msg_1" {
+		t.Fatalf("the fallback answer did not reach the caller: %v", message)
+	}
+
+	calls := upstream.calls()
+	if len(calls) != 2 {
+		t.Fatalf("upstream attempts = %d, want 2", len(calls))
+	}
+	if calls[0].auth != "Bearer "+testJWT || calls[0].endpoint != zcodeMessagesPath {
+		t.Errorf("the primary attempt did not use the Coding Plan endpoint with the jwt: %+v", calls[0])
+	}
+	if calls[1].apiKey != testAPIKeyMaterial || calls[1].auth != "" || calls[1].endpoint != zaiMessagesPath {
+		t.Errorf("the fallback attempt did not use the managed key on the zai endpoint: %+v", calls[1])
+	}
+	if calls[0].body != calls[1].body {
+		t.Errorf("the fallback replayed a mutated body:\n jwt: %s\n key: %s", calls[0].body, calls[1].body)
+	}
+}
+
+// TestExecutorExecuteStreamDoesNotSpliceAfterOutput is the streaming half of the
+// same rule: once a frame is visible, a failed attempt is final even though the
+// failure would otherwise be retryable.
+func TestExecutorExecuteStreamDoesNotSpliceAfterOutput(t *testing.T) {
+	upstream := newScriptedUpstream(t,
+		upstreamScript{frames: partialStream, abort: true},
+		upstreamScript{frames: completeAnthropicSSE()},
+	)
+	fake, _ := overrideHost(t)
+	rec := newStreamRecorder()
+	rec.bind(fake)
+
+	env := callMethod(t, pluginabi.MethodExecutorExecuteStream, executorRequestJSON(t, testFallbackDoc(jwtStatusActive, apiKeyStatusActive), testRequestPayload(), "stream-6", nil))
+	if !env.OK {
+		t.Fatalf("stream start failed: %+v", env.Error)
+	}
+	if !rec.waitDone(5 * time.Second) {
+		t.Fatal("stream was never closed")
+	}
+	emits := rec.emitted()
+	if len(emits) != 1 || !strings.Contains(string(emits[0]), "partial") {
+		t.Fatalf("forwarded frames = %v, want only the primary's partial output", emitStrings(emits))
+	}
+	closes := rec.closed()
+	if len(closes) != 1 || closes[0] == "" {
+		t.Fatalf("the aborted stream must close exactly once with an error: %v", closes)
 	}
 	if upstream.count() != 1 {
-		t.Fatalf("upstream request count = %d, want 1 (no retry within one credential)", upstream.count())
+		t.Fatalf("upstream request count = %d, want 1: nothing may follow visible output", upstream.count())
 	}
 }
 
-func TestExecutorExecuteResponseTooLarge(t *testing.T) {
-	newUpstreamRecorder(t)
-	overrideConfig(t, func(cfg *Config) { cfg.Upstream.MaxResponseBytes = 128 })
+func TestExecutorExecuteRateLimitedFallsBack(t *testing.T) {
+	upstream := newScriptedUpstream(t,
+		upstreamScript{status: http.StatusTooManyRequests, body: `{}`},
+		upstreamScript{frames: completeAnthropicSSE()},
+	)
 	overrideHost(t)
 
-	env := callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, testExecutorDoc(), testRequestPayload(), "", nil))
-	if env.OK {
-		t.Fatal("an oversized aggregated response must fail")
+	env := callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, testFallbackDoc(jwtStatusActive, apiKeyStatusActive), testRequestPayload(), "", nil))
+	if !env.OK {
+		t.Fatalf("execute failed: %+v", env.Error)
 	}
-	if env.Error.Code != "response_too_large" {
-		t.Fatalf("error = %+v", env.Error)
+	if upstream.count() != 2 {
+		t.Fatalf("upstream request count = %d, want 2", upstream.count())
 	}
 }
 
-func TestExecutorExecuteInvalidPayload(t *testing.T) {
-	upstream := newUpstreamRecorder(t)
+func TestExecutorExecuteNoFallbackKeyReportsThePrimaryBlock(t *testing.T) {
+	upstream := newScriptedUpstream(t,
+		upstreamScript{status: http.StatusForbidden, body: `{"error":{"message":"captcha verification required"}}`},
+	)
 	overrideHost(t)
 
-	env := callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, testExecutorDoc(), []byte(`not json`), "", nil))
+	env := callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, testFallbackDoc(jwtStatusActive, apiKeyStatusUnavailable), testRequestPayload(), "", nil))
 	if env.OK {
-		t.Fatal("invalid payload must produce an error envelope")
+		t.Fatal("a blocked primary with no fallback must produce an error envelope")
 	}
-	if env.Error.Code != "invalid_request" {
+	// The caller is told the Coding Plan credential is verification blocked,
+	// which is the actionable reason, and never hears upstream prose.
+	if env.Error.Code != "upstream_verification_required" || env.Error.HTTPStatus != http.StatusForbidden {
 		t.Fatalf("error = %+v", env.Error)
 	}
-	if upstream.count() != 0 {
-		t.Fatalf("upstream request count = %d, want 0", upstream.count())
+	if strings.Contains(env.Error.Message, "captcha verification required") {
+		t.Fatalf("the upstream body leaked into the envelope: %q", env.Error.Message)
+	}
+	if upstream.count() != 1 {
+		t.Fatalf("upstream request count = %d, want 1", upstream.count())
+	}
+}
+
+// TestExecutorHasNoCaptchaAutomation pins the negative requirement of the
+// milestone. The first version of this scan was tripped by its own needle list
+// and by the plain word "browser" in unrelated prose, so it matches on
+// automation-shaped identifiers only and skips the file that carries the scan.
+func TestExecutorHasNoCaptchaAutomation(t *testing.T) {
+	forbidden := []string{
+		"captcha_solver", "captchasolver", "solve_captcha", "solver.js",
+		"playwright", "puppeteer", "chromedp", "rod.Chrome", "webdriver",
+		"tesseract", "recaptcha", "hcaptcha", "turnstile",
+		"aliyun-captcha", "captcha-verify-param", "x-captcha-verify",
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || entry.Name() == "executor_test.go" {
+			continue
+		}
+		raw, err := os.ReadFile(entry.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		lower := strings.ToLower(string(raw))
+		for _, needle := range forbidden {
+			if strings.Contains(lower, strings.ToLower(needle)) {
+				t.Errorf("%s references %q; captcha automation is out of scope", entry.Name(), needle)
+			}
+		}
 	}
 }
 

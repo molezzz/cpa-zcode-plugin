@@ -158,8 +158,36 @@ func (f *upstreamFailure) Error() string { return f.Message }
 
 // captchaMarkers are the observed upstream body markers for verification
 // rejections. The upstream signals verification requirements inside the
-// response body rather than only in the status code.
-var captchaMarkers = []string{"captcha", "verify token", "verify failed"}
+// response body rather than only in the status code. Each marker is checked
+// for a specific way the upstream asks for verification, so a 403 whose body
+// merely mentions an unrelated kind of "check" is still classified as a
+// credential rejection rather than as verification blocked.
+var captchaMarkers = []string{
+	"captcha",
+	"verify token",
+	"verify failed",
+	"verification required",
+	"verification failed",
+	"needs verification",
+	"requires verification",
+	"risk control",
+}
+
+// exhaustionMarkers are the body markers that confirm a 402 really is quota
+// exhaustion. A 402 with no marker, or one whose body names a different reason,
+// is not exhaustion: the exhausted state has no retry window, so recording it
+// on a guess would disable the credential until a quota refresh.
+var exhaustionMarkers = []string{
+	"quota",
+	"insufficient",
+	"exceed",
+	"balance",
+	"arrears",
+	"欠费",
+	"额度",
+	"余额",
+	"配额",
+}
 
 func containsMarker(body string, markers []string) bool {
 	lower := strings.ToLower(body)
@@ -178,32 +206,38 @@ func classifyUpstreamFailure(status int, body []byte) *upstreamFailure {
 	bodyText := string(body)
 	switch {
 	case status == http.StatusForbidden && containsMarker(bodyText, captchaMarkers):
+		// A verification requirement is a definitive conclusion about this
+		// credential, so the request moves on to the fallback credential
+		// instead of repeating the primary.
 		return &upstreamFailure{
-			Class:          failureVerificationBlocked,
-			UpstreamStatus: status,
-			ClientStatus:   http.StatusForbidden,
-			Code:           "upstream_verification_required",
-			Message:        "upstream verification is required before the Coding Plan credential can be used; no verification is automated",
+			Class:                 failureVerificationBlocked,
+			UpstreamStatus:        status,
+			ClientStatus:          http.StatusForbidden,
+			Code:                  "upstream_verification_required",
+			Message:               "upstream verification is required before the Coding Plan credential can be used; no verification is automated",
+			RetryableBeforeOutput: true,
 		}
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		return &upstreamFailure{
-			Class:          failureInvalid,
-			UpstreamStatus: status,
-			ClientStatus:   status,
-			Code:           "credential_invalid",
-			Message:        "upstream rejected the credential; refresh it or complete the ZCode login again",
+			Class:                 failureInvalid,
+			UpstreamStatus:        status,
+			ClientStatus:          status,
+			Code:                  "credential_invalid",
+			Message:               "upstream rejected the credential; refresh it or complete the ZCode login again",
+			RetryableBeforeOutput: true,
 		}
-	case status == http.StatusPaymentRequired:
-		// Exhaustion is confirmed only by the observed 402 signal. Quota
-		// keywords inside other statuses stay with that status's class, so
-		// a schema rejection that merely mentions quota is never recorded
-		// as exhaustion.
+	case status == http.StatusPaymentRequired && containsMarker(bodyText, exhaustionMarkers):
+		// Exhaustion is recorded only when the 402 body confirms it. A payment
+		// requirement for some other reason is a plain request rejection, because
+		// the exhausted state is permanent: recording it for the wrong reason
+		// would strand the credential until a quota refresh recovered it.
 		return &upstreamFailure{
-			Class:          failureExhausted,
-			UpstreamStatus: status,
-			ClientStatus:   http.StatusPaymentRequired,
-			Code:           "upstream_quota_exhausted",
-			Message:        "upstream quota is exhausted for this credential; refresh the quota to restore it",
+			Class:                 failureExhausted,
+			UpstreamStatus:        status,
+			ClientStatus:          http.StatusPaymentRequired,
+			Code:                  "upstream_quota_exhausted",
+			Message:               "upstream quota is exhausted for this credential; refresh the quota to restore it",
+			RetryableBeforeOutput: true,
 		}
 	case status == http.StatusTooManyRequests:
 		return &upstreamFailure{
@@ -427,9 +461,10 @@ func pumpUpstream(ctx context.Context, client *http.Client, profile ResolvedProf
 // stalledFailure classifies an idle-watchdog shutdown of the stream.
 func stalledFailure() *upstreamFailure {
 	return &upstreamFailure{
-		Class:        failureCooldown,
-		ClientStatus: http.StatusBadGateway,
-		Code:         "upstream_stream_stalled",
-		Message:      "upstream stream stalled and timed out",
+		Class:                 failureCooldown,
+		ClientStatus:          http.StatusBadGateway,
+		Code:                  "upstream_stream_stalled",
+		Message:               "upstream stream stalled and timed out",
+		RetryableBeforeOutput: true,
 	}
 }

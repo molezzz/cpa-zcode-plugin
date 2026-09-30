@@ -116,6 +116,33 @@ func (a *messageAggregator) observe(frame []byte) error {
 	return nil
 }
 
+// frameFailure classifies an upstream SSE frame that reports a failure in
+// band. The streaming forwarder consults it before emitting, because a stream
+// the upstream itself ends with an error event is not a successful stream and
+// must never reach the caller as content. The aggregate reaches the same
+// verdict in its own event dispatch, which is where the rest of the stream is
+// interpreted.
+func frameFailure(frame []byte) error {
+	event, data, ok := parseSSEFrame(frame)
+	if !ok {
+		return nil
+	}
+	var payload map[string]any
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&payload); err != nil {
+		return nil
+	}
+	eventType := sseString(payload["type"])
+	if eventType == "" {
+		eventType = event
+	}
+	if eventType != "error" {
+		return nil
+	}
+	return upstreamErrorEvent(payload)
+}
+
 // applyDelta merges one content-block delta into its block.
 func (a *messageAggregator) applyDelta(block map[string]any, delta map[string]any) {
 	textKey := ""
