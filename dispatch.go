@@ -126,8 +126,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		runShutdown()
 		return okEnvelope(struct{}{})
 	default:
-		// Anything not explicitly implemented above — including methods of
-		// undeclared capabilities such as executor.* or auth.* — is refused.
+		// Anything not implemented above is refused, whether or not some other
+		// plugin declares a capability for it: this plugin never answers a
+		// method it does not implement.
 		return errorEnvelope("unknown_method", "unknown method: "+method, 0), nil
 	}
 }

@@ -1,0 +1,96 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: build linux (amd64, arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: install arm64 cross compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: build linux/amd64 and linux/arm64
+        env:
+          CC_linux_arm64: aarch64-linux-gnu-gcc
+        run: scripts/release.sh "${GITHUB_REF_NAME#v}" linux/amd64 linux/arm64
+      - name: smoke(linux/amd64 原生加载与注册冒烟)
+        run: make smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/release/zcode-v*.tar.gz
+          if-no-files-found: error
+
+  darwin:
+    name: build darwin (arm64, amd64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build darwin/arm64 and darwin/amd64
+        env:
+          # Apple 工具链是通用二进制,clang 直接以 -arch 交叉到 x86_64。
+          CC_darwin_amd64: clang -arch x86_64
+        run: scripts/release.sh "${GITHUB_REF_NAME#v}" darwin/arm64 darwin/amd64
+      - name: smoke(darwin/arm64 原生加载与注册冒烟)
+        run: make smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-darwin
+          path: dist/release/zcode-v*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: build windows (amd64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build windows/amd64
+        shell: bash
+        run: scripts/release.sh "${GITHUB_REF_NAME#v}" windows/amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/release/zcode-v*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: merge checksums & publish release
+    needs: [linux, darwin, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist/release
+      - name: generate & verify SHA256SUMS
+        run: |
+          cd dist/release
+          ls zcode-v*.tar.gz | sort | xargs sha256sum > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/release/* \
+            --title "zcode ${GITHUB_REF_NAME}" \
+            --generate-notes

@@ -18,7 +18,7 @@ ifeq ($(GOOS),linux)
 SMOKE_LDFLAGS = -ldl
 endif
 
-.PHONY: build test vet fmt smoke test-bridge check clean
+.PHONY: build test vet fmt smoke test-bridge check release clean
 
 build:
 	mkdir -p $(BUILD_DIR)
@@ -43,6 +43,11 @@ smoke: build
 	$(SMOKE_BIN) $(PLUGIN_OUTPUT)
 
 check: vet test test-bridge smoke
+
+# 多平台发布:矩阵构建 + 压缩包 + SHA256SUMS,详见 scripts/release.sh。
+# 交叉编译器通过环境变量声明,如 CC_linux_arm64=aarch64-linux-gnu-gcc。
+release:
+	scripts/release.sh $(VERSION)
 
 clean:
 	rm -rf $(BUILD_DIR)

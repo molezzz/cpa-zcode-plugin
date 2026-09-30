@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    # 格式、静态检查、单元测试、竞态测试、依赖校验与漏洞扫描。
+    name: checks (vet / test / race / mod / vuln)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt(格式检查)
+        # 只检查 git 跟踪的文件:工作树里可能存在 git-ignored 的
+        # 嵌套参考仓库,不属于本仓库的代码。
+        run: |
+          files=$(git ls-files '*.go')
+          unformatted=$(gofmt -l $files)
+          if [ -n "$unformatted" ]; then
+            echo "需要运行 gofmt 的文件:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet(静态检查)
+        run: go vet ./...
+      - name: go test(单元测试)
+        run: go test ./...
+      - name: go test -race(竞态测试)
+        run: go test -race ./...
+      - name: go test -tags cgobridge_test(C 桥回环测试)
+        run: go test -tags cgobridge_test ./...
+      - name: go mod verify(依赖校验)
+        run: |
+          go mod verify
+          go mod tidy -diff
+      - name: govulncheck(漏洞扫描)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: 凭证泄漏审计(令牌/Key/Cookie/授权参数)
+        run: scripts/check-scrubbed.sh
+
+  smoke:
+    # 共享库加载与注册冒烟测试:以宿主的方式 dlopen 插件库,
+    # 初始化并核对 plugin.register 声明的能力。
+    name: smoke (load & register)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: make smoke
+        run: make smoke
