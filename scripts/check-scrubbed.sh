@@ -42,7 +42,7 @@ failures=0
 while IFS= read -r file; do
     [ -n "$file" ] || continue
     [ -f "$file" ] || continue
-    if LC_ALL=C grep -n -E -q "$expr" "$file" 2>/dev/null; then
+    if LC_ALL=C grep -E -q "$expr" "$file" 2>/dev/null; then
         echo "疑似敏感内容: $file"
         failures=$((failures + 1))
     fi

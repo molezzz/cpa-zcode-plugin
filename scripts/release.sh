@@ -15,7 +15,7 @@
 # 未声明的平台按本机编译器构建(仅当目标即本机平台时可行)。
 #
 # 输出: dist/release/
-#   zcode-v<版本>-<goos>-<goarch>.tar.gz | .zip
+#   zcode-v<版本>-<goos>-<goarch>.tar.gz
 #   SHA256SUMS
 # 压缩包内含共享库、生成的 zcode.h、LICENSE 与中文安装说明 INSTALL.md。
 set -euo pipefail

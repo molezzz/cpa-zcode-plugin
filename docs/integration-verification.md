@@ -54,7 +54,8 @@
 
 ### 1.7 目标平台宿主加载
 
-- [ ] 在每个目标平台上,用发布压缩包(经 `SHA256SUMS` 校验)按 `docs/install.md` 安装,宿主成功加载并注册;`make smoke` 等价的加载/注册冒烟通过(CI 的 release 工作流在每个平台原生执行)。
+- [ ] 在每个目标平台上,用发布压缩包(经 `SHA256SUMS` 校验)按 `docs/install.md` 安装,宿主成功加载并注册。
+  自动化冒烟的覆盖面:CI 在 Ubuntu 原生执行加载/注册冒烟;release 工作流在 linux/amd64 与 darwin/arm64 原生冒烟。windows/amd64 与 darwin/amd64 产物未做自动化加载冒烟,依赖本项的人工宿主加载验证。
 - [ ] 按 `docs/install.md` 第 4 节完成一次升级与一次回滚演练。
 
 ## 2. 记录与脱敏要求

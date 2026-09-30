@@ -23,11 +23,10 @@ jobs:
         # 只检查 git 跟踪的文件:工作树里可能存在 git-ignored 的
         # 嵌套参考仓库,不属于本仓库的代码。
         run: |
-          files=$(git ls-files '*.go')
-          unformatted=$(gofmt -l $files)
-          if [ -n "$unformatted" ]; then
+          git ls-files '*.go' | xargs gofmt -l > /tmp/gofmt.out
+          if [ -s /tmp/gofmt.out ]; then
             echo "需要运行 gofmt 的文件:"
-            echo "$unformatted"
+            cat /tmp/gofmt.out
             exit 1
           fi
       - name: go vet(静态检查)

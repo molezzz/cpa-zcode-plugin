@@ -64,6 +64,10 @@ jobs:
           cache: true
       - name: build windows/amd64
         shell: bash
+        env:
+          # windows-latest 自带 mingw-w64,其 gcc 即 CGO 所需工具链;
+          # 显式声明以便工具链缺失时在该步直接报错而非静默走默认。
+          CC_windows_amd64: gcc
         run: scripts/release.sh "${GITHUB_REF_NAME#v}" windows/amd64
       - uses: actions/upload-artifact@v4
         with:

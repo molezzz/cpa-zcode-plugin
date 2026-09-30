@@ -6,7 +6,7 @@
 
 | 平台 | 产物 | 依赖 |
 | --- | --- | --- |
-| linux/amd64、linux/arm64 | `zcode.so` | glibc ≥ 2.17;宿主需以动态链接方式运行 |
+| linux/amd64、linux/arm64 | `zcode.so` | 与宿主同构的 glibc 环境(发布产物在 ubuntu-latest 上构建;宿主 glibc 过旧导致加载失败时,用 `scripts/release.sh` 在与宿主一致的环境自行构建) |
 | darwin/arm64、darwin/amd64 | `zcode.dylib` | macOS 12 及以上 |
 | windows/amd64 | `zcode.dll` | Windows 10 / Server 2016 及以上 |
 
@@ -50,7 +50,7 @@
    cp "zcode-v${VERSION}-${PLATFORM}/zcode.so" /path/to/cpa/plugins/
    ```
 
-   同一插件目录内不要同时存在多个版本的插件库;升级前先按第 4 节移除旧版本。
+   同一插件目录内不要同时存在多个版本的插件库;升级时按第 3 节先删旧文件再复制新文件。
 
 5. **重启宿主并确认加载**
 
