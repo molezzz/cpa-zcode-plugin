@@ -108,6 +108,18 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleExecutorCountTokens()
 	case pluginabi.MethodExecutorHTTPRequest:
 		return handleExecutorHTTPRequest()
+	case pluginabi.MethodManagementRegister:
+		return handleManagementRegister(request)
+	case pluginabi.MethodManagementHandle:
+		return handleManagementHandle(request)
+	case pluginabi.MethodQuotaIdentifier:
+		return handleQuotaIdentifier()
+	case pluginabi.MethodQuotaDescribe:
+		return handleQuotaDescribe()
+	case pluginabi.MethodQuotaFetch:
+		return handleQuotaFetch(request)
+	case pluginabi.MethodQuotaReset:
+		return handleQuotaReset(request)
 	case pluginabi.MethodPluginQuiesce:
 		return okEnvelope(struct{}{})
 	case pluginabi.MethodPluginShutdown:
@@ -177,6 +189,13 @@ func pluginRegistration() registration {
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats:  []string{"claude"},
 			ExecutorOutputFormats: []string{"claude"},
+			// Authenticated management routes: the redacted state page and
+			// the fixed maintenance action vocabulary.
+			ManagementAPI: true,
+			// Normalized quota reporting for the Coding Plan JWT credential,
+			// with conservative evidence-based state recovery. Reset is
+			// declared unsupported upstream and answers accordingly.
+			QuotaProvider: true,
 		},
 	}
 }
@@ -211,6 +230,9 @@ func runShutdown() {
 		// Authorization sessions hold OAuth secrets and must never outlive
 		// the plugin.
 		activeSessions.shutdownAll()
+		// Management-initiated authorization loops poll the upstream and save
+		// through the host; cancel them before the library can unload.
+		managementOAuth.stopAll()
 		// In-flight executions pump into host callbacks; cancel them so the
 		// shared library unloads without calling a stopped host.
 		activeExecutions.cancelAll()

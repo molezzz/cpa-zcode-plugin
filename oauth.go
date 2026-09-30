@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -168,20 +169,11 @@ func handleAuthLoginStart(request []byte) ([]byte, error) {
 		return errorEnvelope("unknown_provider", "auth.login.start does not handle provider "+req.Provider, http.StatusBadRequest), nil
 	}
 
-	cfg := currentConfig()
-	client := newSessionHTTPClient(cfg)
-	pollSecret, err := randomHexToken(pollSecretBytes)
+	session, err := startAuthorizationSession(currentConfig())
 	if err != nil {
-		return errorEnvelope("plugin_error", "could not create authorization session", http.StatusInternalServerError), nil
-	}
-	flowID, authorizeURL, err := oauthInit(context.Background(), client, oauthUpstreamBase, pollSecret)
-	if err != nil {
-		client.CloseIdleConnections()
-		return errorEnvelope("oauth_upstream_failed", err.Error(), http.StatusBadGateway), nil
-	}
-	session, err := activeSessions.create(flowID, authorizeURL, pollSecret, client, time.Duration(cfg.OAuth.SessionTTLSeconds)*time.Second)
-	if err != nil {
-		client.CloseIdleConnections()
+		if errors.Is(err, errOAuthUpstream) {
+			return errorEnvelope("oauth_upstream_failed", err.Error(), http.StatusBadGateway), nil
+		}
 		return errorEnvelope("plugin_error", "could not create authorization session", http.StatusInternalServerError), nil
 	}
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
@@ -190,6 +182,39 @@ func handleAuthLoginStart(request []byte) ([]byte, error) {
 		State:     session.id,
 		ExpiresAt: session.expiresAt,
 	})
+}
+
+// errOAuthUpstream marks a session-start failure that originated at the
+// authorization upstream, so callers can map it to an upstream-failure
+// envelope instead of a local plugin error.
+var errOAuthUpstream = errors.New("authorization upstream failed")
+
+// startAuthorizationSession creates one pending authorization session with its
+// own polling secret, HTTP client, and cookie jar. Both the host's native
+// login entry and the management plane's re-authorization action create
+// sessions through it, so the two entries cannot drift in how sessions are
+// constructed.
+func startAuthorizationSession(cfg Config) (*authSession, error) {
+	client := newSessionHTTPClient(cfg)
+	pollSecret, err := randomHexToken(pollSecretBytes)
+	if err != nil {
+		client.CloseIdleConnections()
+		return nil, fmt.Errorf("could not create authorization session")
+	}
+	flowID, authorizeURL, err := oauthInit(context.Background(), client, oauthUpstreamBase, pollSecret)
+	if err != nil {
+		client.CloseIdleConnections()
+		if !errors.Is(err, errOAuthUpstream) {
+			err = fmt.Errorf("%w: %v", errOAuthUpstream, err)
+		}
+		return nil, err
+	}
+	session, err := activeSessions.create(flowID, authorizeURL, pollSecret, client, time.Duration(cfg.OAuth.SessionTTLSeconds)*time.Second)
+	if err != nil {
+		client.CloseIdleConnections()
+		return nil, fmt.Errorf("could not create authorization session")
+	}
+	return session, nil
 }
 
 // authLoginPollRPC mirrors the host request for auth.login.poll.
@@ -273,11 +298,44 @@ func terminalPollResponse(session *authSession) (reply []byte, done bool) {
 	}
 }
 
-// interpretPollBody applies the upstream poll verdict to the session.
+// pollOutcomeKind classifies the result of applying one upstream poll body to
+// a session.
+type pollOutcomeKind string
+
+const (
+	pollPending   pollOutcomeKind = "pending"
+	pollCompleted pollOutcomeKind = "completed"
+	pollFailed    pollOutcomeKind = "failed"
+)
+
+// pollOutcome is the shared verdict of one poll. The native host poll path
+// maps it onto RPC replies; the management plane's re-authorization loop
+// reacts to it and stops on terminal outcomes.
+type pollOutcome struct {
+	Kind    pollOutcomeKind
+	Message string
+	Result  *completedLogin
+}
+
+// interpretPollBody applies the upstream poll verdict to the session and
+// renders the poll reply. The credentials persist through the host: a
+// successful poll carries the completed auth record back to the host, which
+// stores it.
 func interpretPollBody(ctx context.Context, session *authSession, body []byte) ([]byte, error) {
+	return pollOutcomeReply(session, applyPollVerdict(ctx, session, body, nil)), nil
+}
+
+// applyPollVerdict applies one upstream poll body to the session. The persist
+// callback, when set, stores the completed credential document before the
+// session is marked complete — the management plane's re-authorization path
+// uses it because no host poll is waiting to persist the result. A persist
+// failure fails the session: an unpersisted OAuth result must not look like a
+// completed login. A nil persist keeps the native behavior, where the host
+// persists from the poll reply.
+func applyPollVerdict(ctx context.Context, session *authSession, body []byte, persist func(identityID string, storage []byte) error) pollOutcome {
 	var parsed oauthPollResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return pollResponse(pluginapi.AuthLoginStatusPending, "waiting for authorization", nil), nil
+		return pollOutcome{Kind: pollPending, Message: "waiting for authorization"}
 	}
 	status := strings.TrimSpace(parsed.Data.Status)
 	if status == "" {
@@ -292,47 +350,90 @@ func interpretPollBody(ctx context.Context, session *authSession, body []byte) (
 	switch {
 	case status == oauthPollStatusFailed:
 		session.fail("authorization was rejected or failed upstream")
-		return pollResponse(pluginapi.AuthLoginStatusError, "authorization was rejected or failed upstream", nil), nil
+		return pollOutcome{Kind: pollFailed, Message: "authorization was rejected or failed upstream"}
 	case status == oauthPollStatusReady:
 		if token == "" {
 			session.fail("authorization completed without a coding plan credential")
-			return pollResponse(pluginapi.AuthLoginStatusError, "authorization completed without a coding plan credential", nil), nil
+			return pollOutcome{Kind: pollFailed, Message: "authorization completed without a coding plan credential"}
 		}
 		if !session.beginFinalization() {
 			// Another poll of this session is completing the credentials,
 			// including the managed key exchange; report pending so the host
 			// retries and observes the single consistent completion.
-			return pollResponse(pluginapi.AuthLoginStatusPending, "finalizing authorization", nil), nil
+			return pollOutcome{Kind: pollPending, Message: "finalizing authorization"}
 		}
 		if snap := session.snapshot(); snap.State != authSessionPending {
 			// A concurrent poll expired or failed the session between the
 			// upstream read and here; report the stable terminal outcome and
 			// skip the credential completion (and its upstream side effects).
-			if reply, done := terminalPollResponse(session); done {
-				return reply, nil
-			}
+			return terminalPollOutcome(session)
 		}
 		storage, identityID, err := completeLoginStorage(token, accessToken)
 		if err != nil {
 			session.fail(err.Error())
-			return pollResponse(pluginapi.AuthLoginStatusError, err.Error(), nil), nil
+			return pollOutcome{Kind: pollFailed, Message: err.Error()}
+		}
+		if persist != nil {
+			if err := persist(identityID, storage); err != nil {
+				session.fail("credentials could not be persisted; retry the authorization")
+				return pollOutcome{Kind: pollFailed, Message: "credentials could not be persisted; retry the authorization"}
+			}
 		}
 		result, completed := session.complete(completedLogin{IdentityID: identityID, Storage: storage})
 		if !completed {
 			// The session reached a terminal state concurrently (for example
 			// expired between the upstream read and here); report that stable
 			// outcome instead of a bogus success with an empty record.
-			if reply, done := terminalPollResponse(session); done {
-				return reply, nil
-			}
-			return pollResponse(pluginapi.AuthLoginStatusError, "authorization session expired", nil), nil
+			return terminalPollOutcome(session)
 		}
-		return okEnvelope(pluginapi.AuthLoginPollResponse{
-			Status: pluginapi.AuthLoginStatusSuccess,
-			Auth:   authDataFromStorage(result.IdentityID, result.Storage),
-		})
+		return pollOutcome{Kind: pollCompleted, Result: &result}
 	default:
-		return pollResponse(pluginapi.AuthLoginStatusPending, "waiting for authorization", nil), nil
+		return pollOutcome{Kind: pollPending, Message: "waiting for authorization"}
+	}
+}
+
+// terminalPollOutcome renders the poll outcome of an already-terminal
+// session. An unreachable terminal state falls back to pending, which the
+// caller treats as "keep waiting" exactly like an ordinary poll.
+func terminalPollOutcome(session *authSession) pollOutcome {
+	snap := session.snapshot()
+	switch snap.State {
+	case authSessionCompleted:
+		if snap.Result == nil {
+			return pollOutcome{Kind: pollFailed, Message: "authorization result is unavailable"}
+		}
+		return pollOutcome{Kind: pollCompleted, Result: snap.Result}
+	case authSessionFailed, authSessionExpired:
+		message := snap.Message
+		if message == "" {
+			message = "authorization session expired"
+		}
+		return pollOutcome{Kind: pollFailed, Message: message}
+	default:
+		return pollOutcome{Kind: pollPending, Message: "waiting for authorization"}
+	}
+}
+
+// pollOutcomeReply renders the host poll reply for one outcome, preserving
+// the exact reply contract of the native poll path.
+func pollOutcomeReply(session *authSession, outcome pollOutcome) []byte {
+	switch outcome.Kind {
+	case pollCompleted:
+		if outcome.Result == nil {
+			return pollResponse(pluginapi.AuthLoginStatusError, "authorization result is unavailable", nil)
+		}
+		raw, err := okEnvelope(pluginapi.AuthLoginPollResponse{
+			Status: pluginapi.AuthLoginStatusSuccess,
+			Auth:   authDataFromStorage(outcome.Result.IdentityID, outcome.Result.Storage),
+		})
+		if err != nil {
+			return pollResponse(pluginapi.AuthLoginStatusError, "could not encode login result", nil)
+		}
+		return raw
+	case pollFailed:
+		return pollResponse(pluginapi.AuthLoginStatusError, outcome.Message, nil)
+	default:
+		return pollResponse(pluginapi.AuthLoginStatusPending, outcome.Message, nil)
 	}
 }
 

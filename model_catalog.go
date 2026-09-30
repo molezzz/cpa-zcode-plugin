@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -489,4 +490,122 @@ func catalogModelList(static []pluginapi.ModelInfo, supplements [][]string) []pl
 		}
 	}
 	return models
+}
+
+// catalogViewEntry is the management-plane view of one cache scope. It names
+// only non-secret scope parts — the stable identity and the environment
+// label — and the sanitized lifecycle facts of the entry.
+type catalogViewEntry struct {
+	Identity      string `json:"identity"`
+	Environment   string `json:"environment"`
+	State         string `json:"state"` // "cached" | "cooldown"
+	ModelCount    int    `json:"model_count,omitempty"`
+	ExpiresAt     string `json:"expires_at,omitempty"`
+	FailureReason string `json:"failure_reason,omitempty"`
+	CooldownUntil string `json:"cooldown_until,omitempty"`
+}
+
+// view snapshots the catalog for the management plane. Expired positive
+// entries are omitted: they would be rediscorvered on the next catalog query,
+// so displaying them as cached would lie. Identities carry no credential
+// material by construction (see catalogIdentityFor).
+func (c *modelCatalog) view(now time.Time) []catalogViewEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entries := make([]catalogViewEntry, 0, len(c.successes)+len(c.failures))
+	for scope, entry := range c.successes {
+		if !now.Before(entry.expiresAt) {
+			continue
+		}
+		entries = append(entries, catalogViewEntry{
+			Identity:    scope.Identity,
+			Environment: scope.Environment,
+			State:       "cached",
+			ModelCount:  len(entry.ids),
+			ExpiresAt:   entry.expiresAt.UTC().Format(time.RFC3339),
+		})
+	}
+	for scope, failure := range c.failures {
+		if !now.Before(failure.until) {
+			continue
+		}
+		entries = append(entries, catalogViewEntry{
+			Identity:      scope.Identity,
+			Environment:   scope.Environment,
+			State:         "cooldown",
+			FailureReason: failure.reason,
+			CooldownUntil: failure.until.UTC().Format(time.RFC3339),
+		})
+	}
+	sortCatalogView(entries)
+	return entries
+}
+
+// sortCatalogView orders the view by identity then environment so the
+// management page renders a stable list.
+func sortCatalogView(entries []catalogViewEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Identity != entries[j].Identity {
+			return entries[i].Identity < entries[j].Identity
+		}
+		return entries[i].Environment < entries[j].Environment
+	})
+}
+
+// modelRefreshOutcome is the sanitized result of one environment's forced
+// model cache refresh.
+type modelRefreshOutcome struct {
+	Environment string `json:"environment,omitempty"`
+	OK          bool   `json:"ok"`
+	ModelCount  int    `json:"model_count,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+// refreshAccountModels forces a model cache refresh for every environment the
+// account's usable credentials can discover against. Unlike the passive
+// path it bypasses the failure cooldown — an explicit operator action means
+// "ask again now" — but it still refuses credentials the execution state
+// machine would skip, so a refresh cannot hammer an upstream with a
+// credential that account already records as unusable.
+func refreshAccountModels(ctx context.Context, cfg Config, catalog *modelCatalog, authIndex string, doc []byte, now time.Time) []modelRefreshOutcome {
+	outcomes := []modelRefreshOutcome{}
+	snap, err := readCredentialSnapshot(doc)
+	if err != nil {
+		return []modelRefreshOutcome{{Reason: "credential_missing"}}
+	}
+	for _, kind := range []CredentialKind{CredentialJWT, CredentialAPIKey} {
+		environment := environmentForKind(kind)
+		if !credentialUsableForDiscovery(kind, snap, now) {
+			outcomes = append(outcomes, modelRefreshOutcome{
+				Environment: environment,
+				Reason:      "credential_unavailable",
+			})
+			continue
+		}
+		target, ok := buildDiscoveryTarget(kind, snap)
+		if !ok {
+			outcomes = append(outcomes, modelRefreshOutcome{
+				Environment: environment,
+				Reason:      "credential_unavailable",
+			})
+			continue
+		}
+		ids, reason := discoverModels(ctx, modelDiscoveryClient, target)
+		scope := catalogScopeFor(authIndex, snap, environment)
+		if reason == "" {
+			catalog.recordSuccess(scope, ids, time.Duration(cfg.ModelDiscovery.SuccessTTLSeconds)*time.Second, now)
+			outcomes = append(outcomes, modelRefreshOutcome{
+				Environment: environment,
+				OK:          true,
+				ModelCount:  len(ids),
+			})
+			continue
+		}
+		catalog.recordFailure(scope, reason, time.Duration(cfg.ModelDiscovery.FailureCooldownSeconds)*time.Second, now)
+		outcomes = append(outcomes, modelRefreshOutcome{
+			Environment: environment,
+			Reason:      reason,
+		})
+	}
+	return outcomes
 }

@@ -42,6 +42,19 @@ type recordedState struct {
 	// Code is the bounded upstream classification kept for diagnosis. It is
 	// never a URL, a token, or upstream prose.
 	Code string
+	// OnlyIfStatus, when set, restricts the conclusion to a record whose
+	// persisted status still reads exactly that value. A quota recovery uses
+	// it so an exhausted credential flips to active only when the persisted
+	// state is still exhausted — the check runs inside the identity lock, so
+	// a state that changed between the quota call and the write cannot be
+	// overwritten by a stale recovery.
+	OnlyIfStatus string
+	// NotIfStatus is the mirror guard: the conclusion applies only while the
+	// persisted status is NOT this value. A credential refresh's successful
+	// probe uses it so a valid authentication never clears exhausted — a
+	// models endpoint 200 proves the credential authenticates, which is not
+	// evidence about quota, and exhausted recovers through a quota refresh.
+	NotIfStatus string
 }
 
 // errAuthFileNameUnknown reports that the host auth store could not name the
@@ -66,6 +79,66 @@ type stateStore interface {
 // state write, so a slow store cannot hold a request hostage.
 const credentialStateStoreTimeout = 5 * time.Second
 
+// identityLocks is the plugin-wide registry of per-upstream-identity mutexes.
+// Every serialized-per-identity consumer — the credential state recorder and
+// the management actions — shares one instance, so a management refresh and a
+// request-side state write for the same account can never interleave.
+type identityLocks struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func newIdentityLocks() *identityLocks {
+	return &identityLocks{locks: map[string]*sync.Mutex{}}
+}
+
+// identityLockKey collapses the identifiers that may name the same account
+// onto one lock: the upstream identity wins, the auth index is the fallback,
+// and an unattributed write still gets its own serialization key.
+func identityLockKey(identityID, authIndex string) string {
+	if key := strings.TrimSpace(identityID); key != "" {
+		return key
+	}
+	if key := strings.TrimSpace(authIndex); key != "" {
+		return key
+	}
+	return "zcode-unattributed"
+}
+
+// lock returns the unlock func for one identity's critical section.
+func (l *identityLocks) lock(key string) func() {
+	mu := l.mutexFor(key)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// tryLock returns the unlock func and true, or false when the identity is
+// already locked by someone else. Management actions use it to refuse, not
+// queue, when another operation for the same account is in flight.
+func (l *identityLocks) tryLock(key string) (func(), bool) {
+	mu := l.mutexFor(key)
+	if !mu.TryLock() {
+		return nil, false
+	}
+	return mu.Unlock, true
+}
+
+func (l *identityLocks) mutexFor(key string) *sync.Mutex {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lock, ok := l.locks[key]
+	if !ok {
+		lock = &sync.Mutex{}
+		l.locks[key] = lock
+	}
+	return lock
+}
+
+// identityLockRegistry is the shared instance. It exists at package level so
+// recorders built through forStore and management services built per request
+// serialize against the same mutexes.
+var identityLockRegistry = newIdentityLocks()
+
 // credentialStateRecorder writes credential state transitions back to the
 // host auth store. Transitions are serialized per upstream identity, and one
 // request's conclusions land as exactly one lossless save, so concurrent
@@ -76,8 +149,7 @@ type credentialStateRecorder struct {
 	// now is a test seam for the retry windows.
 	now func() time.Time
 
-	locksMu sync.Mutex
-	locks   map[string]*sync.Mutex
+	locks *identityLocks
 }
 
 // credentialStates is the plugin-wide recorder. The store is resolved when an
@@ -93,7 +165,7 @@ func newCredentialStateRecorderOver(store stateStore) *credentialStateRecorder {
 	return &credentialStateRecorder{
 		store: store,
 		now:   time.Now,
-		locks: map[string]*sync.Mutex{},
+		locks: identityLockRegistry,
 	}
 }
 
@@ -238,22 +310,7 @@ func (r *credentialStateRecorder) save(ctx context.Context, ref credentialRef, n
 // attempt with no identifiable identity still gets a lock, so writes stay
 // serialized against each other.
 func (r *credentialStateRecorder) lockIdentity(ref credentialRef) func() {
-	key := strings.TrimSpace(ref.IdentityID)
-	if key == "" {
-		key = strings.TrimSpace(ref.AuthIndex)
-	}
-	if key == "" {
-		key = "zcode-unattributed"
-	}
-	r.locksMu.Lock()
-	lock, ok := r.locks[key]
-	if !ok {
-		lock = &sync.Mutex{}
-		r.locks[key] = lock
-	}
-	r.locksMu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	return r.locks.lock(identityLockKey(ref.IdentityID, ref.AuthIndex))
 }
 
 // applyCredentialState renders one attempt's conclusions into the document and
@@ -294,6 +351,14 @@ func applyCredentialState(doc []byte, conclusions []recordedState, now time.Time
 func applyStateSection(zcode map[string]any, conclusion recordedState, now time.Time) {
 	name := credentialSectionName(conclusion.Kind)
 	existing, _ := zcode[name].(map[string]any)
+	if conclusion.OnlyIfStatus != "" && normalizeStatus(stringField(existing, "status")) != conclusion.OnlyIfStatus {
+		// The persisted state moved on since the evidence was gathered; the
+		// guarded conclusion no longer applies to it.
+		return
+	}
+	if conclusion.NotIfStatus != "" && normalizeStatus(stringField(existing, "status")) == conclusion.NotIfStatus {
+		return
+	}
 	if stateAlreadyRecorded(existing, conclusion) {
 		return
 	}

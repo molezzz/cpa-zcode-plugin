@@ -51,6 +51,12 @@ func TestRegisterReturnsImplementedCapabilitiesOnly(t *testing.T) {
 	if !caps.Executor {
 		t.Fatal("executor capability missing: the executor methods are implemented and contract-tested")
 	}
+	if !caps.ManagementAPI {
+		t.Fatal("management_api capability missing: the management methods are implemented and contract-tested")
+	}
+	if !caps.QuotaProvider {
+		t.Fatal("quota_provider capability missing: the quota methods are implemented and contract-tested")
+	}
 	if caps.ExecutorModelScope != pluginapi.ExecutorModelScopeBoth {
 		t.Fatalf("executor_model_scope = %q, want both", caps.ExecutorModelScope)
 	}
@@ -61,8 +67,6 @@ func TestRegisterReturnsImplementedCapabilitiesOnly(t *testing.T) {
 	for name, value := range map[string]bool{
 		"model_router":           caps.ModelRouter,
 		"scheduler":              caps.Scheduler,
-		"management_api":         caps.ManagementAPI,
-		"quota_provider":         caps.QuotaProvider,
 		"frontend_auth_provider": caps.FrontendAuthProvider,
 		"request_translator":     caps.RequestTranslator,
 		"response_translator":    caps.ResponseTranslator,
@@ -126,11 +130,10 @@ func TestModelMethodsReturnStaticCatalog(t *testing.T) {
 
 func TestUnimplementedCapabilityMethodsAreUnknown(t *testing.T) {
 	// 契约：未声明的能力对应的方法绝不路由到任何实现。executor.* 属于
-	// 已实现的 Executor 能力，在 executor_test.go 中单独覆盖。
+	// 已实现的 Executor 能力，在 executor_test.go 中单独覆盖；management.*
+	// 与 quota.* 属于已实现的 ManagementAPI/QuotaProvider 能力，在
+	// management_test.go 与 quota_test.go 中单独覆盖。
 	for _, method := range []string{
-		pluginabi.MethodManagementRegister,
-		pluginabi.MethodManagementHandle,
-		pluginabi.MethodQuotaFetch,
 		pluginabi.MethodRequestTranslate,
 		pluginabi.MethodResponseTranslate,
 		"totally.bogus.method",

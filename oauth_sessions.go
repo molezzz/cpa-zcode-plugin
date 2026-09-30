@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"sort"
 	"sync"
 	"time"
 )
@@ -317,6 +318,57 @@ func (m *sessionManager) shutdownAll() {
 	for _, session := range sessions {
 		session.destroy()
 	}
+}
+
+// sessionView is the management-plane view of one authorization session. It
+// carries lifecycle facts and a sanitized message only: the authorize URL,
+// flow identifier, and polling secret are authorization parameters that never
+// appear in management data.
+type sessionView struct {
+	State      string `json:"state"`
+	Message    string `json:"message,omitempty"`
+	CreatedAt  string `json:"created_at,omitempty"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
+	IdentityID string `json:"identity_id,omitempty"`
+}
+
+// view lists the redacted state of every live session, settling pending
+// sessions whose TTL has passed first so the page never shows a stale
+// pending entry.
+func (m *sessionManager) view(now time.Time) []sessionView {
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.sessions))
+	for id := range m.sessions {
+		ids = append(ids, id)
+	}
+	sessions := make([]*authSession, 0, len(ids))
+	for _, id := range ids {
+		sessions = append(sessions, m.sessions[id])
+	}
+	m.mu.Unlock()
+
+	views := make([]sessionView, 0, len(sessions))
+	for _, session := range sessions {
+		session.expireIfDue(now)
+		snap := session.snapshot()
+		view := sessionView{
+			State:     string(snap.State),
+			Message:   snap.Message,
+			CreatedAt: session.createdAt.UTC().Format(time.RFC3339),
+			ExpiresAt: session.expiresAt.UTC().Format(time.RFC3339),
+		}
+		if snap.Result != nil {
+			view.IdentityID = snap.Result.IdentityID
+		}
+		views = append(views, view)
+	}
+	sort.Slice(views, func(i, j int) bool {
+		if views[i].CreatedAt != views[j].CreatedAt {
+			return views[i].CreatedAt > views[j].CreatedAt
+		}
+		return views[i].State < views[j].State
+	})
+	return views
 }
 
 // randomHexToken returns 2*bytes hex characters from crypto/rand.

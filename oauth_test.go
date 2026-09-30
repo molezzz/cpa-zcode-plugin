@@ -36,6 +36,7 @@ type fakeAuthStore struct {
 	docs    map[string]json.RawMessage
 	listErr error
 	getErr  error
+	saveErr error
 	saves   []hostCall
 }
 
@@ -75,7 +76,12 @@ func (f *fakeAuthStore) GetRuntime(_ context.Context, authIndex string) (plugina
 func (f *fakeAuthStore) Save(_ context.Context, name string, document json.RawMessage) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.saveErr != nil {
+		return f.saveErr
+	}
 	f.saves = append(f.saves, hostCall{method: "save:" + name, request: document})
+	// The host persists the document: later reads observe the save.
+	f.docs[name] = json.RawMessage(document)
 	return nil
 }
 
