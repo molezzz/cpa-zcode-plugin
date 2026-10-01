@@ -564,6 +564,33 @@ func TestDeviceIdentityDoesNotWriteOnTheReadPath(t *testing.T) {
 	}
 }
 
+// TestDeviceIdentityIsStampedOnFirstLogin covers where the id is meant to be
+// persisted: a login builds the credential document, so the identity is
+// established there rather than on the first quota read.
+func TestDeviceIdentityIsStampedOnFirstLogin(t *testing.T) {
+	resetDeviceIDCache(t)
+	token := makeJWT(t, map[string]any{"sub": "device-login"})
+	now := time.Unix(0, 0).UTC()
+
+	doc, err := buildZcodeStorage(nil, "zcode-device-user", token, "", now)
+	if err != nil {
+		t.Fatalf("build storage: %v", err)
+	}
+	first := recordedDeviceID(doc)
+	if !isUUID(first) {
+		t.Fatalf("login stored device id = %q, want a well-formed UUID", first)
+	}
+
+	// Re-login is the same installation and must not look like a new device.
+	doc, err = buildZcodeStorage(doc, "zcode-device-user", token, "", now)
+	if err != nil {
+		t.Fatalf("re-login: %v", err)
+	}
+	if got := recordedDeviceID(doc); got != first {
+		t.Fatalf("re-login device id = %q, want the original %q", got, first)
+	}
+}
+
 func resetDeviceIDCache(t *testing.T) {
 	t.Helper()
 	deviceIDMu.Lock()

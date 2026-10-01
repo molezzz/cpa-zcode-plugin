@@ -625,6 +625,11 @@ func buildZcodeStorage(previousDoc []byte, identityID, token, accessToken string
 			"status":          "active",
 			"last_checked_at": now.UTC().Format(time.RFC3339),
 		},
+		// The billing endpoint rejects a request that carries no device
+		// identity, so one is established when the credential is created. A
+		// re-login keeps the id already recorded for the identity: the account
+		// is the same installation and should not appear as a new device.
+		deviceIDField: deviceIdentityForNewRecord(previousDoc),
 	}
 	if accessToken != "" {
 		// Kept for the managed API key exchange; without it the OAuth
