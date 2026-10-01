@@ -441,9 +441,7 @@ func parseQuotaBalanceRow(row json.RawMessage) (quotaBalance, bool) {
 	} else if name, ok := optionalString(fields["model"]); ok && name != "" {
 		balance.Name = name
 	}
-	if value, present := optionalString(fields["expires_at"]); present {
-		balance.ExpiresAt = value
-	}
+	balance.ExpiresAt = quotaExpiryText(fields["expires_at"])
 	if capabilities, ok := parseQuotaCapabilities(fields["capabilities"]); ok {
 		balance.Capabilities = capabilities
 	} else if fields["capabilities"] != nil {
@@ -465,6 +463,22 @@ func parseQuotaBalanceRow(row json.RawMessage) (quotaBalance, bool) {
 		balance.Malformed = true
 	}
 	return balance, true
+}
+
+// quotaExpiryText renders a bucket's reset instant as the host's ResetTime
+// string. The upstream states it as epoch seconds, which is a JSON number, so
+// a plain string read drops it and the management page loses the reset time for
+// every bucket. A quoted value is accepted too: it costs nothing to read both
+// shapes rather than betting the field on one of them.
+func quotaExpiryText(raw json.RawMessage) string {
+	if text, ok := optionalString(raw); ok {
+		return text
+	}
+	seconds, present, wellTyped := optionalNumber(raw)
+	if !present || !wellTyped || seconds == nil {
+		return ""
+	}
+	return time.Unix(int64(*seconds), 0).UTC().Format(time.RFC3339)
 }
 
 // optionalString reads an optional JSON string.

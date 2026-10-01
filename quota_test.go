@@ -649,8 +649,43 @@ func TestFetchQuotaEvidenceReadsTheRealBalancePayload(t *testing.T) {
 	if len(glm.Capabilities) != 1 || glm.Capabilities[0] != "model:glm-5.3" {
 		t.Fatalf("GLM-5.3 capabilities = %v, want [model:glm-5.3]", glm.Capabilities)
 	}
+	// The reset instant arrives as epoch seconds, a JSON number. Read as a
+	// string it would drop out, leaving every bucket with no reset time.
+	if glm.ExpiresAt == "" {
+		t.Fatal("GLM-5.3 reset time is empty; the upstream states it as epoch seconds")
+	}
+	reset, err := time.Parse(time.RFC3339, glm.ExpiresAt)
+	if err != nil {
+		t.Fatalf("reset time %q is not RFC3339: %v", glm.ExpiresAt, err)
+	}
+	if want := time.Unix(1790870399, 0).UTC(); !reset.Equal(want) {
+		t.Fatalf("reset time = %v, want %v", reset, want)
+	}
 	if _, ok := byName["GLM-5.3-Flash"]; !ok {
 		t.Fatal("missing the GLM-5.3-Flash bucket")
+	}
+}
+
+// TestQuotaExpiryTextAcceptsBothShapes keeps the reset time readable whether the
+// upstream states it as a number or a quoted string.
+func TestQuotaExpiryTextAcceptsBothShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"epoch number", `1790870399`, "2026-10-01T15:59:59Z"},
+		{"quoted number", `"1790870399"`, "1790870399"},
+		{"already text", `"2026-10-02T15:59:59Z"`, "2026-10-02T15:59:59Z"},
+		{"absent", ``, ""},
+		{"wrong type", `true`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := quotaExpiryText(json.RawMessage(tc.raw)); got != tc.want {
+				t.Fatalf("quotaExpiryText(%s) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
 	}
 }
 
