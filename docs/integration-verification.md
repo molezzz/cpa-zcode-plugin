@@ -39,10 +39,12 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
 
 **在验证推理之前必须先确认这一步**,否则"推理 200"可能只是在替一个其实没有套餐权益的账号兜底。
 
-- [ ] `plugins.configs.zcode.product.app_version` 已设置为**客户端真实版本**。取证方式:在能正常使用的 ZCode 客户端抓一次 start plan 的 balance 请求,读其 `app_version` 查询参数。**不得**沿用参考实现里的 `3.0.0`/`3.0.1`。
+- [ ] `plugins.configs.zcode.product.app_version` 已设置为**客户端真实版本**。取证方式:在能正常使用的 ZCode 客户端抓一次 start plan 的 balance 请求,读其 `app_version` 查询参数。**不得**沿用参考实现里的 `3.0.0`/`3.0.1`。注意:实测该端点**不按这个值判定能力**,它只是客户端自身版本的上线声明(并驱动 `User-Agent` / `X-ZCode-App-Version`),但取值仍应真实。
 - [ ] 插件发出的请求确认为 `GET /api/v1/zcode-plan/billing/balance?app_version=<版本>`,且 `Authorization` 是**裸 JWT**(不加 `Bearer`)。
+- [ ] 该请求带有 `X-Device-Mid` 头,且值是一个格式合法的 UUID。该端点**以设备身份为门槛**:缺失时返回 `400 {"code":3001,"msg":"parameter error"}`——与参数错误无法区分。官方客户端在登录时生成一个 UUIDv4 存入设备身份文件,本插件在登录建凭证时写入 `zcode.device_mid`,重登保留原值。
 - [ ] 该请求返回 `code:0` 且 `data.plans` **非空**。
-  - 若返回 `{"code":3001,"msg":"parameter error"}`:说明声明的版本不被上游接受。**不要**继续猜测参数重试,回到上一条重新取证。
+  - 若返回 `{"code":3001,"msg":"parameter error"}`:**几乎总是缺 `X-Device-Mid`**,不是 `app_version` 的问题。**不要**猜测版本号重试——实测 `app_version` 取 `3.14.4`、`3.14.3`、`0.0.0` 甚至 `999.999.999`,只要带了合法设备身份都同样返回 200;而 `device_mid` 取一个随机 UUID(任意合法 UUID 均可)同样返回 200,取非 UUID 字符串才复现 3001。先确认请求头,而不是版本。
+  - 若返回 `401`:凭证类型不对。该端点只接受 Coding Plan 裸 JWT;`business_token` 与 `x-api-key` 都得到 401,不会进入参数校验。
 - [ ] **不得**以已废弃的 `billing/current` 的 `plans` 作为判据——该端点官方已废弃,它的 `plans:[]` 不构成"账号无订阅"的证据。
 
 ### 1.5 JWT / API Key 请求
@@ -73,7 +75,7 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
   - `no Coding Plan on this account` —— 上游明确报告无套餐(**这不是** unknown);
   - `plan expired` —— 套餐已终止;
   - `unknown (upstream answer not readable)` —— 上游 schema 漂移或答案不可读,此时**不**标记 exhausted/invalid,凭证状态保持不变。
-- [ ] 上游以 HTTP 200 携带业务失败(如 `{"code":3001}`)时,被读成 unknown 而非"无套餐"——否则一次参数错误会伪装成账号没有订阅。
+- [ ] 上游携带业务失败时,被读成 unknown 而非"无套餐"——否则一次参数错误会伪装成账号没有订阅。实测 `3001` 走 HTTP **400** 承载,该状态与 200 携带业务码都要覆盖:判断依据是响应体里的业务码,不是 HTTP 状态。
 
 ### 1.8 管理面回调
 

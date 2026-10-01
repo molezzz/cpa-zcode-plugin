@@ -92,11 +92,16 @@ const (
 	defaultMaxResponseBytes       int64 = 64 << 20
 	defaultRefreshConcurrency           = 4
 	// defaultAppVersion is the ZCode client version the plugin declares by
-	// default. It tracks the version documented in docs/ZCode (package.json).
-	// The upstream gates Billing balance capability on the declared version, so
-	// this value must be a real release rather than an invented constant: see
-	// ProductConfig for how to verify it against a working client.
-	defaultAppVersion = "3.14.3"
+	// default. It tracks the version the shipped desktop client reports, which
+	// is one release ahead of the version in docs/ZCode (package.json) — that
+	// tree is source, the installed app is the release.
+	//
+	// The billing balance endpoint turned out not to gate on this value: a
+	// request carrying a device identity is answered the same way for any
+	// version, including invented ones. It is still declared because it is the
+	// client's own version and belongs on the wire, and because the Messages
+	// path does read it back as User-Agent and X-ZCode-App-Version.
+	defaultAppVersion = "3.14.4"
 )
 
 // parseConfig decodes the YAML override document. Unknown keys are ignored so
