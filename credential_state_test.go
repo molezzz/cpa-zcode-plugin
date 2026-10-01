@@ -221,7 +221,7 @@ func runFallbackAttempt(t *testing.T, doc []byte, forwarder *recordingForwarder)
 		Now:        fixedNow,
 	}
 	cfg := normalizeConfig(defaultConfig())
-	plan := executionPlan(doc, cfg, "GLM-5.2", nil, time.Now())
+	plan := executionPlan(doc, cfg, "GLM-5.2", nil, "", time.Now())
 	scope.Primary = plan.Primary
 	scope.SkipBlockStatus, scope.SkipBlockRetry = skipBlockConclusion(doc, plan.SkipBlockStatus, fixedNow())
 	if plan.Failure != nil {
@@ -377,7 +377,7 @@ func TestUpstreamStreamErrorEventRecordsNoState(t *testing.T) {
 		upstreamScript{frames: completeAnthropicSSE()},
 	)
 	cfg := normalizeConfig(defaultConfig())
-	plan := executionPlan(scope.Document, cfg, "GLM-5.2", nil, time.Now())
+	plan := executionPlan(scope.Document, cfg, "GLM-5.2", nil, "", time.Now())
 	if plan.Failure != nil {
 		t.Fatalf("executionPlan: %+v", plan.Failure)
 	}
@@ -1056,7 +1056,7 @@ func TestBlockedPrimarySkipsUpstreamAndFallsBack(t *testing.T) {
 			// The state that skipped the primary is carried by the plan itself,
 			// so recording it never depends on failure-code spelling.
 			cfg := normalizeConfig(defaultConfig())
-			if skip := executionPlan(doc, cfg, "GLM-5.2", nil, time.Now()).SkipBlockStatus; skip != jwtStatus {
+			if skip := executionPlan(doc, cfg, "GLM-5.2", nil, "", time.Now()).SkipBlockStatus; skip != jwtStatus {
 				t.Fatalf("skip block status = %q, want %q", skip, jwtStatus)
 			}
 			calls := upstream.calls()
@@ -1133,7 +1133,7 @@ func TestVerificationBlockRetryWindowElapses(t *testing.T) {
 
 	// Inside the window the JWT stays skipped.
 	newScriptedUpstream(t, upstreamScript{frames: completeAnthropicSSE()})
-	plan := executionPlan(withRetry, testConfig(), "GLM-5.2", nil, now)
+	plan := executionPlan(withRetry, testConfig(), "GLM-5.2", nil, "", now)
 	if plan.Failure != nil {
 		t.Fatalf("the fallback should serve the request, got %+v", plan.Failure)
 	}
@@ -1156,7 +1156,7 @@ func TestVerificationBlockRetryWindowElapses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan = executionPlan(elapsed, testConfig(), "GLM-5.2", nil, now)
+	plan = executionPlan(elapsed, testConfig(), "GLM-5.2", nil, "", now)
 	if plan.Failure != nil {
 		t.Fatalf("after the retry window the jwt must be primary, got %+v", plan.Failure)
 	}

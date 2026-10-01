@@ -20,7 +20,7 @@ func TestPrimaryProfileUsesJWTPrimaryCredential(t *testing.T) {
 	zcodePlanUpstreamBase = "https://upstream.test"
 	t.Cleanup(func() { zcodePlanUpstreamBase = original })
 
-	plan := executionPlan(testAuthDoc("jwt-token-1", jwtStatusActive), testConfig(), "glm-5.2", nil, time.Now())
+	plan := executionPlan(testAuthDoc("jwt-token-1", jwtStatusActive), testConfig(), "glm-5.2", nil, "", time.Now())
 	if plan.Failure != nil {
 		t.Fatalf("executionPlan: %+v", plan.Failure)
 	}
@@ -69,7 +69,7 @@ func TestFallbackProfileUsesManagedAPIKey(t *testing.T) {
 
 	doc := []byte(`{"zcode":{"identity_id":"zcode-user-1","jwt":{"token":"jwt-token-1","status":"` +
 		jwtStatusInvalid + `"},"api_key":{"status":"active","key_material":"key-1.secret"}}}`)
-	plan := executionPlan(doc, testConfig(), "glm-5.2", nil, time.Now())
+	plan := executionPlan(doc, testConfig(), "glm-5.2", nil, "", time.Now())
 	if plan.Failure != nil {
 		t.Fatalf("executionPlan: %+v", plan.Failure)
 	}
@@ -98,14 +98,14 @@ func TestFallbackProfileUsesManagedAPIKey(t *testing.T) {
 
 func TestProfilesAreImmutablePerRequest(t *testing.T) {
 	doc := testAuthDoc("jwt-token-1", "")
-	first := executionPlan(doc, testConfig(), "GLM-5.2", nil, time.Now())
+	first := executionPlan(doc, testConfig(), "GLM-5.2", nil, "", time.Now())
 	if first.Failure != nil {
 		t.Fatalf("executionPlan: %+v", first.Failure)
 	}
 	// Mutating one profile's headers must not affect the next request.
 	first.Primary.Headers.Set("Authorization", "Bearer tampered")
 	first.Primary.Headers.Set("X-Injected", "yes")
-	second := executionPlan(doc, testConfig(), "GLM-5.2", nil, time.Now())
+	second := executionPlan(doc, testConfig(), "GLM-5.2", nil, "", time.Now())
 	if second.Failure != nil {
 		t.Fatalf("executionPlan: %+v", second.Failure)
 	}
@@ -124,7 +124,7 @@ func TestExecutionPlanRejectsMissingCredentials(t *testing.T) {
 		[]byte(`{"zcode":{"identity_id":"x"}}`),
 		[]byte(`not json`),
 	} {
-		if failure := executionPlan(doc, testConfig(), "GLM-5.2", nil, time.Now()).Failure; failure == nil {
+		if failure := executionPlan(doc, testConfig(), "GLM-5.2", nil, "", time.Now()).Failure; failure == nil {
 			t.Fatalf("doc %q: expected an error", doc)
 		} else if failure.Code != "no_credential" || failure.ClientStatus != http.StatusUnauthorized {
 			t.Fatalf("doc %q: failure = %+v", doc, failure)
@@ -157,7 +157,7 @@ func TestExecutionPlanSkipsBlockedCredentialStates(t *testing.T) {
 			if tc.windowed {
 				doc = withRetryWindow(t, doc, time.Now().Add(time.Minute))
 			}
-			failure := executionPlan(doc, testConfig(), "GLM-5.2", nil, time.Now()).Failure
+			failure := executionPlan(doc, testConfig(), "GLM-5.2", nil, "", time.Now()).Failure
 			if failure == nil {
 				t.Fatal("expected a classified failure")
 			}
@@ -176,7 +176,7 @@ func TestExecutionPlanAllowsActiveAndUnknownStatus(t *testing.T) {
 	// Empty status (legacy document) and unknown status strings stay usable:
 	// the upstream verifies the token on every request.
 	for _, status := range []string{"", jwtStatusActive, "some-future-state"} {
-		plan := executionPlan(testAuthDoc("jwt-token-1", status), testConfig(), "GLM-5.2", nil, time.Now())
+		plan := executionPlan(testAuthDoc("jwt-token-1", status), testConfig(), "GLM-5.2", nil, "", time.Now())
 		if plan.Failure != nil {
 			t.Fatalf("status %q: executionPlan: %+v", status, plan.Failure)
 		}
@@ -200,7 +200,7 @@ func TestCallerHeaderAllowlist(t *testing.T) {
 	caller.Set("X-Cpa-Host-Control", "internal")
 	caller.Set("anthropic-beta", "feature-1,feature-2")
 
-	headers := buildUpstreamHeaders(caller, testConfig().Product.AppVersion)
+	headers := buildUpstreamHeaders(caller, testConfig(), "")
 	for _, name := range []string{"X-Api-Key", "Cookie", "Proxy-Authorization", "Host", "Connection", "X-Cpa-Host-Control"} {
 		if got := headers.Get(name); got != "" {
 			t.Errorf("%s forwarded: %q", name, got)
@@ -231,7 +231,7 @@ func TestCallerHeaderAllowlistDeniesByDefault(t *testing.T) {
 	// do not exist yet.
 	caller := http.Header{}
 	caller.Set("X-Future-Host-Header", "value")
-	if headers := buildUpstreamHeaders(caller, testConfig().Product.AppVersion); headers.Get("X-Future-Host-Header") != "" {
+	if headers := buildUpstreamHeaders(caller, testConfig(), ""); headers.Get("X-Future-Host-Header") != "" {
 		t.Fatal("unknown caller header was forwarded")
 	}
 }
@@ -253,6 +253,49 @@ func TestNormalizeRequestModel(t *testing.T) {
 	for input, want := range cases {
 		if got := normalizeRequestModel(input, catalog); got != want {
 			t.Errorf("normalizeRequestModel(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestNormalizeRequestModelCanonicalizesOfficialGLMIds(t *testing.T) {
+	// Ids outside the static catalog must still reach the upstream in the
+	// official casing when they name an official GLM model — the model
+	// router is case-sensitive.
+	catalog := []string{"GLM-5.2", "GLM-5-Turbo"}
+	cases := map[string]string{
+		"glm-5.3-flash":      "GLM-5.3-Flash",
+		"GLM-5.3-FLASH":      "GLM-5.3-Flash",
+		"zcode/glm-4.6v":     "GLM-4.6V",
+		"glm-4.7-flashx":     "GLM-4.7-FlashX",
+		"glm-5":              "GLM-5",
+		"glm-4-flash-250414": "GLM-4-Flash-250414",
+		// Not in the official table (only the -250414 variant is), so it
+		// passes through unchanged.
+		"glm-4-flash":      "glm-4-flash",
+		"unknown-model":    "unknown-model",
+		"custom-glm-9.9":   "custom-glm-9.9",
+		"agim-5.3-preview": "agim-5.3-preview",
+	}
+	for input, want := range cases {
+		if got := normalizeRequestModel(input, catalog); got != want {
+			t.Errorf("normalizeRequestModel(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestCanonicalizeGLMModelID(t *testing.T) {
+	cases := map[string]string{
+		"glm-5.3-flash":           "GLM-5.3-Flash",
+		" GLM-5.2 ":               "GLM-5.2",
+		"glm-5v-turbo":            "GLM-5V-Turbo",
+		"glm-4.1v-thinking-flash": "GLM-4.1V-Thinking-Flash",
+		"glm-4-flash-250414":      "GLM-4-Flash-250414",
+		"future-glm-9.9":          "future-glm-9.9",
+		"":                        "",
+	}
+	for input, want := range cases {
+		if got := canonicalizeGLMModelID(input); got != want {
+			t.Errorf("canonicalizeGLMModelID(%q) = %q, want %q", input, got, want)
 		}
 	}
 }

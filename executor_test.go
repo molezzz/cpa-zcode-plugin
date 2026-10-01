@@ -758,3 +758,165 @@ func TestExecutionRegistryRemove(t *testing.T) {
 	}
 	cancel()
 }
+
+func TestExecutorExecutePlan3012IsTerminalWithoutCrossDomainFallback(t *testing.T) {
+	upstream := newUpstreamRecorder(t)
+	fake, _ := overrideHost(t)
+	overrideConfig(t, func(cfg *Config) {})
+
+	// The Coding Plan route answers 405 carrying the request-level business
+	// code 3012. The cause is not established and no challenge is claimed:
+	// the caller gets the upstream's own bounded reading of the rejection.
+	upstream.handler = func(w http.ResponseWriter, _ *http.Request, _ int) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte(`{"code":3012,"msg":"request has been blocked due to unusual activity.","logid":"log-1"}`))
+	}
+	// A second server stands in for the managed-key route, a different billing
+	// domain. A request-level verdict cannot be cured by another credential,
+	// so the loop must end before that route can spend the account's balance.
+	fallback := newKeyRouteRecorder(t)
+
+	doc := []byte(`{"zcode":{"identity_id":"zcode-user-1","jwt":{"token":"` + testJWT + `","status":"` +
+		jwtStatusActive + `"},"api_key":{"status":"active","key_material":"key-1.secret"}}}`)
+	env := callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, doc, testRequestPayload(), "", nil))
+	if env.OK {
+		t.Fatalf("execute unexpectedly succeeded: %+v", env.Result)
+	}
+	if env.Error == nil {
+		t.Fatal("failure envelope missing an error")
+	}
+	if env.Error.Code != "upstream_rejected_invalid_request" {
+		t.Fatalf("error code = %q, want the request-level business classification", env.Error.Code)
+	}
+	if env.Error.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("error status = %d, want 400 instead of the 405 carrier", env.Error.HTTPStatus)
+	}
+	if !strings.Contains(env.Error.Message, "unusual activity") || !strings.Contains(env.Error.Message, "3012") {
+		t.Fatalf("message = %q, want the bounded upstream msg and business code", env.Error.Message)
+	}
+	if strings.Contains(strings.ToLower(env.Error.Message), "challenge") {
+		t.Fatalf("message = %q, must not claim an unproven challenge diagnosis", env.Error.Message)
+	}
+	if upstream.count() != 1 {
+		t.Fatalf("coding plan route requests = %d, want exactly 1", upstream.count())
+	}
+	if fallback.count() != 0 {
+		t.Fatalf("fallback route requests = %d, want 0: a request-level verdict must not spend the API-key billing domain", fallback.count())
+	}
+	// Neither credential's state may move: the verdict is about the request,
+	// not about the credential, so the recorded states stay byte-identical.
+	for _, call := range fake.calls {
+		if call.method == pluginabi.MethodHostAuthSave {
+			t.Fatalf("credential state written for a request-level rejection: %s", call.request)
+		}
+	}
+}
+
+func TestExecutorExecuteVerificationBlockedStillFallsBack(t *testing.T) {
+	upstream := newUpstreamRecorder(t)
+	overrideHost(t)
+	overrideConfig(t, func(cfg *Config) {})
+
+	// The one credential-level verdict that changes nothing about the JWT's
+	// validity: a 403 whose body carries explicit captcha/verify evidence.
+	// Its fallback across the billing-domain boundary is the existing,
+	// evidence-backed flow and must not regress.
+	upstream.handler = func(w http.ResponseWriter, _ *http.Request, _ int) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"type":"risk_control","message":"captcha verification required"}}`))
+	}
+	fallback := newKeyRouteRecorder(t)
+
+	doc := []byte(`{"zcode":{"identity_id":"zcode-user-1","jwt":{"token":"` + testJWT + `","status":"` +
+		jwtStatusActive + `"},"api_key":{"status":"active","key_material":"key-1.secret"}}}`)
+	env := callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, doc, testRequestPayload(), "", nil))
+	if !env.OK {
+		t.Fatalf("the fallback key should serve the request: %+v", env.Error)
+	}
+	if upstream.count() != 1 {
+		t.Fatalf("coding plan route requests = %d, want exactly 1", upstream.count())
+	}
+	if fallback.count() != 1 {
+		t.Fatalf("fallback route requests = %d, want exactly 1", fallback.count())
+	}
+}
+
+// newKeyRouteRecorder redirects zaiAPIBase at a local server and counts the
+// requests it receives.
+func newKeyRouteRecorder(t *testing.T) *upstreamRecorder {
+	t.Helper()
+	rec := &upstreamRecorder{}
+	rec.handler = func(w http.ResponseWriter, _ *http.Request, _ int) {
+		writeSSE(w, completeAnthropicSSE())
+	}
+	rec.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.mu.Lock()
+		rec.requests++
+		rec.mu.Unlock()
+		rec.handler(w, r, 0)
+	}))
+	t.Cleanup(rec.server.Close)
+	original := zaiAPIBase
+	zaiAPIBase = rec.server.URL
+	t.Cleanup(func() { zaiAPIBase = original })
+	return rec
+}
+
+func TestExecutorDiagnosticsCarryEvidenceWithoutSecrets(t *testing.T) {
+	upstream := newUpstreamRecorder(t)
+	overrideHost(t)
+	// Debug is off by default; this test turns it on to inspect the evidence
+	// the lines carry.
+	defer storeDebugConfig(true)()
+	buf := captureDiagLog(t)
+
+	const jwtToken = "jwt-evidence-token.payload.signature"
+	const apiKeyMaterial = "key-evidence.secret"
+	upstream.handler = func(w http.ResponseWriter, _ *http.Request, _ int) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte(`{"code":3012,"msg":"request has been blocked due to unusual activity.","logid":"log-evidence-1"}`))
+	}
+	doc := []byte(`{"zcode":{"identity_id":"zcode-user-1","jwt":{"token":"` + jwtToken + `","status":"` +
+		jwtStatusActive + `"},"api_key":{"status":"active","key_material":"` + apiKeyMaterial + `"}}}`)
+	payload := testRequestPayload()
+	env := callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, doc, payload, "", nil))
+	if env.OK {
+		t.Fatalf("execute unexpectedly succeeded: %+v", env.Result)
+	}
+
+	log := buf.String()
+	// The necessary evidence fields: route, billing domain, credential kind,
+	// upstream status, class, code, bounded msg, correlation id, and the
+	// fallback decision.
+	for _, want := range []string{
+		"route=" + routeIDPlanJWT,
+		"domain=" + string(billingPlanEntitlement),
+		"cred=jwt",
+		"upstream_status=405",
+		"class=" + string(failureRejected),
+		"code=upstream_rejected_invalid_request",
+		`logid="log-evidence-1"`,
+		"unusual activity",
+		"decision=denied",
+		routeIDManagedKey,
+		string(billingAPIBalance),
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("diagnostics missing evidence %q: %q", want, log)
+		}
+	}
+	// The forbidden material: credential values and the request payload never
+	// enter the log.
+	for _, forbidden := range []string{
+		jwtToken, apiKeyMaterial, "Bearer ", "evidence-token", "max_tokens",
+	} {
+		if strings.Contains(log, forbidden) {
+			t.Errorf("diagnostics leaked forbidden material %q: %q", forbidden, log)
+		}
+	}
+	// The device identity header never renders: the plan's header view names
+	// every header it carries, and X-Device-Mid must appear only redacted.
+	if strings.Contains(log, "X-Device-Mid=") && !strings.Contains(log, "X-Device-Mid=<redacted>") {
+		t.Errorf("device identity rendered unredacted: %q", log)
+	}
+}

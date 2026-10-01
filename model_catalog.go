@@ -233,7 +233,7 @@ type discoveryTarget struct {
 // buildDiscoveryTarget resolves one environment's discovery request from a
 // credential snapshot. ok is false when the credential carries no material or
 // the environment has no derivable models endpoint.
-func buildDiscoveryTarget(kind CredentialKind, snap credentialSnapshot, cfg Config) (discoveryTarget, bool) {
+func buildDiscoveryTarget(kind CredentialKind, snap credentialSnapshot, cfg Config, deviceID string) (discoveryTarget, bool) {
 	env, ok := discoveryEnvironments[kind]
 	if !ok {
 		return discoveryTarget{}, false
@@ -248,7 +248,7 @@ func buildDiscoveryTarget(kind CredentialKind, snap credentialSnapshot, cfg Conf
 	}
 	// The same product header set as the environment's Messages profile,
 	// except discovery is a plain JSON GET rather than an SSE stream.
-	headers := buildUpstreamHeaders(nil, cfg.Product.AppVersion)
+	headers := buildUpstreamHeaders(nil, cfg, deviceID)
 	headers.Set("Accept", "application/json")
 	env.authenticate(headers, material)
 	return discoveryTarget{
@@ -421,7 +421,7 @@ func modelsForAuth(ctx context.Context, cfg Config, catalog *modelCatalog, authI
 		if catalog.coolingDown(scope, now) {
 			continue
 		}
-		target, ok := buildDiscoveryTarget(kind, snap, cfg)
+		target, ok := buildDiscoveryTarget(kind, snap, cfg, deviceIdentity(authIndex, doc))
 		if !ok {
 			continue
 		}
@@ -614,6 +614,7 @@ func refreshAccountModels(ctx context.Context, cfg Config, catalog *modelCatalog
 	if err != nil {
 		return []modelRefreshOutcome{{Reason: "credential_missing"}}
 	}
+	deviceID := deviceIdentity(authIndex, doc)
 	for _, kind := range []CredentialKind{CredentialJWT, CredentialAPIKey} {
 		environment := environmentForKind(kind)
 		if !credentialUsableForDiscovery(kind, snap, now) {
@@ -623,7 +624,7 @@ func refreshAccountModels(ctx context.Context, cfg Config, catalog *modelCatalog
 			})
 			continue
 		}
-		target, ok := buildDiscoveryTarget(kind, snap, cfg)
+		target, ok := buildDiscoveryTarget(kind, snap, cfg, deviceID)
 		if !ok {
 			outcomes = append(outcomes, modelRefreshOutcome{
 				Environment: environment,

@@ -150,8 +150,17 @@ type upstreamFailure struct {
 	ClientStatus   int
 	Code           string
 	Message        string
-	// RetryableBeforeOutput reports whether the failure classification would
-	// allow another credential attempt while nothing has been output yet.
+	// LogID is the upstream's own request correlation id ("logid" in a Z.AI
+	// business envelope), when the answer carried one. It is display-only
+	// evidence for debug lines — what ties a plugin attempt to an upstream
+	// log entry — and never enters a caller-facing envelope.
+	LogID string
+	// RetryableBeforeOutput reports whether this classification permits
+	// another attempt before anything was output. It says nothing about which
+	// credential or route may serve the retry: the executor's route
+	// compatibility rule (fallbackAllowed) owns that decision, because a
+	// retry that crosses a billing/entitlement boundary spends resources the
+	// failed route was never allowed to spend.
 	RetryableBeforeOutput bool
 }
 
@@ -221,8 +230,11 @@ func credentialRejectionClass(status int, bodyText string) (failureClass, bool) 
 //     whatever business code happens to ride along with it, because that
 //     would trade a five-minute automatic retry for a permanent conclusion.
 //  2. The Z.AI business verdict. The upstream reuses HTTP statuses as carriers
-//     for business outcomes — notably 405 for a risk-control block — so a
-//     recognised code describes the rejection better than its status does.
+//     for business outcomes — 405 has been observed carrying a request-level
+//     business rejection — so a recognised code describes the rejection better
+//     than its status does. The classifier reads only what the answer says
+//     (status, code, bounded msg); it never speculates an unproven server-side
+//     cause such as a client-integrity challenge.
 //  3. HTTP semantics, for an answer that carries neither.
 func classifyUpstreamFailure(status int, body []byte) *upstreamFailure {
 	bodyText := string(body)
@@ -317,10 +329,11 @@ func classifyUpstreamFailure(status int, body []byte) *upstreamFailure {
 // The two halves of the result are deliberately separate. The failure class
 // says whether the answer is a statement about the credential, and therefore
 // whether the state machine may move a credential; RetryableBeforeOutput says
-// whether another credential may serve this request before anything reached the
-// caller. A request-level rejection such as 3012 concludes nothing about the
-// credential, yet it must still let the fallback key try — otherwise a
-// verification block would strand an account that has a working fallback.
+// whether another attempt may serve this request before anything reached the
+// caller — not which route may serve it. A request-level rejection such as
+// 3012 concludes nothing about the credential, so it records no state; whether
+// the request may be replayed across the billing-domain boundary is the
+// executor's route compatibility decision, and by default it is not.
 func classifyBusinessFailure(status int, body []byte) *upstreamFailure {
 	semantics, code, ok := zaiBusinessSemanticsFor(body)
 	if !ok {
@@ -334,9 +347,10 @@ func classifyBusinessFailure(status int, body []byte) *upstreamFailure {
 			ClientStatus:   clientStatusForSemantics(semantics, status),
 			Code:           "upstream_rejected_" + string(semantics),
 			Message:        businessRejectionMessage(semantics, code, body),
-			// A rejection about the request rather than the credential is
-			// exactly when the fallback credential is worth trying: it may
-			// serve a request the primary's plan or risk state cannot.
+			LogID:          zaiBusinessLogID(body),
+			// A rejection about the request rather than the credential permits
+			// another attempt; the executor's route compatibility rule decides
+			// whether any other route may serve it.
 			RetryableBeforeOutput: true,
 		}
 	}
@@ -346,6 +360,7 @@ func classifyBusinessFailure(status int, body []byte) *upstreamFailure {
 		ClientStatus:          clientStatusForSemantics(semantics, status),
 		Code:                  "upstream_" + string(semantics),
 		Message:               businessRejectionMessage(semantics, code, body),
+		LogID:                 zaiBusinessLogID(body),
 		RetryableBeforeOutput: true,
 	}
 }

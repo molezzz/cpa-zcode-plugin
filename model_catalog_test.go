@@ -212,7 +212,7 @@ func TestDiscoverModelsParsesTrimsAndDeduplicates(t *testing.T) {
 	target, ok := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{
 		IdentityID: "identity-1",
 		JWTToken:   "jwt-secret-value",
-	}, defaultConfig())
+	}, defaultConfig(), "")
 	if !ok {
 		t.Fatal("a plan credential must build a discovery target")
 	}
@@ -244,7 +244,7 @@ func TestDiscoverModelsZaiEnvironmentAuthenticatesWithTheKey(t *testing.T) {
 	target, ok := buildDiscoveryTarget(CredentialAPIKey, credentialSnapshot{
 		IdentityID:  "identity-1",
 		APIKeyToken: "key-secret-value",
-	}, defaultConfig())
+	}, defaultConfig(), "")
 	if !ok {
 		t.Fatal("an api key credential must build a discovery target")
 	}
@@ -261,7 +261,7 @@ func TestDiscoverModelsRejectsOversizedResponses(t *testing.T) {
 	defer server.Close()
 	overrideCatalogUpstreams(t, server.URL)
 
-	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig())
+	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig(), "")
 	ids, reason := discoverModels(context.Background(), server.Client(), target)
 	if ids != nil || reason != discoveryReasonTooLarge {
 		t.Fatalf("ids=%v reason=%q, want the size limit to reject the response", ids, reason)
@@ -275,7 +275,7 @@ func TestDiscoverModelsMalformedBodyIsNotSuccess(t *testing.T) {
 	defer server.Close()
 	overrideCatalogUpstreams(t, server.URL)
 
-	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig())
+	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig(), "")
 	ids, reason := discoverModels(context.Background(), server.Client(), target)
 	if ids != nil || reason != discoveryReasonMalformed {
 		t.Fatalf("ids=%v reason=%q, want a malformed response refusal", ids, reason)
@@ -289,7 +289,7 @@ func TestDiscoverModelsEmptyCatalogIsNotSuccess(t *testing.T) {
 	defer server.Close()
 	overrideCatalogUpstreams(t, server.URL)
 
-	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig())
+	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig(), "")
 	ids, reason := discoverModels(context.Background(), server.Client(), target)
 	if ids != nil || reason != discoveryReasonEmpty {
 		t.Fatalf("ids=%v reason=%q, want an empty catalog refusal", ids, reason)
@@ -304,7 +304,7 @@ func TestDiscoverModelsErrorStatusIsSanitized(t *testing.T) {
 	defer server.Close()
 	overrideCatalogUpstreams(t, server.URL)
 
-	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig())
+	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig(), "")
 	ids, reason := discoverModels(context.Background(), server.Client(), target)
 	if ids != nil {
 		t.Fatalf("ids = %v, want none from a rejected discovery", ids)
@@ -317,7 +317,7 @@ func TestDiscoverModelsErrorStatusIsSanitized(t *testing.T) {
 func TestDiscoverModelsUnreachableUpstream(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	overrideCatalogUpstreams(t, server.URL)
-	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig())
+	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig(), "")
 	server.Close()
 
 	ids, reason := discoverModels(context.Background(), server.Client(), target)
@@ -336,7 +336,7 @@ func TestDiscoverModelsTimesOut(t *testing.T) {
 	overrideCatalogUpstreams(t, server.URL)
 
 	bounded := &http.Client{Timeout: 50 * time.Millisecond}
-	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig())
+	target, _ := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{JWTToken: "jwt-secret-value"}, defaultConfig(), "")
 	done := make(chan struct{})
 	var ids []string
 	var reason string
@@ -355,10 +355,10 @@ func TestDiscoverModelsTimesOut(t *testing.T) {
 }
 
 func TestBuildDiscoveryTargetRequiresMaterial(t *testing.T) {
-	if _, ok := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{IdentityID: "identity-1"}, defaultConfig()); ok {
+	if _, ok := buildDiscoveryTarget(CredentialJWT, credentialSnapshot{IdentityID: "identity-1"}, defaultConfig(), ""); ok {
 		t.Fatal("a plan environment without jwt material must not be discovered")
 	}
-	if _, ok := buildDiscoveryTarget(CredentialAPIKey, credentialSnapshot{IdentityID: "identity-1"}, defaultConfig()); ok {
+	if _, ok := buildDiscoveryTarget(CredentialAPIKey, credentialSnapshot{IdentityID: "identity-1"}, defaultConfig(), ""); ok {
 		t.Fatal("a key environment without key material must not be discovered")
 	}
 }

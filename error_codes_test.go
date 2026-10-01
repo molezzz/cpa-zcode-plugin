@@ -26,10 +26,12 @@ func TestClassifyUpstreamFailureBusinessCodeMatrix(t *testing.T) {
 		wantClient     int
 		wantMovesState bool
 	}{
-		// 3012 is the risk-control block this plugin actually hit, delivered on
-		// HTTP 405. It is a request-level refusal: it must not mark the JWT
-		// invalid or exhausted, and 405 must not reach the caller.
-		{"risk control on 405", http.StatusMethodNotAllowed,
+		// 3012 is the request-level rejection this plugin actually hit,
+		// delivered on HTTP 405. It must not mark the JWT invalid or
+		// exhausted, and the 405 carrier must not reach the caller. The
+		// code's cause is not established; the classifier reads only what
+		// the answer states.
+		{"request-level rejection on 405", http.StatusMethodNotAllowed,
 			[]byte(`{"code":3012,"msg":"request has been blocked due to unusual activity.","logid":"abc"}`),
 			failureRejected, http.StatusBadRequest, false},
 

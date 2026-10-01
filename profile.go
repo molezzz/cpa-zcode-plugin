@@ -210,13 +210,20 @@ func apiKeyUsable(status, retryAfter string, now time.Time) bool {
 
 // ResolvedProfile is the immutable per-request upstream configuration. Every
 // execution request builds a fresh profile from the selected auth record; the
-// profile owns endpoint, credential kind, authentication and product headers,
+// profile owns route, credential kind, authentication and product headers,
 // model normalization, and HTTP limits. Callers must not mutate it.
 type ResolvedProfile struct {
 	IdentityID     string
 	CredentialKind CredentialKind
-	MessagesURL    string
-	ModelID        string
+	// Route is the resolved upstream route this profile sends to: identity,
+	// URL, authentication shape, billing/entitlement domain, and gateway
+	// status. It is the only route description the executor and classifier
+	// reason about.
+	Route resolvedRoute
+	// MessagesURL is the route's absolute Messages URL, kept as a direct field
+	// because every attempt reads it.
+	MessagesURL string
+	ModelID     string
 	// Headers is the complete upstream request header set: plugin-built
 	// authentication plus product headers plus allowlisted caller headers.
 	Headers http.Header
@@ -231,28 +238,43 @@ type ResolvedProfile struct {
 	IdleReadTimeout time.Duration
 }
 
-// newProfile builds one credential's immutable profile. Endpoint and
-// authentication depend on the credential kind alone: the primary reaches the
-// Coding Plan endpoint with a bearer JWT, the fallback reaches the Z.AI
-// endpoint with the managed key in x-api-key.
-func newProfile(snap credentialSnapshot, kind CredentialKind, cfg Config, model string, callerHeaders http.Header) ResolvedProfile {
+// newProfile builds one credential's immutable profile. Route and
+// authentication depend on the credential kind alone: the route resolver
+// declares the authentication shape, and the profile builds it from the
+// credential itself. The primary reaches the Coding Plan endpoint with a
+// bearer JWT, the fallback reaches the Z.AI endpoint with the managed key in
+// x-api-key. The JWT's final wire shape — whether the route also wants the JWT
+// in x-api-key — stays an open question until an authorized capture proves it,
+// so the profile declares only the bearer form.
+//
+// deviceID is the credential's persisted device identity, sent as the client
+// fingerprint's X-Device-Mid so a Messages request and a balance request for the
+// same account describe one installation.
+func newProfile(snap credentialSnapshot, kind CredentialKind, cfg Config, model string, callerHeaders http.Header, deviceID string) ResolvedProfile {
+	route := resolveRoute(kind)
 	profile := ResolvedProfile{
 		IdentityID:       snap.IdentityID,
 		CredentialKind:   kind,
-		MessagesURL:      messagesEndpointURL(),
+		Route:            route,
+		MessagesURL:      route.URL,
 		ModelID:          normalizeRequestModel(model, cfg.Models),
-		Headers:          buildUpstreamHeaders(callerHeaders, cfg.Product.AppVersion),
+		Headers:          buildUpstreamHeaders(callerHeaders, cfg, deviceID),
 		MaxResponseBytes: cfg.Upstream.MaxResponseBytes,
 		ConnectTimeout:   time.Duration(cfg.Upstream.ConnectTimeoutSeconds) * time.Second,
 		HeaderTimeout:    time.Duration(cfg.Upstream.RequestTimeoutSeconds) * time.Second,
 		IdleReadTimeout:  time.Duration(cfg.Upstream.RequestTimeoutSeconds) * time.Second,
 	}
-	if kind == CredentialAPIKey {
-		profile.MessagesURL = zaiMessagesEndpointURL()
+	switch route.AuthMode {
+	case authAPIKey:
 		profile.Headers.Set("x-api-key", snap.APIKeyToken)
-		return profile
+	case authBearerJWT:
+		profile.Headers.Set("Authorization", "Bearer "+snap.JWTToken)
 	}
-	profile.Headers.Set("Authorization", "Bearer "+snap.JWTToken)
+	if route.GatewayRewritten {
+		// A gateway-routed request drops only the explicit Host header;
+		// authentication and every other header go through unchanged.
+		profile.Headers = gatewayRequestHeaders(profile.Headers)
+	}
 	return profile
 }
 
@@ -263,7 +285,7 @@ func newProfile(snap credentialSnapshot, kind CredentialKind, cfg Config, model 
 // credential, so a caller Authorization/x-api-key value can never reach the
 // upstream, and the two credential forms cannot inherit each other's header. The
 // result is a fresh header map; mutating it cannot leak into other profiles.
-func buildUpstreamHeaders(callerHeaders http.Header, appVersion string) http.Header {
+func buildUpstreamHeaders(callerHeaders http.Header, cfg Config, deviceID string) http.Header {
 	headers := http.Header{}
 	for name, values := range callerHeaders {
 		if !callerHeaderAllowed(name) {
@@ -278,10 +300,12 @@ func buildUpstreamHeaders(callerHeaders http.Header, appVersion string) http.Hea
 	// never change that.
 	headers.Set("Accept", "text/event-stream")
 	headers.Set("anthropic-version", anthropicVersionValue)
+	appVersion := cfg.Product.AppVersion
 	headers.Set("User-Agent", zcodeUserAgent(appVersion))
 	headers.Set("X-ZCode-App-Version", appVersion)
 	headers.Set("X-ZCode-Agent", zcodeAgentHeader)
 	headers.Set("HTTP-Referer", zcodeReferer)
+	applyClientFingerprint(headers, cfg, deviceID)
 	return headers
 }
 
@@ -307,6 +331,56 @@ var knownModelAliases = map[string]string{
 	"glm-turbo": "GLM-5-Turbo",
 }
 
+// officialGLMModelIDs is the upstream's canonical GLM model id table
+// (official shared/official-glm-model-id.ts). The Coding Plan balance
+// endpoint declares model capabilities in lower case, so this table is how
+// capability ids and caller spellings are folded onto the official casing
+// the upstream model router expects. New official models enter the table
+// together with the official source's own list.
+var officialGLMModelIDs = []string{
+	"GLM-5.3",
+	"GLM-5.3-Flash",
+	"GLM-5V-Turbo",
+	"GLM-5.2",
+	"GLM-5.1",
+	"GLM-5.1-Highspeed",
+	"GLM-5",
+	"GLM-5-Turbo",
+	"GLM-4.7",
+	"GLM-4.7-FlashX",
+	"GLM-4.7-Flash",
+	"GLM-4.6",
+	"GLM-4.5-Air",
+	"GLM-4.5",
+	"GLM-4.6V",
+	"GLM-4.6V-Flash",
+	"GLM-4.6V-FlashX",
+	"GLM-4.1V-Thinking-FlashX",
+	"GLM-4.1V-Thinking-Flash",
+	"GLM-4-FlashX-250414",
+	"GLM-4-Flash-250414",
+	"GLM-4V-Flash",
+}
+
+var officialGLMModelIDsByLower = func() map[string]string {
+	byLower := make(map[string]string, len(officialGLMModelIDs))
+	for _, id := range officialGLMModelIDs {
+		byLower[strings.ToLower(id)] = id
+	}
+	return byLower
+}()
+
+// canonicalizeGLMModelID folds one model id onto the official casing. An id
+// outside the official table is returned unchanged: dynamic discovery may
+// name models the table does not know yet.
+func canonicalizeGLMModelID(id string) string {
+	trimmed := strings.TrimSpace(id)
+	if canonical, ok := officialGLMModelIDsByLower[strings.ToLower(trimmed)]; ok {
+		return canonical
+	}
+	return trimmed
+}
+
 // normalizeRequestModel maps a caller model id onto the canonical upstream
 // name. A leading provider scope ("zcode/GLM-5.2") is dropped, catalog ids
 // are matched case-insensitively so their canonical casing is restored, and
@@ -326,6 +400,12 @@ func normalizeRequestModel(model string, catalog []string) string {
 		}
 	}
 	if canonical, ok := knownModelAliases[lower]; ok {
+		return canonical
+	}
+	// A caller or capability spelling of an official GLM id ("glm-5.3-flash")
+	// must reach the upstream in the official casing; the model router is
+	// case-sensitive.
+	if canonical, ok := officialGLMModelIDsByLower[lower]; ok {
 		return canonical
 	}
 	return trimmed

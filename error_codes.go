@@ -9,11 +9,12 @@ import (
 )
 
 // Z.AI does not answer with HTTP semantics alone. Its status codes are reused
-// as transport carriers for business outcomes: a risk-control rejection is
-// delivered as HTTP 405, a stale token as HTTP 401 on an endpoint that has no
-// 401 semantics at all. Classifying on the status alone therefore mislabels
-// every such answer — most visibly, forwarding 405 to the caller tells the
-// caller "method not allowed" about a request whose method was always correct.
+// as transport carriers for business outcomes: a business rejection has been
+// observed delivered as HTTP 405, a stale token as HTTP 401 on an endpoint
+// that has no 401 semantics at all. Classifying on the status alone therefore
+// mislabels every such answer — most visibly, forwarding 405 to the caller
+// tells the caller "method not allowed" about a request whose method was
+// always correct.
 //
 // The plugin therefore classifies on the Z.AI business code carried in the
 // body, and only falls back to HTTP status for answers that carry no code.
@@ -23,9 +24,12 @@ import (
 // the code is polymorphic in the wild (number or string) and some endpoints
 // wrap it under data, so both spellings are read.
 type zaiBusinessEnvelope struct {
-	Code    zaiBusinessCode    `json:"code"`
-	Msg     string             `json:"msg"`
-	Message string             `json:"message"`
+	Code    zaiBusinessCode `json:"code"`
+	Msg     string          `json:"msg"`
+	Message string          `json:"message"`
+	// LogID is the upstream's request correlation id. It is display-only
+	// evidence for debug lines and never enters a caller-facing envelope.
+	LogID   string             `json:"logid"`
 	Success *bool              `json:"success"`
 	Data    *zaiBusinessDetail `json:"data"`
 	// Error carries the OpenAI-shaped error object the Messages endpoints use.
@@ -38,6 +42,7 @@ type zaiBusinessDetail struct {
 	Code    zaiBusinessCode `json:"code"`
 	Msg     string          `json:"msg"`
 	Message string          `json:"message"`
+	LogID   string          `json:"logid"`
 	Success *bool           `json:"success"`
 }
 
@@ -86,6 +91,16 @@ func (c zaiBusinessCode) succeeded() bool {
 	}
 }
 
+// eachNested runs f over the envelope's nested detail objects (data, error) —
+// the places a wrapped verdict may hide one level in.
+func (e *zaiBusinessEnvelope) eachNested(f func(*zaiBusinessDetail)) {
+	for _, nested := range []*zaiBusinessDetail{e.Data, e.Error} {
+		if nested != nil {
+			f(nested)
+		}
+	}
+}
+
 // parseZaiBusinessEnvelope decodes the Z.AI business verdict of one response
 // body. ok is false only when the body is not a JSON object at all; a JSON
 // object without a code is a successful envelope carrying no code.
@@ -97,28 +112,32 @@ func parseZaiBusinessEnvelope(body []byte) (zaiBusinessEnvelope, bool) {
 	// A code nested under data or error is the same verdict one level in;
 	// prefer it only when the top level carried none.
 	if !parsed.Code.present() {
-		for _, nested := range []*zaiBusinessDetail{parsed.Data, parsed.Error} {
-			if nested != nil && nested.Code.present() {
+		parsed.eachNested(func(nested *zaiBusinessDetail) {
+			if !parsed.Code.present() && nested.Code.present() {
 				parsed.Code = nested.Code
-				break
 			}
-		}
+		})
 	}
 	if parsed.Msg == "" {
-		for _, nested := range []*zaiBusinessDetail{parsed.Data, parsed.Error} {
-			if nested != nil && strings.TrimSpace(nested.Msg) != "" {
+		parsed.eachNested(func(nested *zaiBusinessDetail) {
+			if parsed.Msg == "" && strings.TrimSpace(nested.Msg) != "" {
 				parsed.Msg = nested.Msg
-				break
 			}
-		}
+		})
+	}
+	if parsed.LogID == "" {
+		parsed.eachNested(func(nested *zaiBusinessDetail) {
+			if parsed.LogID == "" && strings.TrimSpace(nested.LogID) != "" {
+				parsed.LogID = nested.LogID
+			}
+		})
 	}
 	if parsed.Success == nil {
-		for _, nested := range []*zaiBusinessDetail{parsed.Data, parsed.Error} {
-			if nested != nil && nested.Success != nil {
+		parsed.eachNested(func(nested *zaiBusinessDetail) {
+			if parsed.Success == nil && nested.Success != nil {
 				parsed.Success = nested.Success
-				break
 			}
-		}
+		})
 	}
 	return parsed, true
 }
@@ -146,9 +165,11 @@ const (
 	// zaiSemProviderOverloaded is upstream capacity pressure.
 	zaiSemProviderOverloaded zaiBusinessSemantics = "provider_overloaded"
 	// zaiSemRequestRejected is a request-level refusal — a malformed request,
-	// an unknown model, or a risk-control block. It says nothing about the
-	// credential, which is why 3012 lands here and never marks a credential
-	// invalid or exhausted.
+	// an unknown model, or a block whose cause the answer does not state. It
+	// says nothing about the credential, which is why 3012 lands here and
+	// never marks a credential invalid or exhausted; and it concludes nothing
+	// about the cause either, so no unproven server-side explanation is
+	// inferred from it.
 	zaiSemRequestRejected zaiBusinessSemantics = "invalid_request"
 	// zaiSemUpstreamError is an upstream-side fault.
 	zaiSemUpstreamError zaiBusinessSemantics = "server_error"
@@ -265,7 +286,7 @@ func failureClassForSemantics(semantics zaiBusinessSemantics) (failureClass, boo
 		// request's entitlement to run, not about the credential's validity:
 		// the same credential may serve a different request. They conclude
 		// nothing, so a plan the user is not entitled to cannot strand the
-		// credential, and a risk-control block cannot mark it invalid.
+		// credential, and a request-level block cannot mark it invalid.
 		return "", false
 	}
 }
@@ -295,6 +316,19 @@ func zaiBusinessMessage(body []byte) string {
 		}
 	}
 	return ""
+}
+
+// zaiBusinessLogID extracts the bounded, single-line request correlation id a
+// Z.AI business answer may carry ("logid"). It is display-only debug evidence
+// — what ties a plugin attempt to an upstream log entry — and never reaches a
+// caller-facing envelope.
+func zaiBusinessLogID(body []byte) string {
+	envelope, ok := parseZaiBusinessEnvelope(body)
+	if !ok {
+		return ""
+	}
+	const maxLogID = 64
+	return truncateForLog(singleLine(envelope.LogID), maxLogID)
 }
 
 // zaiBusinessSuccess reports whether a 2xx Z.AI answer actually succeeded. Some

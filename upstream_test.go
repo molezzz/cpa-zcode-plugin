@@ -17,7 +17,7 @@ import (
 // testProfile builds an immutable profile aimed at an httptest server.
 func testProfile(t *testing.T, serverURL string, mutate func(*ResolvedProfile)) ResolvedProfile {
 	t.Helper()
-	plan := executionPlan(testAuthDoc("jwt-token-1", jwtStatusActive), testConfig(), "GLM-5.2", nil, time.Now())
+	plan := executionPlan(testAuthDoc("jwt-token-1", jwtStatusActive), testConfig(), "GLM-5.2", nil, "", time.Now())
 	if plan.Failure != nil {
 		t.Fatalf("executionPlan: %+v", plan.Failure)
 	}
@@ -424,5 +424,108 @@ func TestPumpUpstreamSlowTrickleKeepsStreamAlive(t *testing.T) {
 	}
 	if frames != 2 {
 		t.Fatalf("frames = %d, want 2", frames)
+	}
+}
+
+func TestPumpUpstreamClassifiesPlanRoute3012AsRequestRejection(t *testing.T) {
+	// The observed upstream answer on the Coding Plan route: HTTP 405 carrying
+	// business code 3012. Per the official client's own attribution table the
+	// code is a request-level invalid_request; its cause is not established,
+	// so the classifier reads only what the answer says and speculates
+	// nothing. The 405 carrier is folded to 400 — 405 would tell the caller
+	// the method was wrong, which it never was.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte(`{"code":3012,"msg":"request has been blocked due to unusual activity.","logid":"log-1"}`))
+	}))
+	defer srv.Close()
+	err := pumpUpstream(context.Background(), srv.Client(), testProfile(t, srv.URL, nil), []byte(`{}`), func([]byte) error { return nil })
+	var failure *upstreamFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("pumpUpstream = %v, want *upstreamFailure", err)
+	}
+	if failure.Class != failureRejected {
+		t.Fatalf("class = %q, want %q", failure.Class, failureRejected)
+	}
+	if failure.Code != "upstream_rejected_invalid_request" {
+		t.Fatalf("code = %q, want the invalid_request business code", failure.Code)
+	}
+	if failure.UpstreamStatus != http.StatusMethodNotAllowed {
+		t.Fatalf("upstream status = %d, want the carrier preserved for evidence", failure.UpstreamStatus)
+	}
+	if failure.ClientStatus != http.StatusBadRequest {
+		t.Fatalf("client status = %d, want 400: the host answers request faults immediately and must not hold the caller for a cooldown retry", failure.ClientStatus)
+	}
+	if !failure.RetryableBeforeOutput {
+		t.Fatal("a request-level rejection permits another attempt; whether any other route may serve it is the executor's route decision")
+	}
+	if !strings.Contains(failure.Message, "unusual activity") || !strings.Contains(failure.Message, "3012") {
+		t.Fatalf("message = %q, want the bounded upstream msg and the business code", failure.Message)
+	}
+	if failure.LogID != "log-1" {
+		t.Fatalf("logid = %q, want the upstream correlation id as debug evidence", failure.LogID)
+	}
+	if strings.Contains(strings.ToLower(failure.Message), "challenge") || strings.Contains(strings.ToLower(failure.Message), "trust") {
+		t.Fatalf("message = %q, must not claim an unproven challenge diagnosis", failure.Message)
+	}
+}
+
+func TestPumpUpstreamKeepsKeyRoute3012AsRejection(t *testing.T) {
+	// The same answer on the managed-key route is the same request-level
+	// rejection: the business code table is not route-specific.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte(`{"code":3012,"msg":"blocked","logid":"log-1"}`))
+	}))
+	defer srv.Close()
+	profile := testProfile(t, srv.URL, func(p *ResolvedProfile) {
+		p.CredentialKind = CredentialAPIKey
+		p.MessagesURL = srv.URL + "/api/anthropic/v1/messages"
+		p.Route = resolveRoute(CredentialAPIKey)
+		p.Route.URL = p.MessagesURL
+	})
+	err := pumpUpstream(context.Background(), srv.Client(), profile, []byte(`{}`), func([]byte) error { return nil })
+	var failure *upstreamFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("pumpUpstream = %v, want *upstreamFailure", err)
+	}
+	if failure.Class != failureRejected || !failure.RetryableBeforeOutput {
+		t.Fatalf("failure = %+v, want a retryable request-level rejection", failure)
+	}
+}
+
+func TestPumpUpstreamDoesNotReclassifyOtherBusinessCodes(t *testing.T) {
+	// Every other request-level code keeps the same ordinary rejection
+	// semantics; 3012 is not special-cased anywhere.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte(`{"code":3001,"msg":"parameter error","logid":"log-1"}`))
+	}))
+	defer srv.Close()
+	err := pumpUpstream(context.Background(), srv.Client(), testProfile(t, srv.URL, nil), []byte(`{}`), func([]byte) error { return nil })
+	var failure *upstreamFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("pumpUpstream = %v, want *upstreamFailure", err)
+	}
+	if failure.Class != failureRejected {
+		t.Fatalf("class = %q, want %q", failure.Class, failureRejected)
+	}
+}
+
+func TestPumpUpstream3012OnAnotherCarrierKeepsTheRealStatus(t *testing.T) {
+	// 405 is only one observed carrier; the same code on a real 4xx keeps
+	// that status for the caller.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":3012,"msg":"blocked","logid":"log-1"}`))
+	}))
+	defer srv.Close()
+	err := pumpUpstream(context.Background(), srv.Client(), testProfile(t, srv.URL, nil), []byte(`{}`), func([]byte) error { return nil })
+	var failure *upstreamFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("pumpUpstream = %v, want *upstreamFailure", err)
+	}
+	if failure.Class != failureRejected || failure.ClientStatus != http.StatusBadRequest {
+		t.Fatalf("failure = %+v, want a rejection with the upstream's own 400", failure)
 	}
 }

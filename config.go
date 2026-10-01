@@ -17,8 +17,13 @@ type Config struct {
 	// Models lists the static fallback model IDs; dynamic discovery may only
 	// extend, never replace, this list.
 	Models []string `yaml:"models"`
+	// Debug turns per-request diagnostics on: each attempt logs its target,
+	// sanitized headers, duration, and classified outcome, and each quota
+	// refresh logs its verdict evidence. Default off.
+	Debug *bool `yaml:"debug"`
 
 	Product        ProductConfig        `yaml:"product"`
+	Client         ClientConfig         `yaml:"client"`
 	ModelDiscovery ModelDiscoveryConfig `yaml:"model_discovery"`
 	OAuth          OAuthConfig          `yaml:"oauth"`
 	Upstream       UpstreamConfig       `yaml:"upstream"`
@@ -81,6 +86,12 @@ func (c ModelDiscoveryConfig) IsEnabled() bool {
 	return c.Enabled == nil || *c.Enabled
 }
 
+// IsDebugEnabled reports whether request diagnostics are on; unset defaults
+// to false, because the lines are for troubleshooting, not for steady state.
+func (c Config) IsDebugEnabled() bool {
+	return c.Debug != nil && *c.Debug
+}
+
 const (
 	defaultPriority                     = 1
 	defaultSuccessTTLSeconds            = 3600
@@ -123,6 +134,7 @@ func defaultConfig() Config {
 		Priority: defaultPriority,
 		Models:   []string{"GLM-5.2", "GLM-5-Turbo"},
 		Product:  ProductConfig{AppVersion: defaultAppVersion},
+		Client:   normalizedClientConfig(ClientConfig{}),
 		ModelDiscovery: ModelDiscoveryConfig{
 			Enabled:                boolPtr(true),
 			SuccessTTLSeconds:      defaultSuccessTTLSeconds,
@@ -154,8 +166,14 @@ func mergeConfig(base, override Config) Config {
 	if ids := normalizeModelIDs(override.Models); len(ids) > 0 {
 		base.Models = ids
 	}
+	if override.Debug != nil {
+		base.Debug = override.Debug
+	}
 	if version := strings.TrimSpace(override.Product.AppVersion); version != "" {
 		base.Product.AppVersion = version
+	}
+	if client := override.Client; client != (ClientConfig{}) {
+		base.Client = normalizedClientConfig(client)
 	}
 	if override.ModelDiscovery.Enabled != nil {
 		base.ModelDiscovery.Enabled = override.ModelDiscovery.Enabled
@@ -210,6 +228,7 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.Product.AppVersion == "" {
 		cfg.Product.AppVersion = defaultAppVersion
 	}
+	cfg.Client = normalizedClientConfig(cfg.Client)
 	if cfg.ModelDiscovery.Enabled == nil {
 		cfg.ModelDiscovery.Enabled = boolPtr(true)
 	}

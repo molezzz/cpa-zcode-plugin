@@ -616,7 +616,7 @@ func refreshCredentialsForAccount(ctx context.Context, recorder *credentialState
 			outcomes = append(outcomes, view)
 			continue
 		}
-		target, ok := buildDiscoveryTarget(kind, snap, cfg)
+		target, ok := buildDiscoveryTarget(kind, snap, cfg, deviceIdentity(authIndex, doc))
 		if !ok {
 			view.Reason = "credential_unavailable"
 			outcomes = append(outcomes, view)

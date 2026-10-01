@@ -1303,3 +1303,43 @@ func TestPlanStatusForPrefersTheServerClock(t *testing.T) {
 		t.Errorf("status = %q, want expired per the local clock", got)
 	}
 }
+
+// TestBalanceModelIDsCanonicalizesCapabilityCasing pins the official casing
+// fold: the balance endpoint declares capabilities in lower case, and the
+// catalog must carry the upstream's canonical spellings.
+func TestBalanceModelIDsCanonicalizesCapabilityCasing(t *testing.T) {
+	balance := quotaBalance{
+		Name:         "GLM-5.3-Flash",
+		Capabilities: []string{"model:glm-5.3-flash", "model:GLM-5.2", "realtime"},
+	}
+	if got := strings.Join(balanceModelIDs(balance), ","); got != "GLM-5.3-Flash,GLM-5.2" {
+		t.Fatalf("ids = %v, want the canonical GLM-5.3-Flash and GLM-5.2", got)
+	}
+	// The name fallback folds the same way.
+	if got := balanceModelIDs(quotaBalance{Name: "glm-5.3-flash"}); strings.Join(got, ",") != "GLM-5.3-Flash" {
+		t.Fatalf("ids = %v, want the canonical row name", got)
+	}
+}
+
+// TestQuotaBalancePathIsIndependentOfMessagesRouteDecisions pins the boundary
+// the issue asks for: route and billing-domain decisions exist for Messages
+// traffic only. The quota path keeps its own JWT-only contract — the balance
+// URL is not a Messages route, stays direct even with the official gateway
+// candidates registered, and the plan-JWT route's billing domain is the plan
+// entitlement the balance endpoint reads.
+func TestQuotaBalancePathIsIndependentOfMessagesRouteDecisions(t *testing.T) {
+	if route := resolveRoute(CredentialJWT); route.BillingDomain != billingPlanEntitlement {
+		t.Fatalf("plan route billing domain = %q, want %q", route.BillingDomain, billingPlanEntitlement)
+	}
+	balance := balanceURL("3.14.4")
+	if strings.Contains(balance, zcodeMessagesPath) {
+		t.Fatalf("balance url %q must not be a Messages route", balance)
+	}
+	official := []gatewayRouteCandidate{
+		{ProviderEndpoint: "https://api.z.ai/api/anthropic/v1/messages", GatewayPath: "/api/v1/ultra-zai/anthropic/v1/messages"},
+		{ProviderEndpoint: "https://open.bigmodel.cn/api/anthropic/v1/messages", GatewayPath: "/api/v1/ultra/anthropic/v1/messages"},
+	}
+	if rewritten, ok := applyGatewayRoutes(balance, zcodeGatewayOrigin(), official); ok {
+		t.Fatalf("balance url was rewritten to %q; billing paths must stay direct", rewritten)
+	}
+}

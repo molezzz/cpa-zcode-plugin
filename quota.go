@@ -164,8 +164,8 @@ func quotaAuthFailure(status int, body []byte) *upstreamFailure {
 	}
 	// A business verdict is consulted next, for the same reason as on the
 	// Messages path: this upstream carries business outcomes on statuses that
-	// mean something else, so a 403 holding a risk-control code must not be read
-	// as a credential rejection.
+	// mean something else, so a 403 holding a request-level business code must
+	// not be read as a credential rejection.
 	if semantics, code, ok := zaiBusinessSemanticsFor(body); ok {
 		class, movesCredential := failureClassForSemantics(semantics)
 		if !movesCredential {
@@ -562,7 +562,9 @@ const modelCapabilityPrefix = "model:"
 // balanceModelIDs renders the model ids one balance row declares. A row that
 // declares none falls back to its display name, matching the upstream's own
 // reading: a balance whose meter is a model is how the plan advertises that
-// model even without an explicit capability entry.
+// model even without an explicit capability entry. Ids are folded onto the
+// official casing, matching the official client's own reading of the same
+// capability list.
 func balanceModelIDs(balance quotaBalance) []string {
 	if balance.Malformed {
 		// A row whose fields drifted is not evidence about what it covers.
@@ -574,14 +576,14 @@ func balanceModelIDs(balance quotaBalance) []string {
 			continue
 		}
 		if id := strings.TrimSpace(capability[len(modelCapabilityPrefix):]); id != "" {
-			ids = append(ids, id)
+			ids = append(ids, canonicalizeGLMModelID(id))
 		}
 	}
 	if len(ids) == 0 {
 		// A balance whose meter is a model is how the plan advertises that
 		// model even without an explicit capability entry.
 		if name := strings.TrimSpace(balance.Name); name != "" {
-			ids = append(ids, name)
+			ids = append(ids, canonicalizeGLMModelID(name))
 		}
 	}
 	return ids
@@ -913,6 +915,13 @@ func runQuotaRefresh(ctx context.Context, store AuthStore, scope quotaRefreshSco
 		scope.DeviceID = deviceIdentity(scope.AuthIndex, scope.Document)
 	}
 	evidence := fetchQuotaEvidence(ctx, scope.JWT, scope.AppVersion, scope.DeviceID, now)
+	diagf("quota auth=%s url=%s verdict=%s reason=%q plan=%q plans=[%s] balances=[%s]",
+		scope.AuthIndex, balanceURL(scope.AppVersion), evidence.Verdict, evidence.Reason,
+		evidence.Plan, diagPlanSummary(evidence.Plans), diagBalanceSummary(evidence.Balances))
+	if failure := evidence.AuthFailure; failure != nil {
+		diagf("quota auth=%s auth_failure upstream_status=%d class=%s code=%s msg=%q",
+			scope.AuthIndex, failure.UpstreamStatus, failure.Class, failure.Code, failure.Message)
+	}
 	recordErr := credentialStates.forStore(store).record(ctx, credentialRef{
 		AuthIndex:  scope.AuthIndex,
 		IdentityID: scope.IdentityID,

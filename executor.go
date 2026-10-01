@@ -98,12 +98,18 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 		return envErr, nil
 	}
 	cfg := currentConfig()
+	tag := diagRequestTag()
 	payload, model, envErr := prepareUpstreamPayload(req.Payload, req.Model, cfg.Models)
 	if envErr != nil {
+		diagf("request tag=%s mode=aggregate rejected: payload could not be prepared", tag)
 		return envErr, nil
 	}
-	scope, profiles, failure := newExecutionScope(req, cfg, model)
+	diagf("request tag=%s mode=aggregate auth=%s model_in=%q model_out=%q payload=%dB",
+		tag, strings.TrimSpace(req.AuthID), req.Model, model, len(payload))
+	scope, profiles, failure := newExecutionScope(req, cfg, model, tag)
 	if failure != nil {
+		diagf("plan tag=%s auth=%s no-credential class=%s code=%s msg=%q",
+			tag, strings.TrimSpace(req.AuthID), failure.Class, failure.Code, failure.Message)
 		return failureEnvelope(failure), nil
 	}
 
@@ -119,12 +125,16 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 		return answerSink{forwarder: agg, render: agg.finish}
 	})
 	if outcome.Failure != nil {
+		diagf("request tag=%s outcome=failure class=%s code=%s msg=%q",
+			tag, outcome.Failure.Class, outcome.Failure.Code, outcome.Failure.Message)
 		return failureEnvelope(outcome.Failure), nil
 	}
 	payloadOut, err := sink.render()
 	if err != nil {
+		diagf("request tag=%s outcome=failure render_error msg=%q", tag, err)
 		return failureEnvelope(failureFromError(err)), nil
 	}
+	diagf("request tag=%s outcome=ok response=%dB", tag, len(payloadOut))
 	return okEnvelope(pluginapi.ExecutorResponse{
 		Payload: payloadOut,
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
@@ -136,11 +146,11 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 // credential recorder is wired in, so the attempt loop itself stays free of
 // host handles. It returns a non-nil failure only when no credential at all
 // could be attempted.
-func newExecutionScope(req executorRequestRPC, cfg Config, model string) (executionScope, []ResolvedProfile, *upstreamFailure) {
+func newExecutionScope(req executorRequestRPC, cfg Config, model string, diagTag string) (executionScope, []ResolvedProfile, *upstreamFailure) {
 	now := time.Now()
 	authIndex := strings.TrimSpace(req.AuthID)
 	doc := currentAuthDocument(authIndex, req.StorageJSON)
-	plan := executionPlan(doc, cfg, model, req.Headers, now)
+	plan := executionPlan(doc, cfg, model, req.Headers, deviceIdentity(authIndex, doc), now)
 	if plan.Failure != nil {
 		return executionScope{}, nil, plan.Failure
 	}
@@ -157,6 +167,7 @@ func newExecutionScope(req executorRequestRPC, cfg Config, model string) (execut
 		IdentityID:      plan.Primary.IdentityID,
 		Document:        doc,
 		Primary:         plan.Primary,
+		DiagTag:         diagTag,
 		SkipBlockStatus: skipBlockStatus,
 		SkipBlockRetry:  skipBlockRetry,
 		Recorder:        credentialStates.forStore(authStoreProvider()),
@@ -210,12 +221,18 @@ func handleExecutorExecuteStream(request []byte) ([]byte, error) {
 		return errorEnvelope("invalid_request", "executor.execute_stream requires the host stream id", http.StatusBadRequest), nil
 	}
 	cfg := currentConfig()
+	tag := diagRequestTag()
 	payload, model, envErr := prepareUpstreamPayload(req.Payload, req.Model, cfg.Models)
 	if envErr != nil {
+		diagf("request tag=%s mode=stream rejected: payload could not be prepared", tag)
 		return envErr, nil
 	}
-	scope, profiles, failure := newExecutionScope(req, cfg, model)
+	diagf("request tag=%s mode=stream stream_id=%s auth=%s model_in=%q model_out=%q payload=%dB",
+		tag, streamID, strings.TrimSpace(req.AuthID), req.Model, model, len(payload))
+	scope, profiles, failure := newExecutionScope(req, cfg, model, tag)
 	if failure != nil {
+		diagf("plan tag=%s auth=%s no-credential class=%s code=%s msg=%q",
+			tag, strings.TrimSpace(req.AuthID), failure.Class, failure.Code, failure.Message)
 		return failureEnvelope(failure), nil
 	}
 
@@ -230,9 +247,12 @@ func handleExecutorExecuteStream(request []byte) ([]byte, error) {
 		})
 		closer := newStreamCloser(sink, streamID)
 		if outcome.Failure != nil {
+			diagf("request tag=%s outcome=failure class=%s code=%s msg=%q",
+				tag, outcome.Failure.Class, outcome.Failure.Code, outcome.Failure.Message)
 			closer.Close(outcome.Failure.Message)
 			return
 		}
+		diagf("request tag=%s outcome=ok", tag)
 		closer.Close("")
 	}()
 	return okEnvelope(executorStreamResponseRPC{
@@ -318,15 +338,15 @@ type credentialPlan struct {
 // recorded as unusable is skipped in favour of the key, and a key that is not
 // recorded as usable removes the fallback entirely. Failures are classified and
 // sanitized. now is the clock the recorded retry windows are measured against.
-func executionPlan(doc []byte, cfg Config, model string, callerHeaders http.Header, now time.Time) credentialPlan {
+func executionPlan(doc []byte, cfg Config, model string, callerHeaders http.Header, deviceID string, now time.Time) credentialPlan {
 	snap, err := readCredentialSnapshot(doc)
 	if err != nil {
 		return credentialPlan{Failure: credentialProfileFailure(err)}
 	}
 	cfg = normalizeConfig(cfg)
 
-	primary, primaryErr := primaryProfile(snap, cfg, model, callerHeaders, now)
-	fallback, fallbackErr := fallbackProfile(snap, cfg, model, callerHeaders, now)
+	primary, primaryErr := primaryProfile(snap, cfg, model, callerHeaders, deviceID, now)
+	fallback, fallbackErr := fallbackProfile(snap, cfg, model, callerHeaders, deviceID, now)
 
 	// A JWT past its re-authorization age is still attempted — the upstream may
 	// well accept it, and skipping a possibly-working primary would spend a
@@ -365,26 +385,26 @@ func executionPlan(doc []byte, cfg Config, model string, callerHeaders http.Head
 
 // primaryProfile builds the Coding Plan JWT profile, or the classified failure
 // explaining why this credential may not be attempted.
-func primaryProfile(snap credentialSnapshot, cfg Config, model string, callerHeaders http.Header, now time.Time) (ResolvedProfile, error) {
+func primaryProfile(snap credentialSnapshot, cfg Config, model string, callerHeaders http.Header, deviceID string, now time.Time) (ResolvedProfile, error) {
 	if strings.TrimSpace(snap.JWTToken) == "" {
 		return ResolvedProfile{}, errNoCredential
 	}
 	if !jwtUsable(snap.JWTStatus, snap.JWTRetryAfter, now) {
 		return ResolvedProfile{}, credentialStatusError{Status: snap.JWTStatus}
 	}
-	return newProfile(snap, CredentialJWT, cfg, model, callerHeaders), nil
+	return newProfile(snap, CredentialJWT, cfg, model, callerHeaders, deviceID), nil
 }
 
 // fallbackProfile builds the managed API key profile, or the classified failure
 // explaining why no fallback credential is available.
-func fallbackProfile(snap credentialSnapshot, cfg Config, model string, callerHeaders http.Header, now time.Time) (ResolvedProfile, error) {
+func fallbackProfile(snap credentialSnapshot, cfg Config, model string, callerHeaders http.Header, deviceID string, now time.Time) (ResolvedProfile, error) {
 	if strings.TrimSpace(snap.APIKeyToken) == "" {
 		return ResolvedProfile{}, credentialStatusError{Status: apiKeyStatusUnavailable}
 	}
 	if !apiKeyUsable(snap.APIKeyStatus, snap.APIKeyRetryAfter, now) {
 		return ResolvedProfile{}, credentialStatusError{Status: snap.APIKeyStatus}
 	}
-	return newProfile(snap, CredentialAPIKey, cfg, model, callerHeaders), nil
+	return newProfile(snap, CredentialAPIKey, cfg, model, callerHeaders, deviceID), nil
 }
 
 // credentialProfileFailure maps profile construction errors onto sanitized,
@@ -537,6 +557,10 @@ type executionScope struct {
 	IdentityID string
 	Document   []byte
 	Primary    ResolvedProfile
+	// DiagTag is the request's debug correlation tag. It is display-only:
+	// debug lines interleave across concurrent requests, and the tag is what
+	// ties a plan line to its attempt and outcome lines.
+	DiagTag string
 	// SkipBlockStatus is the recorded JWT state that skipped the primary,
 	// together with the block's retry window. It is the reason this request is
 	// running on a credential it would not otherwise use, so the loop records
@@ -586,10 +610,13 @@ func (b *stateBatch) flush(ctx context.Context) {
 
 // runExecution performs the credential attempt loop over the immutable
 // profiles. Profiles are attempted in order; a failed attempt is retried on
-// the next profile only while nothing has been forwarded to the caller and the
-// failure classification allows a pre-output retry. Once output started, the
-// failure is final: a response must never mix output from two upstream
-// attempts.
+// the next profile only while nothing has been forwarded to the caller, the
+// failure classification permits another attempt, and the route compatibility
+// rule (fallbackAllowed) allows the next profile's route to serve the request
+// — which across a billing/entitlement boundary it may not, so a request-level
+// verdict on one route stays an honest terminal failure instead of silently
+// spending another domain. Once output started, the failure is final: a
+// response must never mix output from two upstream attempts.
 //
 // newSink builds the output target of one attempt. Each attempt gets its own,
 // so a failed attempt's partial output is discarded rather than merged into
@@ -600,6 +627,17 @@ func runExecution(ctx context.Context, scope executionScope, profiles []Resolved
 	// so one request can never interleave two state writes for one identity.
 	scope.batch = &stateBatch{recorder: scope.Recorder, ref: scope.credentialRef()}
 	defer scope.batch.flush(ctx)
+
+	attemptKinds := make([]string, 0, len(profiles))
+	for _, profile := range profiles {
+		attemptKinds = append(attemptKinds, profile.Route.ID+"("+string(profile.Route.BillingDomain)+")")
+	}
+	skipBlock := scope.SkipBlockStatus
+	if skipBlock == "" {
+		skipBlock = "(none)"
+	}
+	diagf("plan tag=%s auth=%s skip_block=%s retry_after=%s attempts=[%s]",
+		scope.DiagTag, scope.AuthIndex, skipBlock, diagRetryAfter(scope.SkipBlockRetry), strings.Join(attemptKinds, " "))
 
 	if scope.SkipBlockStatus != "" {
 		// The primary's block is recorded once, before the first attempt runs:
@@ -612,14 +650,26 @@ func runExecution(ctx context.Context, scope executionScope, profiles []Resolved
 	// credential attempt below replays this one buffer, so a fallback can
 	// never mutate what the caller sent.
 	var lastFailure *upstreamFailure
-	for _, profile := range profiles {
+	for i, profile := range profiles {
 		sink := newSink()
 		outcome := attemptProfile(ctx, scope, profile, payload, sink.forwarder)
 		if outcome.Failure == nil {
 			return executionOutcome{OutputStarted: outcome.OutputStarted}, sink
 		}
-		if outcome.OutputStarted || !outcome.Failure.RetryableBeforeOutput {
+		if outcome.OutputStarted {
 			return outcome, sink
+		}
+		if i+1 < len(profiles) {
+			next := profiles[i+1]
+			if !fallbackAllowed(profile, outcome.Failure, next) {
+				diagf("fallback tag=%s decision=denied class=%s logid=%q from=%s(%s) to=%s(%s)",
+					scope.DiagTag, outcome.Failure.Class, outcome.Failure.LogID,
+					profile.Route.ID, profile.Route.BillingDomain, next.Route.ID, next.Route.BillingDomain)
+				return outcome, sink
+			}
+			diagf("fallback tag=%s decision=replay class=%s logid=%q from=%s(%s) to=%s(%s)",
+				scope.DiagTag, outcome.Failure.Class, outcome.Failure.LogID,
+				profile.Route.ID, profile.Route.BillingDomain, next.Route.ID, next.Route.BillingDomain)
 		}
 		lastFailure = outcome.Failure
 	}
@@ -636,19 +686,45 @@ func runExecution(ctx context.Context, scope executionScope, profiles []Resolved
 
 // attemptProfile runs one upstream attempt against an immutable profile, reports
 // whether output reached the caller, and queues the credential's conclusion for
-// the request's single save.
+// the request's single save. Debug lines record what went out (route, billing
+// domain, sanitized headers) and what came back (classified outcome, upstream
+// status, business code, bounded msg, correlation id) — the evidence an
+// operator needs to compare this attempt against the official client's, without
+// any credential material, prompt content, or raw bodies.
 func attemptProfile(ctx context.Context, scope executionScope, profile ResolvedProfile, payload []byte, forwarder frameForwarder) executionOutcome {
+	diagf("attempt tag=%s cred=%s route=%s domain=%s url=%s model=%q payload=%dB headers=[%s]",
+		scope.DiagTag, profile.CredentialKind, profile.Route.ID, profile.Route.BillingDomain, profile.MessagesURL,
+		profile.ModelID, len(payload), diagHeaderView(profile.Headers))
+	started := time.Now()
+	forwardedFrames, forwardedBytes := 0, 0
 	client := upstreamClient(profile)
 	err := pumpUpstream(ctx, client, profile, payload, func(frame []byte) error {
+		forwardedFrames++
+		forwardedBytes += len(frame)
 		return forwarder.Forward(ctx, frame)
 	})
+	duration := time.Since(started).Round(time.Millisecond)
 	if err == nil {
+		diagf("attempt tag=%s cred=%s result=ok duration=%s frames=%d forwarded=%dB output_started=%v",
+			scope.DiagTag, profile.CredentialKind, duration, forwardedFrames, forwardedBytes, forwarder.OutputStarted())
 		scope.batch.add(recordedState{Kind: profile.CredentialKind, Status: activeStatusFor(profile.CredentialKind)})
 		return executionOutcome{OutputStarted: forwarder.OutputStarted()}
 	}
 	failure := failureFromError(err)
+	diagf("attempt tag=%s cred=%s result=failure duration=%s upstream_status=%d class=%s code=%s logid=%q output_started=%v frames=%d msg=%q",
+		scope.DiagTag, profile.CredentialKind, duration, failure.UpstreamStatus, failure.Class, failure.Code,
+		failure.LogID, forwarder.OutputStarted(), forwardedFrames, failure.Message)
 	scope.batch.add(conclusionFor(profile.CredentialKind, failure, scope.Now()))
 	return executionOutcome{Failure: failure, OutputStarted: forwarder.OutputStarted()}
+}
+
+// diagRetryAfter renders a recorded retry window for a debug line; a zero
+// time means the recorded state carries no window at all.
+func diagRetryAfter(retryAfter time.Time) string {
+	if retryAfter.IsZero() {
+		return "-"
+	}
+	return retryAfter.UTC().Format(time.RFC3339)
 }
 
 // activeStatusFor is the conclusion of a successful attempt: the credential is
@@ -697,6 +773,9 @@ var statusVocabulary = map[CredentialKind]map[failureClass]string{
 		failureExhausted:           jwtStatusExhausted,
 		failurePlanExpired:         jwtStatusPlanExpired,
 		failureCooldown:            jwtStatusCooldown,
+		// A request-level rejection (failureRejected) is deliberately absent:
+		// it is a statement about the request, not about the credential, so it
+		// records no state and leaves both the credential and its quota valid.
 	},
 	CredentialAPIKey: {
 		failureVerificationBlocked: apiKeyStatusCooldown,

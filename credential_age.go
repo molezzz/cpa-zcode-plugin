@@ -9,8 +9,8 @@ import (
 
 // The zcode-plan JWT carries no exp claim. It states only when it was issued
 // (iat), so nothing in the credential itself says when it stops working: the
-// upstream decides, silently, and the only symptom is a rejection that looks
-// like a risk-control block rather than an expiry.
+// upstream decides, silently, and the only symptom is a rejection that states
+// nothing about an expiry.
 //
 // Inventing a JWT expiry would be worse than the problem. The official client
 // does not track one either — it watches the OAuth access token's lifetime and
