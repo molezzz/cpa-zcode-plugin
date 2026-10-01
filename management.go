@@ -13,14 +13,39 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-// Management route paths, relative to the host's /v0/management prefix. All
-// routes stay management-authenticated: none declares a legacy Menu label,
-// which the host would turn into an unauthenticated resource route.
+// Management route paths, relative to the host's /v0/management prefix.
+//
+// None of these three declares a legacy Menu label, and that is load-bearing
+// rather than incidental: the host turns a Menu-bearing GET management route
+// into an unauthenticated resource route, which would strip management
+// authentication from the account state and from the action endpoint that
+// refreshes credentials. The left-nav entry comes from the resource route
+// below instead, which serves the page shell and nothing else.
 const (
 	managementPagePath   = "/zcode/page"
 	managementStatePath  = "/zcode/state"
 	managementActionPath = "/zcode/action"
 )
+
+// The resource page is the plugin's only unauthenticated surface. It is the
+// shell behind the host control panel's "ZCode" left-nav entry: a Menu label on
+// a resource route is what produces that entry, and the host serves resource
+// routes without management authentication, over GET only, and without
+// HTML-escaping the response body. The shell is therefore the page constant
+// verbatim — no server-side interpolation, and every account value fetched at
+// runtime from the authenticated routes above with the management key the
+// operator supplies.
+const (
+	managementResourcePrefix = "/v0/resource/plugins/"
+	managementResourcePage   = "/page"
+	managementResourceMenu   = "ZCode"
+)
+
+// managementResourcePagePath is the route the host registers and serves. The
+// prefix is spelled out in full because the plugin has to recognize resource
+// paths on their own terms: a path under it carries no management
+// authentication, so nothing authenticated may ever answer one.
+var managementResourcePagePath = managementResourcePrefix + pluginID + managementResourcePage
 
 // The fixed action vocabulary of the management plane. Account-granular
 // actions require an explicit auth_index; the batch action refuses one
@@ -61,6 +86,13 @@ func handleManagementRegister(request []byte) ([]byte, error) {
 				Description: "Perform a ZCode maintenance action (refresh_credential, refresh_quota, refresh_models, oauth_retry, batch_refresh)",
 			},
 		},
+		Resources: []pluginapi.ResourceRoute{
+			{
+				Path:        managementResourcePagePath,
+				Menu:        managementResourceMenu,
+				Description: "ZCode provider management page",
+			},
+		},
 	})
 }
 
@@ -89,20 +121,53 @@ func handleManagementHandle(request []byte) ([]byte, error) {
 
 // serveManagementHTTP routes one management request to its handler. Unknown
 // routes answer 404 with a sanitized JSON error, never a body echo.
+//
+// The host dispatches resource requests here too, with the full
+// /v0/resource/plugins/<id>/ path and no body, which is why the resource
+// surface is settled before the management routes rather than as one more case
+// among them.
 func serveManagementHTTP(method, path string, body []byte) pluginapi.ManagementResponse {
+	if isResourcePath(path) {
+		// A resource path is unauthenticated by construction. Only the shell may
+		// answer one: the suffix matches below would otherwise serve account
+		// state to any anonymous GET, which is the boundary this route exists to
+		// keep intact rather than to erode.
+		if method == http.MethodGet && strings.HasSuffix(path, managementResourcePagePath) {
+			return managementPageResponse()
+		}
+		return managementErrorResponse(http.StatusNotFound, "unknown_route", "this management route does not exist")
+	}
 	switch {
 	case method == http.MethodGet && strings.HasSuffix(path, managementPagePath):
-		return pluginapi.ManagementResponse{
-			StatusCode: http.StatusOK,
-			Headers:    http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-			Body:       []byte(managementPageHTML),
-		}
+		return managementPageResponse()
 	case method == http.MethodGet && strings.HasSuffix(path, managementStatePath):
 		return managementJSONResponse(buildManagementState(time.Now()))
 	case method == http.MethodPost && strings.HasSuffix(path, managementActionPath):
 		return runManagementAction(body, time.Now())
 	default:
 		return managementErrorResponse(http.StatusNotFound, "unknown_route", "this management route does not exist")
+	}
+}
+
+// isResourcePath reports whether one request path is addressed to the host's
+// unauthenticated resource surface. The check is by plugin prefix rather than by
+// the shell's own path so that a resource path naming any other plugin route —
+// a data route, or a path this plugin never registered — still reads as
+// unauthenticated and is refused instead of falling through to a suffix match.
+func isResourcePath(path string) bool {
+	return strings.HasPrefix(path, managementResourcePrefix+pluginID+"/")
+}
+
+// managementPageResponse serves the page shell. It is shared by the
+// authenticated management route and the unauthenticated resource route
+// because the two must stay byte-identical: the resource route is what the
+// navigation entry opens, and any difference would be a second page carrying
+// different rules about where the shell's data comes from.
+func managementPageResponse() pluginapi.ManagementResponse {
+	return pluginapi.ManagementResponse{
+		StatusCode: http.StatusOK,
+		Headers:    http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+		Body:       []byte(managementPageHTML),
 	}
 }
 

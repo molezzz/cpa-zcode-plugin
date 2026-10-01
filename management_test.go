@@ -189,22 +189,44 @@ func jwtStatusOf(t *testing.T, doc map[string]any) string {
 	return status
 }
 
+// fetchManagementPage serves one request through the ABI and returns the
+// response body, so the tests exercise the same dispatch the host reaches
+// rather than calling the router directly.
+func fetchManagementPage(t *testing.T, method, path string) string {
+	t.Helper()
+	request, err := json.Marshal(managementHandleRPC{Method: method, Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := callMethod(t, pluginabi.MethodManagementHandle, request)
+	if !env.OK {
+		t.Fatalf("management.handle %s %s failed: %+v", method, path, env.Error)
+	}
+	var response pluginapi.ManagementResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatalf("decode management response: %v", err)
+	}
+	return string(response.Body)
+}
+
 func TestManagementRegisterDeclaresRoutes(t *testing.T) {
 	env := callMethod(t, pluginabi.MethodManagementRegister, []byte(`{"BasePath":"/v0/management"}`))
 	if !env.OK {
 		t.Fatalf("management.register failed: %+v", env.Error)
 	}
 	var response struct {
-		Routes []pluginapi.ManagementRoute `json:"routes"`
+		Routes    []pluginapi.ManagementRoute `json:"routes"`
+		Resources []pluginapi.ResourceRoute   `json:"resources"`
 	}
 	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatalf("decode registration: %v", err)
 	}
 	paths := map[string]bool{}
 	for _, route := range response.Routes {
-		// No route may declare a legacy Menu label: Menu-bearing GET routes
-		// become unauthenticated resource routes, and the management page
-		// must stay management-authenticated.
+		// No management route may declare a legacy Menu label: the host turns a
+		// Menu-bearing GET into an unauthenticated resource route, which would
+		// put account state and the credential-refresh action outside
+		// management authentication. The menu entry comes from Resources.
 		if route.Menu != "" {
 			t.Errorf("route %s %s declares a Menu label", route.Method, route.Path)
 		}
@@ -213,6 +235,154 @@ func TestManagementRegisterDeclaresRoutes(t *testing.T) {
 	for _, want := range []string{"GET /zcode/page", "GET /zcode/state", "POST /zcode/action"} {
 		if !paths[want] {
 			t.Errorf("route %q missing, got %v", want, paths)
+		}
+	}
+
+	// Exactly one resource route, and it must carry the Menu label: an empty one
+	// is discarded by the host and yields no navigation entry at all.
+	if len(response.Resources) != 1 {
+		t.Fatalf("resources = %d, want exactly 1 (the page shell): %+v", len(response.Resources), response.Resources)
+	}
+	shell := response.Resources[0]
+	if strings.TrimSpace(shell.Menu) != managementResourceMenu {
+		t.Errorf("resource Menu = %q, want %q", shell.Menu, managementResourceMenu)
+	}
+	if strings.TrimSpace(shell.Path) == "" {
+		t.Error("resource route declares no path")
+	}
+	// The shell is the only unauthenticated surface, so it must not shadow a
+	// data route: /zcode/state and /zcode/action must never appear here.
+	for _, forbidden := range []string{managementStatePath, managementActionPath, "/state", "/action"} {
+		if strings.Contains(shell.Path, forbidden) {
+			t.Errorf("resource route %q exposes the data route %q without authentication", shell.Path, forbidden)
+		}
+	}
+}
+
+// TestManagementResourceShellCarriesNoData pins the security boundary of the
+// navigation entry. The host serves resource routes without management
+// authentication, so whatever this route returns is readable by anyone who can
+// reach the port. The assertion is therefore not that the shell looks empty but
+// that it contains no value a populated fixture holds: the identity, the
+// secrets, and the label of a real account must all be absent.
+func TestManagementResourceShellCarriesNoData(t *testing.T) {
+	fixture := newManagementFixture(t)
+	const (
+		jwtSecret   = "shell-jwt-secret-value"
+		keySecret   = "shell-key-secret-material"
+		oauthSecret = "shell-oauth-secret-value"
+	)
+	doc := newTestAccountDoc(t, "zcode-shell-1", jwtSecret, "active", keySecret)
+	addLabelledAccount(t, fixture.store, "zcode-shell-1", "Shell Visible Label", string(doc))
+
+	// Prove the fixture really does hold the values the shell must not carry;
+	// otherwise this test would pass against an empty store. Only the redacted
+	// identity and label qualify: the secrets are deliberately absent from the
+	// state document too, so their absence proves nothing on their own.
+	state := buildManagementState(time.Now())
+	if len(state.Accounts) != 1 {
+		t.Fatalf("fixture holds %d accounts, want 1", len(state.Accounts))
+	}
+	encodedState, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, carried := range []string{"Shell Visible Label", "zcode-shell-1"} {
+		if !strings.Contains(string(encodedState), carried) {
+			t.Fatalf("the state document does not carry %q, so the shell assertion below is vacuous", carried)
+		}
+	}
+
+	shell := fetchManagementPage(t, http.MethodGet, managementResourcePagePath)
+	for _, secret := range []string{jwtSecret, keySecret, oauthSecret, "Shell Visible Label", "zcode-shell-1"} {
+		if strings.Contains(shell, secret) {
+			t.Errorf("the unauthenticated shell carries the fixture value %q", secret)
+		}
+	}
+	// No server-side interpolation at all: the shell must be the page constant,
+	// byte for byte, since the host does not HTML-escape resource responses.
+	if shell != managementPageHTML {
+		t.Error("the resource route does not serve the page constant verbatim")
+	}
+}
+
+// TestManagementResourceShellRejectsWriteMethods pins that the shell can never
+// become a write endpoint. The host dispatches resource routes over GET only,
+// and it carries no request body; refusing the method here as well keeps the
+// plugin from depending on that host-side guarantee for a route that returns
+// the credential-refresh entry point's page.
+func TestManagementResourceShellRejectsWriteMethods(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		shell := fetchManagementPage(t, method, managementResourcePagePath)
+		if strings.Contains(shell, "<!DOCTYPE html>") {
+			t.Errorf("%s on the resource page served the page shell", method)
+		}
+	}
+}
+
+// TestManagementResourcePathNeverServesData closes the boundary the resource
+// route is allowed to reach. The management router matches routes by suffix, so
+// without the resource-prefix guard a request for
+// /v0/resource/plugins/zcode/state — an unauthenticated path naming the state
+// route — would satisfy the same suffix as the authenticated one and answer
+// with account identities. The host does not register that resource route, so
+// today the path is unreachable; the test exists so that registering one later,
+// or reordering the routes, cannot turn the guard's absence into a leak that
+// still passes every other test.
+func TestManagementResourcePathNeverServesData(t *testing.T) {
+	newManagementFixture(t)
+	for _, suffix := range []string{"/state", "/action", "/page/", "/unknown"} {
+		path := "/v0/resource/plugins/" + pluginID + suffix
+		body := fetchManagementPage(t, http.MethodGet, path)
+		if !strings.Contains(body, "unknown_route") {
+			t.Errorf("GET %s answered with data or a shell (%d bytes), want a 404 route error", path, len(body))
+		}
+	}
+	// The shell itself must keep answering: the guard must not swallow the one
+	// resource route the plugin does register.
+	if body := fetchManagementPage(t, http.MethodGet, managementResourcePagePath); body != managementPageHTML {
+		t.Error("the registered resource page no longer serves the shell")
+	}
+}
+
+// TestManagementPageCarriesOnlyAnUnauthenticatedShellContract asserts the page's
+// own rules, which are what make serving it without authentication safe: every
+// request carries the operator's key, the key lives only in localStorage, and
+// a rejected key is dropped rather than replayed.
+func TestManagementPageCarriesOnlyAnUnauthenticatedShellContract(t *testing.T) {
+	page := managementPageHTML
+
+	// One network entry point, and it authenticates. A bare fetch() anywhere in
+	// the script would be an unauthenticated read of the data routes.
+	if got := strings.Count(page, "fetch("); got != 1 {
+		t.Errorf("page performs %d network calls, want exactly 1 (the apiFetch helper)", got)
+	}
+	for _, want := range []string{
+		`"Authorization": "Bearer " + key`,
+		"function apiFetch(",
+		"if (!key) {",
+		"localStorage.setItem(KEY_STORAGE, key)",
+		"localStorage.removeItem(KEY_STORAGE)",
+		"reply.status === 401",
+		"forgetKey(",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("page is missing the authenticated-fetch contract: %q", want)
+		}
+	}
+
+	// The key must not leak into sessionStorage, a cookie, or the URL. Each entry
+	// is a usage rather than a bare word: the page deliberately *names* the
+	// stores it refuses in its comments, so only real accesses are forbidden.
+	script := page
+	if start := strings.Index(page, "<script>"); start >= 0 {
+		if end := strings.LastIndex(page, "</script>"); end > start {
+			script = page[start:end]
+		}
+	}
+	for _, forbidden := range []string{"sessionStorage.", "sessionStorage[", "document.cookie", "management_key="} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("page stores or exposes the key through %q", forbidden)
 		}
 	}
 }

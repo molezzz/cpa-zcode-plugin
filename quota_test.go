@@ -142,6 +142,24 @@ func addFakeAccount(t *testing.T, store *fakeAuthStore, authIndex, identityID, d
 	store.docs[authIndex] = json.RawMessage(doc)
 }
 
+// addLabelledAccount registers one plugin account carrying a human label, so a
+// test can prove a value that appears in the authenticated state is absent from
+// the unauthenticated shell.
+func addLabelledAccount(t *testing.T, store *fakeAuthStore, authIndex, label, doc string) string {
+	t.Helper()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.entries = append(store.entries, pluginapi.HostAuthFileEntry{
+		AuthIndex: authIndex,
+		Name:      authIndex + ".json",
+		Label:     label,
+		Provider:  pluginID,
+		ID:        "identity-" + authIndex,
+	})
+	store.docs[authIndex] = json.RawMessage(doc)
+	return authIndex
+}
+
 // newTestAccountDoc builds an auth document with a zcode namespace holding a
 // JWT, an optional managed key, and the given jwt status.
 func newTestAccountDoc(t *testing.T, identityID, jwtToken, jwtStatus, keyMaterial string) []byte {

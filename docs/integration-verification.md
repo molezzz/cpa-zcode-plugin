@@ -79,9 +79,19 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
 
 ### 1.8 管理面回调
 
-- [ ] 管理页在真实宿主认证下可打开;所有账号操作(OAuth 重试、凭证刷新、额度刷新、模型缓存刷新、批量刷新)各执行一次并观察结果与串行提示。
+管理页有两种入口,验证时都要走:宿主控制面板左侧导航的 **ZCode** 入口(打开
+`/v0/resource/plugins/zcode/page`,**无鉴权**),以及鉴权路由 `/v0/management/zcode/page`。
+无鉴权只覆盖 HTML 外壳——外壳里必须没有任何账号数据。
+
+- [ ] 宿主控制面板左侧导航出现 **ZCode** 入口,点击可打开管理页;直接访问 `/v0/resource/plugins/zcode/page` 返回 200 HTML 外壳,不带任何鉴权头也能取到。
+- [ ] 对该外壳做敏感词扫描(`grep -nE 'eyJ|sk-|cpa-zcode-[0-9a-f]'`),只命中 JS 字段名,无任何真实凭据值;外壳与 `/v0/management/zcode/page` 逐字节一致。
+- [ ] 未填管理密钥时:页面不发起任何状态请求、不展示任何账号行,并给出"Enter and save the management key"提示。
+- [ ] 填入密钥后状态可读(账号表、OAuth 会话、额度、模型缓存);五个操作(`refresh_credential` / `refresh_quota` / `refresh_models` / `oauth_retry` / `batch_refresh`)各执行一次并观察结果与串行提示。
+- [ ] 密钥错误或被撤销时(宿主答 401):密钥从 localStorage 清除、表格清空、输入框重新聚焦、给出可读提示,且不再按 20 秒定时器重试该密钥。
+- [ ] 密钥只落在 localStorage:DevTools 里 sessionStorage 与 cookie 均无该值。
 - [ ] OAuth 重试返回的授权链接可完成登录,完成后账号状态与凭证正确落盘。
 - [ ] 页面无重复提交、无旧响应覆盖新状态的现象。
+- [ ] `POST /v0/resource/plugins/zcode/page` 不被路由到(资源路由仅 GET);`/v0/resource/plugins/zcode/state` 返回 404 而不是账号数据。
 
 ### 1.9 目标平台宿主加载
 
@@ -103,6 +113,7 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
 
 操作规程:
 
+0. **已知残留风险(接受而非修复)**:管理密钥按设计只存 localStorage,同一宿主源下的任何脚本(含其他插件的资源页)都能读到它。这是「不得落 cookie / sessionStorage」这条硬要求的直接代价,换取的是密钥不随每个宿主请求自动外发。验证环境请使用不含无关插件的独立宿主;该风险随宿主自身的 XSS 防护能力变化,不由本插件兜底。
 1. 对要提交进仓库的内容先跑 `scripts/check-scrubbed.sh`(它扫描 git 跟踪文件与 dist 产物)。
 2. 对仓库外的单文件(日志、截图 OCR 文本、录制响应),直接人工复核:
    `grep -nE 'eyJ|sk-|Bearer [A-Za-z0-9._-]{25,}|(code|state)=[A-Za-z0-9]{24,}' <文件>`,命中即须清除。

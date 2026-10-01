@@ -2,11 +2,19 @@ package main
 
 // managementPageHTML is the static management page. It carries no data and no
 // secret: everything dynamic is fetched from the authenticated management
-// routes and written through DOM textContent / attribute assignments, never
-// HTML interpolation. Asynchronous responses guard on a generation counter so
-// a slow older reply can never overwrite newer state, and action buttons
-// disable themselves while a request is in flight so an action cannot be
-// submitted twice.
+// routes with the operator's management key and written through DOM
+// textContent / attribute assignments, never HTML interpolation.
+//
+// The page is also served from the unauthenticated resource route that carries
+// the host's navigation entry, so the shell must stay a constant: the host does
+// not HTML-escape resource responses, and anything interpolated here would reach
+// every unauthenticated visitor. That is also why the resource route serves no
+// data and the key is supplied by the operator at runtime — the page opens with
+// no accounts rendered and stays that way until a key is entered.
+//
+// Asynchronous responses guard on a generation counter so a slow older reply
+// can never overwrite newer state, and action buttons disable themselves while
+// a request is in flight so an action cannot be submitted twice.
 const managementPageHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -29,11 +37,32 @@ const managementPageHTML = `<!DOCTYPE html>
   #result { white-space: pre-wrap; background: #f2f2f7; padding: .6rem; margin-top: .8rem; font-size: .8rem; min-height: 1.2rem; }
   #error { color: #c0392b; margin-top: .5rem; font-size: .85rem; min-height: 1.1rem; }
   .link-cell a { word-break: break-all; }
+  #key-panel { border: 1px solid #d8d8dc; background: #fafafc; padding: .7rem .8rem; margin: .8rem 0 1rem; }
+  #key-panel.collapsed { display: flex; align-items: center; gap: .6rem; padding: .4rem .6rem; }
+  #key-panel.collapsed #key-fields, #key-panel.collapsed #key-hint { display: none; }
+  #key-panel label { font-size: .85rem; margin-right: .4rem; }
+  #management-key { padding: .25rem .5rem; font-size: .85rem; border: 1px solid #d8d8dc; min-width: 18rem; }
+  #key-hint { margin: .5rem 0 0; }
 </style>
 </head>
 <body>
 <h1>ZCode Provider</h1>
 <p class="muted">Redacted operational state. Secrets, authorization parameters, upstream bodies, and prompts are never shown.</p>
+
+<div id="key-panel">
+  <div id="key-fields">
+    <label for="management-key">Management key</label>
+    <input id="management-key" type="password" autocomplete="off" spellcheck="false">
+    <button id="save-key" type="button">Save</button>
+    <button id="clear-key" type="button">Forget</button>
+    <p id="key-hint" class="muted">This page is a static shell: every account, quota, and credential value below is
+      fetched with the management key you enter here. The key is kept in this browser's local storage only, is sent as a
+      bearer token, and is never sent again after a request is rejected.</p>
+  </div>
+  <button id="key-show" type="button" hidden>Change key</button>
+  <span id="key-state" class="muted"></span>
+</div>
+
 <div id="error" role="alert"></div>
 
 <h2>Accounts</h2>
@@ -64,8 +93,106 @@ const managementPageHTML = `<!DOCTYPE html>
 (function () {
   var STATE_URL = "/v0/management/zcode/state";
   var ACTION_URL = "/v0/management/zcode/action";
+  var KEY_STORAGE = "zcode_management_key";
   var generation = 0;      // bumped per state fetch; stale replies are dropped
   var busy = 0;            // in-flight action count for global batch guard
+
+  var keyInput = document.getElementById("management-key");
+  var keyPanel = document.getElementById("key-panel");
+  var keyState = document.getElementById("key-state");
+
+  // localStorage is the only store the key may live in: sessionStorage dies
+  // with the tab and a cookie would ride along on every host request. Each
+  // access is guarded because a blocked or full store is an ordinary browser
+  // state, not an error worth breaking the page over.
+  function storedKey() {
+    try {
+      return window.localStorage.getItem(KEY_STORAGE) || "";
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function storeKey(key) {
+    try {
+      window.localStorage.setItem(KEY_STORAGE, key);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function clearStoredKey() {
+    try {
+      window.localStorage.removeItem(KEY_STORAGE);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // forgetKey drops a key that the host rejected or that the operator asked to
+  // drop. Rendering is cleared with it: leaving the previous accounts on screen
+  // after the key is gone would keep showing data the page can no longer
+  // re-fetch or prove is still authorized.
+  function forgetKey(message) {
+    clearStoredKey();
+    generation += 1;
+    keyInput.value = "";
+    var sections = ["accounts", "sessions", "model-cache"];
+    for (var i = 0; i < sections.length; i += 1) {
+      var body = document.getElementById(sections[i]);
+      while (body.firstChild) { body.removeChild(body.firstChild); }
+    }
+    text(document.getElementById("result"), "");
+    showKeyPanel(false);
+    keyInput.focus();
+    if (message) { showError(message); }
+  }
+
+  function showKeyPanel(collapsed) {
+    keyPanel.classList.toggle("collapsed", collapsed);
+    document.getElementById("key-show").hidden = !collapsed;
+    text(keyState, collapsed ? "Management key saved in this browser." : "");
+  }
+
+  // apiFetch is the page's only network entry point. Refusing to send without a
+  // key is the point: the shell answers every visitor, and the data behind it
+  // must not be requested at all until an operator supplies the key. A 401
+  // means the stored key is wrong or revoked, so it is discarded rather than
+  // retried — a wrong key would otherwise be replayed on every timer tick.
+  function apiFetch(url, method, body) {
+    var key = storedKey();
+    if (!key) {
+      return Promise.reject(new Error("Enter and save the management key to load any data."));
+    }
+    return fetch(url, {
+      method: method,
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": "Bearer " + key
+      },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    }).then(function (reply) {
+      if (reply.status === 401) {
+        forgetKey("The management key was rejected. Enter it again to continue.");
+        return Promise.reject(new Error("unauthorized"));
+      }
+      return reply.json().catch(function () {
+        return null;
+      }).then(function (data) {
+        return { ok: reply.ok, data: data };
+      });
+    });
+  }
+
+  // describeFailure keeps the message an operator sees about a request that
+  // never reached the host, as opposed to one the host answered and refused.
+  function describeFailure(failure) {
+    if (failure && failure.message === "unauthorized") { return ""; }
+    return failure && failure.message ? failure.message : "the request could not be sent";
+  }
 
   function el(tag, className) {
     var node = document.createElement(tag);
@@ -175,13 +302,8 @@ const managementPageHTML = `<!DOCTYPE html>
     setBatchDisabled(true);
     if (row) { setRowDisabled(row, true); }
     showError("");
-    fetch(ACTION_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: action, auth_index: authIndex || "" })
-    }).then(function (reply) {
-      return reply.json().then(function (data) { return { ok: reply.ok, data: data }; });
-    }).then(function (outcome) {
+    apiFetch(ACTION_URL, "POST", { action: action, auth_index: authIndex || "" })
+    .then(function (outcome) {
       // A newer action or state fetch superseded this reply; rendering it
       // would put a stale result over a fresh one.
       if (localGeneration !== generation) { return; }
@@ -194,9 +316,10 @@ const managementPageHTML = `<!DOCTYPE html>
         var error = (outcome.data && outcome.data.error) || {};
         showError("Action " + action + " failed: " + (error.message || error.code || "unknown error"));
       }
-    }).catch(function () {
+    }).catch(function (failure) {
       if (localGeneration !== generation) { return; }
-      showError("Action " + action + " could not be sent");
+      var reason = describeFailure(failure);
+      if (reason) { showError("Action " + action + " could not be sent: " + reason); }
     }).then(function () {
       busy -= 1;
       setBatchDisabled(false);
@@ -304,28 +427,70 @@ const managementPageHTML = `<!DOCTYPE html>
   function loadState() {
     generation += 1;
     var localGeneration = generation;
-    fetch(STATE_URL, { headers: { "Accept": "application/json" } })
-      .then(function (reply) {
-        if (!reply.ok) { throw new Error("state request failed"); }
-        return reply.json();
-      })
-      .then(function (data) {
+    // Rendering is cleared before the fetch so the tables never show one
+    // generation's accounts while the next request is in flight.
+    clearTables();
+    apiFetch(STATE_URL, "GET")
+      .then(function (outcome) {
         // A newer fetch or action superseded this reply; applying it would
         // overwrite fresh state with stale state.
         if (localGeneration !== generation) { return; }
+        if (!outcome.ok) {
+          var error = (outcome.data && outcome.data.error) || {};
+          showError("State could not be loaded: " + (error.message || error.code || "unknown error"));
+          return;
+        }
         showError("");
-        render(data);
+        render(outcome.data);
       })
       .catch(function (failure) {
         if (localGeneration !== generation) { return; }
-        showError("State could not be loaded: " + failure.message);
+        var reason = describeFailure(failure);
+        // Without a key this is the expected opening state, not a failure: the
+        // shell is public, so the prompt is the page's first job.
+        if (reason) { showError(reason); }
       });
+  }
+
+  function clearTables() {
+    var sections = ["accounts", "sessions", "model-cache"];
+    for (var i = 0; i < sections.length; i += 1) {
+      var body = document.getElementById(sections[i]);
+      while (body.firstChild) { body.removeChild(body.firstChild); }
+    }
   }
 
   document.getElementById("batch-refresh").addEventListener("click", function () {
     runAction("batch_refresh", "", document.getElementById("batch-refresh"), null);
   });
 
+  document.getElementById("save-key").addEventListener("click", function () {
+    var key = keyInput.value.trim();
+    if (!key) {
+      showError("Enter the management key before saving.");
+      keyInput.focus();
+      return;
+    }
+    if (!storeKey(key)) {
+      showError("The management key could not be saved in this browser.");
+      return;
+    }
+    keyInput.value = "";
+    showKeyPanel(true);
+    showError("");
+    loadState();
+  });
+
+  document.getElementById("clear-key").addEventListener("click", function () {
+    forgetKey("The management key was cleared. Enter it again to continue.");
+  });
+
+  document.getElementById("key-show").addEventListener("click", function () {
+    showKeyPanel(false);
+    keyInput.focus();
+  });
+
+  showKeyPanel(!!storedKey());
   loadState();
   setInterval(loadState, 20000);
 }());
