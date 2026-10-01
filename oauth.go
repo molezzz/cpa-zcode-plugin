@@ -486,7 +486,7 @@ func attachBusinessToken(doc []byte, identityID, accessToken string, now time.Ti
 	}
 	cached, ok := activeBusinessTokens.get(identityID, accessToken, now)
 	if ok {
-		return writeBusinessToken(doc, businessToken{Token: cached}, now)
+		return writeBusinessToken(doc, cached, now)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), managedKeyExchangeTimeout)
 	defer cancel()

@@ -86,21 +86,23 @@ func readOAuthMaterial(doc []byte) oauthMaterial {
 
 // usableBusinessToken returns the recorded business token when it is still
 // inside its window. The skew is subtracted so a token is never used within the
-// last five minutes of its life.
-func (m oauthMaterial) usableBusinessToken(now time.Time) (string, bool) {
+// last five minutes of its life. The lifetime rides along with the token: a
+// caller that re-caches this entry needs it, and dropping it would make the
+// cache entry read as unknown-lived.
+func (m oauthMaterial) usableBusinessToken(now time.Time) (businessToken, bool) {
 	if m.BusinessToken == "" {
-		return "", false
+		return businessToken{}, false
 	}
 	expiresAt, err := time.Parse(time.RFC3339, m.BusinessExpires)
 	if err != nil {
 		// An unparsable expiry means the token's lifetime is unknown, which is
 		// not evidence it is still good.
-		return "", false
+		return businessToken{}, false
 	}
 	if !now.Before(expiresAt.Add(-businessTokenRefreshSkew)) {
-		return "", false
+		return businessToken{}, false
 	}
-	return m.BusinessToken, true
+	return businessToken{Token: m.BusinessToken, ExpiresAt: expiresAt}, true
 }
 
 // knownOAuthFields lists every field the plugin writes into the oauth
@@ -192,20 +194,24 @@ func newBusinessTokenStore() *businessTokenState {
 	return &businessTokenState{entries: map[string]cachedBusinessToken{}}
 }
 
-func (s *businessTokenState) get(identity, sourceToken string, now time.Time) (string, bool) {
+// get returns the cached business token together with its whole recorded
+// lifetime. Callers persist that lifetime, so handing back only the token
+// string would drop it — and a token persisted without an expiry reads as
+// unknown-lived, which costs an exchange on every restart.
+func (s *businessTokenState) get(identity, sourceToken string, now time.Time) (businessToken, bool) {
 	if strings.TrimSpace(identity) == "" || strings.TrimSpace(sourceToken) == "" {
-		return "", false
+		return businessToken{}, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry, ok := s.entries[identity]
 	if !ok || entry.SourceToken != sourceToken {
-		return "", false
+		return businessToken{}, false
 	}
 	if !entry.Token.ExpiresAt.IsZero() && !now.Before(entry.Token.ExpiresAt.Add(-businessTokenRefreshSkew)) {
-		return "", false
+		return businessToken{}, false
 	}
-	return entry.Token.Token, true
+	return entry.Token, true
 }
 
 func (s *businessTokenState) put(identity, sourceToken string, token businessToken) {
@@ -235,11 +241,11 @@ func resolveBusinessToken(ctx context.Context, client *http.Client, identityID s
 		return "", errZaiOAuthRequired
 	}
 	if cached, ok := activeBusinessTokens.get(identityID, accessToken, now); ok {
-		return cached, nil
+		return cached.Token, nil
 	}
 	if cached, ok := material.usableBusinessToken(now); ok {
-		activeBusinessTokens.put(identityID, accessToken, businessToken{Token: cached})
-		return cached, nil
+		activeBusinessTokens.put(identityID, accessToken, cached)
+		return cached.Token, nil
 	}
 
 	token, err := exchangeBusinessTokenWithExpiry(ctx, client, accessToken)

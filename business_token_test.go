@@ -293,8 +293,14 @@ func TestWriteBusinessTokenPreservesExchangeMaterial(t *testing.T) {
 	if material.BusinessToken != "biz-token" {
 		t.Fatalf("business token = %q", material.BusinessToken)
 	}
-	if usable, ok := material.usableBusinessToken(now); !ok || usable != "biz-token" {
-		t.Fatalf("usableBusinessToken = %q ok=%v, want the recorded token", usable, ok)
+	usable, ok := material.usableBusinessToken(now)
+	if !ok || usable.Token != "biz-token" {
+		t.Fatalf("usableBusinessToken = %+v ok=%v, want the recorded token", usable, ok)
+	}
+	// The lifetime must ride along: a caller that re-caches this entry needs
+	// it, and an entry without it reads as unknown-lived and expires on sight.
+	if usable.ExpiresAt.IsZero() {
+		t.Error("usableBusinessToken lost the recorded lifetime")
 	}
 }
 
@@ -312,5 +318,46 @@ func TestWriteBusinessTokenClearsStaleExpiry(t *testing.T) {
 	}
 	if _, ok := material.usableBusinessToken(now); ok {
 		t.Fatal("a token with an unknown lifetime must not be served from the document")
+	}
+}
+
+// TestLoginPersistsTheBusinessTokenLifetime is the regression test for a lost
+// lifetime: the managed key exchange performs the login and caches the result
+// with the upstream's expires_in, and the recording step then read that cache.
+// When the cache handed back only the token string, the expiry was dropped and
+// the token was written with no deadline — which reads as unknown-lived, so the
+// skew could never be applied and every restart paid for a fresh exchange.
+func TestLoginPersistsTheBusinessTokenLifetime(t *testing.T) {
+	fixture := newBizTokenFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(bizLoginOK(3600)))
+	})
+	now := time.Now()
+	// A freshly exchanged token, as the managed key exchange caches it.
+	exchanged, err := exchangeBusinessTokenWithExpiry(context.Background(), fixture.srv.Client(), "oauth-access-token")
+	if err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+	if exchanged.ExpiresAt.IsZero() {
+		t.Fatal("the exchange dropped the upstream's expires_in")
+	}
+	activeBusinessTokens.put("zcode-user-1", "oauth-access-token", exchanged)
+
+	// The recording step takes that cache hit and must carry the lifetime over.
+	doc := attachBusinessToken(
+		authDocWith(t, "oauth-access-token", now.UTC().Format(time.RFC3339)),
+		"zcode-user-1", "oauth-access-token", now)
+	material := readOAuthMaterial(doc)
+	if material.BusinessExpires == "" {
+		t.Fatal("the persisted business token has no expiry; the lifetime was dropped on the way to disk")
+	}
+	// And it must be usable: an entry whose deadline is missing would be
+	// refused, and one whose deadline is wrong would expire early.
+	cached, ok := material.usableBusinessToken(now)
+	if !ok {
+		t.Fatal("the persisted business token is not usable on the next start")
+	}
+	if !cached.ExpiresAt.Equal(exchanged.ExpiresAt.Truncate(time.Second)) &&
+		!cached.ExpiresAt.Equal(exchanged.ExpiresAt) {
+		t.Errorf("persisted expiry = %v, want the exchanged %v", cached.ExpiresAt, exchanged.ExpiresAt)
 	}
 }
