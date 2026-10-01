@@ -356,12 +356,7 @@ func applyCredentialState(doc []byte, conclusions []recordedState, now time.Time
 func applyStateSection(zcode map[string]any, conclusion recordedState, now time.Time) {
 	name := credentialSectionName(conclusion.Kind)
 	existing, _ := zcode[name].(map[string]any)
-	if conclusion.OnlyIfStatus != "" && normalizeStatus(stringField(existing, "status")) != conclusion.OnlyIfStatus {
-		// The persisted state moved on since the evidence was gathered; the
-		// guarded conclusion no longer applies to it.
-		return
-	}
-	if conclusion.NotIfStatus != "" && normalizeStatus(stringField(existing, "status")) == conclusion.NotIfStatus {
+	if !conclusionApplies(conclusion, normalizeStatus(stringField(existing, "status"))) {
 		return
 	}
 	if stateAlreadyRecorded(existing, conclusion) {
@@ -403,6 +398,26 @@ func applyStateSection(zcode map[string]any, conclusion recordedState, now time.
 // checked-at stamp is deliberately ignored: it only records that a conclusion
 // was reached, not that anything about the credential changed. A conclusion
 // with no code asserts no reason, so the recorded one is not compared either.
+// conclusionApplies reports whether a guarded conclusion still applies to a
+// credential in the given recorded state. The persisted state may have moved on
+// since the evidence was gathered, in which case the conclusion no longer
+// describes it.
+//
+// It is the one ruleset for both halves of a guarded write: the recorder uses it
+// to decide whether to persist, and the management plane uses it to report only
+// the conclusions that were actually reached. Sharing it is what keeps a
+// refresh from claiming a recovery it did not perform.
+func conclusionApplies(conclusion recordedState, currentStatus string) bool {
+	current := normalizeStatus(currentStatus)
+	if conclusion.OnlyIfStatus != "" && current != conclusion.OnlyIfStatus {
+		return false
+	}
+	if conclusion.NotIfStatus != "" && current == conclusion.NotIfStatus {
+		return false
+	}
+	return true
+}
+
 func stateAlreadyRecorded(existing map[string]any, conclusion recordedState) bool {
 	if existing == nil {
 		return false

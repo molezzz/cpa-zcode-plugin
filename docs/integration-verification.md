@@ -26,33 +26,62 @@
 - [ ] 记录中保存了该 Key 的上游资源标识;管理页能看到 Key 的存在与状态,但看不到 Key 值。
 - [ ] 在上游手动删除该 Key 后,管理页刷新凭证能观察到失效;插件不会去扫描或接管其它任何 Key。
 
-### 1.3 JWT / API Key 请求
+### 1.3 业务 token 兑换链(前置)
+
+OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务接口接受的凭证,必须先兑换。直接拿它打业务接口会返回 `{"code":401,"msg":"token expired or incorrect"}`——刚登录完几分钟内出现,极易被误判为凭证过期而反复重登。
+
+- [ ] 登录完成后,auth 文件的 `zcode.oauth` 同时存在 `access_token`(兑换原料,带 `exp`)、`business_token`(兑换所得)、`business_token_expires_at`。
+- [ ] 用该 auth 文件里的 `business_token`(不带 `Bearer` 前缀)请求 `GET /api/biz/subscription/list`,返回 `code:200` / `success:true`。
+- [ ] 重启宿主后不重新登录,业务接口仍可用(业务 token 从 auth 文件读回,不重新兑换)。
+- [ ] 兑换失败时,插件不丢失 Coding Plan 凭证:管理页仍可发起请求(走 JWT 或受管 API Key),并提示需要重新登录。
+
+### 1.4 额度与权益前置(billing/balance)
+
+**在验证推理之前必须先确认这一步**,否则"推理 200"可能只是在替一个其实没有套餐权益的账号兜底。
+
+- [ ] `plugins.configs.zcode.product.app_version` 已设置为**客户端真实版本**。取证方式:在能正常使用的 ZCode 客户端抓一次 start plan 的 balance 请求,读其 `app_version` 查询参数。**不得**沿用参考实现里的 `3.0.0`/`3.0.1`。
+- [ ] 插件发出的请求确认为 `GET /api/v1/zcode-plan/billing/balance?app_version=<版本>`,且 `Authorization` 是**裸 JWT**(不加 `Bearer`)。
+- [ ] 该请求返回 `code:0` 且 `data.plans` **非空**。
+  - 若返回 `{"code":3001,"msg":"parameter error"}`:说明声明的版本不被上游接受。**不要**继续猜测参数重试,回到上一条重新取证。
+- [ ] **不得**以已废弃的 `billing/current` 的 `plans` 作为判据——该端点官方已废弃,它的 `plans:[]` 不构成"账号无订阅"的证据。
+
+### 1.5 JWT / API Key 请求
 
 - [ ] 用流式客户端(Claude Code 等发 Anthropic 格式请求的客户端)发起请求,JWT 主凭证生效,增量输出正常。
 - [ ] 用非流式客户端发起同一请求,输出完整、无重复、无截断。
 - [ ] 客户端自带的 `Authorization` / `x-api-key` / `Cookie` 不会出现在上游请求中(宿主日志或抓包确认上游只收到插件构造的凭证)。
 
-### 1.4 验证受阻回退(无 CAPTCHA 自动化)
+### 1.6 验证受阻回退(无 CAPTCHA 自动化)
 
 - [ ] 在受控方式下触发一次上游验证阻塞(例如上游弹出验证要求的时段),观察:
   - 插件**不**尝试任何验证码自动化(源码与依赖中不存在 CAPTCHA/浏览器自动化组件,见许可证审查文档);
   - 请求自动回退到受管 API Key 并成功返回;
   - 管理页 JWT 状态显示 `verification_blocked`,约五分钟后自动重试 JWT。
-- [ ] 若验证阻塞在隔离环境中无法复现,记录"未能复现",并改用模拟上游测试的结论作为依据(见 `credential_state_test.go` 的分类矩阵)。
+- [ ] 若验证阻塞在隔离环境中无法复现,记录"未能复现",并改用模拟上游测试的结论作为依据(见 `credential_state_test.go` 与 `error_codes_test.go` 的分类矩阵)。
+- [ ] 上游返回 `{"code":3012}` 时(通常以 HTTP 405 承载)观察:
+  - 调用方收到的状态码**不是** 405(405 会让调用方误判为"方法不允许");
+  - JWT 状态**不**变为 `invalid`/`exhausted`——`3012` 是请求级风控拒绝,不是凭证失效;
+  - 请求在无可见输出前回退到受管 API Key;
+  - 错误消息包含上游自己的 `msg` 与业务码,而不是一句 `upstream rejected the request (http 405)`。
 
-### 1.5 模型与额度
+### 1.7 模型与额度
 
 - [ ] 未登录状态下模型列表仍有静态基础模型(Provider 可选、可预测)。
 - [ ] 登录后动态发现生效,模型为静态 ∪ 动态;管理页模型缓存按身份+环境展示。
-- [ ] 管理页"Quota"刷新显示余额;人为构造的 schema 漂移(上游变更时)只会显示 unknown,不会误标 exhausted/invalid。
+- [ ] 管理页"Quota"刷新能区分四种状态,而不是笼统的 unknown:
+  - `plan with quota` —— 有套餐且有余额;
+  - `no Coding Plan on this account` —— 上游明确报告无套餐(**这不是** unknown);
+  - `plan expired` —— 套餐已终止;
+  - `unknown (upstream answer not readable)` —— 上游 schema 漂移或答案不可读,此时**不**标记 exhausted/invalid,凭证状态保持不变。
+- [ ] 上游以 HTTP 200 携带业务失败(如 `{"code":3001}`)时,被读成 unknown 而非"无套餐"——否则一次参数错误会伪装成账号没有订阅。
 
-### 1.6 管理面回调
+### 1.8 管理面回调
 
 - [ ] 管理页在真实宿主认证下可打开;所有账号操作(OAuth 重试、凭证刷新、额度刷新、模型缓存刷新、批量刷新)各执行一次并观察结果与串行提示。
 - [ ] OAuth 重试返回的授权链接可完成登录,完成后账号状态与凭证正确落盘。
 - [ ] 页面无重复提交、无旧响应覆盖新状态的现象。
 
-### 1.7 目标平台宿主加载
+### 1.9 目标平台宿主加载
 
 - [ ] 在每个目标平台上,用发布压缩包(经 `SHA256SUMS` 校验)按 `docs/install.md` 安装,宿主成功加载并注册。
   自动化冒烟的覆盖面:CI 在 Ubuntu 原生执行加载/注册冒烟;release 工作流在 linux/amd64 与 darwin/arm64 原生冒烟。windows/amd64 与 darwin/amd64 产物未做自动化加载冒烟,依赖本项的人工宿主加载验证。

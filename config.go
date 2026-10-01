@@ -18,10 +18,25 @@ type Config struct {
 	// extend, never replace, this list.
 	Models []string `yaml:"models"`
 
+	Product        ProductConfig        `yaml:"product"`
 	ModelDiscovery ModelDiscoveryConfig `yaml:"model_discovery"`
 	OAuth          OAuthConfig          `yaml:"oauth"`
 	Upstream       UpstreamConfig       `yaml:"upstream"`
 	Quota          QuotaConfig          `yaml:"quota"`
+}
+
+// ProductConfig declares how the plugin presents itself as a ZCode client.
+// AppVersion is the value the upstream judges client capability by: it is sent
+// as X-ZCode-App-Version, as the User-Agent suffix, and as the billing
+// balance query parameter. It must match a real ZCode client release, because
+// the upstream applies the policy of the declared version — a stale value both
+// understates the client's capability and can bypass the policy of the version
+// the user actually runs.
+type ProductConfig struct {
+	// AppVersion is the ZCode client version the plugin speaks as. The default
+	// is the version documented in docs/ZCode; override it after checking a
+	// working client's own app_version, which is the only authoritative source.
+	AppVersion string `yaml:"app_version"`
 }
 
 // ModelDiscoveryConfig controls identity-scoped dynamic model discovery.
@@ -76,6 +91,12 @@ const (
 	defaultRequestTimeoutSeconds        = 300
 	defaultMaxResponseBytes       int64 = 64 << 20
 	defaultRefreshConcurrency           = 4
+	// defaultAppVersion is the ZCode client version the plugin declares by
+	// default. It tracks the version documented in docs/ZCode (package.json).
+	// The upstream gates Billing balance capability on the declared version, so
+	// this value must be a real release rather than an invented constant: see
+	// ProductConfig for how to verify it against a working client.
+	defaultAppVersion = "3.14.3"
 )
 
 // parseConfig decodes the YAML override document. Unknown keys are ignored so
@@ -96,6 +117,7 @@ func defaultConfig() Config {
 		Enabled:  boolPtr(true),
 		Priority: defaultPriority,
 		Models:   []string{"GLM-5.2", "GLM-5-Turbo"},
+		Product:  ProductConfig{AppVersion: defaultAppVersion},
 		ModelDiscovery: ModelDiscoveryConfig{
 			Enabled:                boolPtr(true),
 			SuccessTTLSeconds:      defaultSuccessTTLSeconds,
@@ -126,6 +148,9 @@ func mergeConfig(base, override Config) Config {
 	}
 	if ids := normalizeModelIDs(override.Models); len(ids) > 0 {
 		base.Models = ids
+	}
+	if version := strings.TrimSpace(override.Product.AppVersion); version != "" {
+		base.Product.AppVersion = version
 	}
 	if override.ModelDiscovery.Enabled != nil {
 		base.ModelDiscovery.Enabled = override.ModelDiscovery.Enabled
@@ -175,6 +200,10 @@ func normalizeConfig(cfg Config) Config {
 	cfg.Models = normalizeModelIDs(cfg.Models)
 	if len(cfg.Models) == 0 {
 		cfg.Models = append([]string(nil), defaultConfig().Models...)
+	}
+	cfg.Product.AppVersion = strings.TrimSpace(cfg.Product.AppVersion)
+	if cfg.Product.AppVersion == "" {
+		cfg.Product.AppVersion = defaultAppVersion
 	}
 	if cfg.ModelDiscovery.Enabled == nil {
 		cfg.ModelDiscovery.Enabled = boolPtr(true)

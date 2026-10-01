@@ -5,6 +5,10 @@ docs/zcode2api/
 # 上游: git@github.com:rensumo/cpa-plugin-zcode.git
 docs/cpa-plugin-zcode/
 
+# 官方客户端源码(Apache-2.0)，协议事实的取证来源，不纳入本仓库版本管理
+# ZCode
+docs/ZCode/
+
 # 构建产物
 dist/
 # go build ./... 在模块根目录留下的二进制

@@ -53,7 +53,6 @@ func (f *managementFixture) setup(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/zcode-plan/anthropic/v1/models", f.servePlanModels)
 	mux.HandleFunc("/api/anthropic/v1/models", f.serveZaiModels)
-	mux.HandleFunc(billingCurrentPath, f.serveBillingCurrent)
 	mux.HandleFunc(billingBalancePath, f.serveBillingBalance)
 	f.modelsSrv = httptest.NewServer(mux)
 	t.Cleanup(f.modelsSrv.Close)
@@ -94,13 +93,6 @@ func (f *managementFixture) servePlanModels(w http.ResponseWriter, _ *http.Reque
 func (f *managementFixture) serveZaiModels(w http.ResponseWriter, _ *http.Request) {
 	f.mu.Lock()
 	status, body := f.zaiStatus, f.zaiBody
-	f.mu.Unlock()
-	f.respondJSON(w, status, body)
-}
-
-func (f *managementFixture) serveBillingCurrent(w http.ResponseWriter, _ *http.Request) {
-	f.mu.Lock()
-	status, body := f.billStatus, f.billBody
 	f.mu.Unlock()
 	f.respondJSON(w, status, body)
 }
@@ -833,4 +825,90 @@ func TestQuotaViewKeepsMalformedBalanceRowsVisible(t *testing.T) {
 	if drifted["remaining"] != nil || drifted["total"] != nil {
 		t.Fatalf("drifted row = %v, want no coerced numbers", drifted)
 	}
+}
+
+// TestAccountViewSuggestsReauthForAnAgedJWT covers the operator-visible half of
+// the age policy: the zcode-plan JWT states no expiry, so past the
+// re-authorization age the plugin says so instead of letting the account fail
+// requests quietly.
+func TestAccountViewSuggestsReauthForAnAgedJWT(t *testing.T) {
+	aged := time.Now().Add(-jwtReauthAfter - time.Hour)
+	doc := accountDocWithJWT(t, makeJWTWithClaims(t, map[string]any{
+		"sub": "aged-user",
+		"iat": aged.Unix(),
+	}), "active", "")
+
+	namespace, err := readAccountNamespace(doc)
+	if err != nil {
+		t.Fatalf("read namespace: %v", err)
+	}
+	if namespace.JWT == nil || !namespace.JWT.ReauthSuggested {
+		t.Fatalf("jwt view = %+v, want a re-authorization suggestion", namespace.JWT)
+	}
+	// A credential already recorded invalid says what is wrong more precisely,
+	// so the age suggestion would only be noise.
+	invalid := accountDocWithJWT(t, makeJWTWithClaims(t, map[string]any{
+		"sub": "aged-user",
+		"iat": aged.Unix(),
+	}), jwtStatusInvalid, "")
+	namespace, err = readAccountNamespace(invalid)
+	if err != nil {
+		t.Fatalf("read namespace: %v", err)
+	}
+	if namespace.JWT.ReauthSuggested {
+		t.Error("an already-invalid credential must not also be suggested for re-auth")
+	}
+}
+
+// TestAccountViewReportsLapsedBusinessAccess covers the other invisible
+// failure: the Coding Plan JWT keeps working, so nothing else would tell the
+// user their business-API access has lapsed and the subscription surface will
+// answer 401.
+func TestAccountViewReportsLapsedBusinessAccess(t *testing.T) {
+	doc := accountDocWithJWT(t, makeJWTWithClaims(t, map[string]any{"sub": "user-1"}), "active", "")
+	failed := recordBusinessTokenFailure(doc, time.Now())
+	namespace, err := readAccountNamespace(failed)
+	if err != nil {
+		t.Fatalf("read namespace: %v", err)
+	}
+	if namespace.OAuth == nil || !namespace.OAuth.ReauthRequired {
+		t.Fatalf("oauth view = %+v, want reauth required", namespace.OAuth)
+	}
+	if namespace.OAuth.Reason != errZaiOAuthRequired.Error() {
+		t.Errorf("reason = %q, want the re-login requirement", namespace.OAuth.Reason)
+	}
+	// A later successful exchange clears the flag: it is cleared in the
+	// document, so the view must not resurrect it from the error alone.
+	recovered := writeBusinessToken(failed, businessToken{
+		Token:     "biz-token",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}, time.Now())
+	namespace, err = readAccountNamespace(recovered)
+	if err != nil {
+		t.Fatalf("read namespace: %v", err)
+	}
+	if namespace.OAuth.ReauthRequired {
+		t.Error("a recovered exchange must clear the reauth requirement")
+	}
+}
+
+// accountDocWithJWT renders an account document carrying a JWT and, when the
+// access token is present, the OAuth namespace.
+func accountDocWithJWT(t *testing.T, jwt, status, accessToken string) []byte {
+	t.Helper()
+	zcode := map[string]any{
+		"identity_id": "zcode-user-1",
+		"jwt":         map[string]any{"token": jwt, "status": status},
+	}
+	if accessToken != "" {
+		zcode["oauth"] = map[string]any{
+			"access_token": accessToken,
+			"received_at":  time.Now().UTC().Format(time.RFC3339),
+		}
+	}
+	raw, err := json.Marshal(map[string]any{"zcode": zcode})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }

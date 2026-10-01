@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -19,13 +20,13 @@ import (
 // override.
 var zcodePlanBillingBase = "https://zcode.z.ai/api/v1/zcode-plan"
 
-// Billing endpoint paths observed on the Coding Plan upstream. Both are plain
-// authenticated GETs; the balance endpoint is the state evidence, the current
-// endpoint only names the subscription.
-const (
-	billingCurrentPath = "/billing/current"
-	billingBalancePath = "/billing/balance"
-)
+// billingBalancePath is the only billing endpoint the plugin queries. The
+// upstream deprecated billing/current, and its plans field is no longer
+// authoritative for Start Plan availability, so the balance endpoint is the
+// single source of both entitlement and quota. Its Authorization header is the
+// bare Coding Plan JWT: the upstream explicitly rejects a Bearer-prefixed
+// credential on this path.
+const billingBalancePath = "/billing/balance"
 
 // quotaRequestTimeout bounds one quota refresh. It is a management-plane
 // convenience, not request work: a slow billing upstream must delay neither
@@ -52,6 +53,11 @@ type quotaBalance struct {
 	Used      *float64
 	Remaining *float64
 	ExpiresAt string
+	// Capabilities are the upstream's own declarations of what this balance
+	// covers. Entries shaped "model:<id>" are the authoritative dynamic model
+	// source for the identity, so they are read here rather than by a second
+	// request the upstream has no endpoint for.
+	Capabilities []string
 	// Malformed marks a row that carried a wrong JSON type in a numeric
 	// field. It contributes schema-incompatibility evidence but never balance
 	// evidence.
@@ -59,14 +65,18 @@ type quotaBalance struct {
 }
 
 // quotaVerdict is what the balance evidence says about the credential's
-// remaining quota. verdictUnknown means the response carried no explicit,
-// well-typed remaining value at all.
+// entitlement. unknown means the response carried no explicit, well-typed
+// evidence at all; noPlan and expired are positive readings of an account the
+// upstream did describe, and are kept distinct from unknown so the management
+// page can tell "this account has no plan" from "the plugin could not tell".
 type quotaVerdict string
 
 const (
 	verdictUnknown   quotaVerdict = "unknown"
 	verdictAvailable quotaVerdict = "available"
 	verdictExhausted quotaVerdict = "exhausted"
+	verdictNoPlan    quotaVerdict = "no_plan"
+	verdictExpired   quotaVerdict = "expired"
 )
 
 // quotaEvidence is the sanitized outcome of one quota refresh: what the
@@ -85,26 +95,35 @@ type quotaEvidence struct {
 	// upstream shape.
 	SchemaCompatible bool
 	Plan             string
-	Balances         []quotaBalance
+	// Plans is the entitlement evidence itself. Its presence is what separates
+	// an account without a Coding Plan from one whose quota could not be read.
+	Plans    []quotaPlan
+	Balances []quotaBalance
 
 	Subscription *pluginapi.QuotaSubscription
 	Summary      []pluginapi.QuotaMetric
 	Groups       []pluginapi.QuotaGroup
 }
 
-// quotaEndpointURL builds one billing endpoint URL.
-func quotaEndpointURL(path string) string {
-	return strings.TrimRight(zcodePlanBillingBase, "/") + path
+// balanceURL builds the balance endpoint URL for one declared client version.
+// The upstream decides Start Plan capability by the declared app_version, so
+// the configured product version — not a constant — is what the query carries.
+func balanceURL(appVersion string) string {
+	query := url.Values{"app_version": []string{strings.TrimSpace(appVersion)}}
+	return strings.TrimRight(zcodePlanBillingBase, "/") + billingBalancePath + "?" + query.Encode()
 }
 
 // quotaGet performs one bounded authenticated GET. The status is returned for
-// every HTTP answer; transport errors return zero status and the error.
+// every HTTP answer; transport errors return zero status and the error. The
+// Authorization header is the bare Coding Plan JWT: this endpoint does not
+// accept a Bearer prefix, and sending one is answered as though no credential
+// were presented.
 func quotaGet(ctx context.Context, url string, jwt string) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Authorization", jwt)
 	req.Header.Set("Accept", "application/json")
 	resp, err := quotaHTTPClient.Do(req)
 	if err != nil {
@@ -126,18 +145,47 @@ func quotaGet(ctx context.Context, url string, jwt string) ([]byte, int, error) 
 // quota-specific codes and messages name the billing surface; everything else
 // is a transport or schema concern, not a credential state.
 func quotaAuthFailure(status int, body []byte) *upstreamFailure {
-	class, rejected := credentialRejectionClass(status, string(body))
-	if !rejected {
-		return nil
-	}
-	switch class {
-	case failureVerificationBlocked:
+	// The verification requirement is settled first, for the same reason the
+	// Messages path does it: it is a body-level conclusion about this credential
+	// that must not be re-read as whatever status or business code accompanies
+	// it, or a five-minute retry would become a permanent conclusion.
+	if status == http.StatusForbidden && containsMarker(string(body), captchaMarkers) {
 		return &upstreamFailure{
 			Class:          failureVerificationBlocked,
 			UpstreamStatus: status,
 			Code:           "quota_verification_required",
 			Message:        "upstream verification is required before the Coding Plan credential can be used; no verification is automated",
 		}
+	}
+	// A business verdict is consulted next, for the same reason as on the
+	// Messages path: this upstream carries business outcomes on statuses that
+	// mean something else, so a 403 holding a risk-control code must not be read
+	// as a credential rejection.
+	if semantics, code, ok := zaiBusinessSemanticsFor(body); ok {
+		class, movesCredential := failureClassForSemantics(semantics)
+		if !movesCredential {
+			// A request-level verdict on the billing call is a conclusion about
+			// this refresh, not about the credential: it concludes nothing and
+			// leaves the recorded state alone.
+			return &upstreamFailure{
+				Class:          failureRejected,
+				UpstreamStatus: status,
+				Code:           "quota_" + string(semantics),
+				Message:        businessRejectionMessage(semantics, code, body),
+			}
+		}
+		return &upstreamFailure{
+			Class:          class,
+			UpstreamStatus: status,
+			Code:           "quota_" + string(semantics),
+			Message:        businessRejectionMessage(semantics, code, body),
+		}
+	}
+	class, rejected := credentialRejectionClass(status, string(body))
+	if !rejected {
+		return nil
+	}
+	switch class {
 	case failureInvalid:
 		return &upstreamFailure{
 			Class:          failureInvalid,
@@ -158,37 +206,49 @@ func quotaAuthFailure(status int, body []byte) *upstreamFailure {
 }
 
 // fetchQuotaEvidence performs one quota refresh against the Coding Plan
-// billing endpoints with the JWT credential. Authentication is checked before
-// any field is read; only explicit, well-typed balance evidence produces a
-// verdict. A verdict of unknown always carries a sanitized reason.
-func fetchQuotaEvidence(ctx context.Context, jwt string) quotaEvidence {
+// balance endpoint with the JWT credential. Authentication and the business
+// verdict are settled before any field is read; only explicit, well-typed
+// balance evidence produces a verdict. A verdict of unknown always carries a
+// sanitized reason.
+func fetchQuotaEvidence(ctx context.Context, jwt string, appVersion string, now time.Time) quotaEvidence {
 	evidence := quotaEvidence{Verdict: verdictUnknown, SchemaCompatible: true}
 
-	currentBody, currentStatus, currentErr := quotaGet(ctx, quotaEndpointURL(billingCurrentPath), jwt)
-	balanceBody, balanceStatus, balanceErr := quotaGet(ctx, quotaEndpointURL(billingBalancePath), jwt)
+	body, status, err := quotaGet(ctx, balanceURL(appVersion), jwt)
 
-	// Authentication is concluded before any body field is read: a rejection
-	// of either billing call is a statement about the credential itself.
-	if evidence.AuthFailure = quotaAuthFailure(currentStatus, currentBody); evidence.AuthFailure == nil {
-		evidence.AuthFailure = quotaAuthFailure(balanceStatus, balanceBody)
-	}
-	if evidence.AuthFailure != nil {
+	// The credential verdict is concluded before any body field is read: a
+	// rejection of the billing call is a statement about the credential itself,
+	// whatever the endpoint happens to report it in.
+	if failure := quotaAuthFailure(status, body); failure != nil {
+		evidence.AuthFailure = failure
 		evidence.SchemaCompatible = false
-		evidence.Reason = evidence.AuthFailure.Code
+		evidence.Reason = failure.Code
+		return evidence
+	}
+	if err != nil || status < 200 || status >= 300 {
+		evidence.SchemaCompatible = false
+		evidence.Reason = quotaTransportReason(err, status)
+		return evidence
+	}
+	// The upstream carries business failures inside HTTP 200 as readily as in
+	// 4xx, so a 2xx is only usable evidence once the envelope agrees. Without
+	// this check a "parameter error" delivered as 200 would read as an account
+	// with no plans.
+	if !zaiBusinessSuccess(body) {
+		evidence.SchemaCompatible = false
+		evidence.Reason = "upstream_reported_failure"
 		return evidence
 	}
 
-	if currentErr == nil && currentStatus >= 200 && currentStatus < 300 {
-		evidence.Plan = parseQuotaPlan(currentBody)
-	}
-
-	if balanceErr != nil || balanceStatus < 200 || balanceStatus >= 300 {
+	plans, plansCompatible := parseQuotaPlans(body, now)
+	evidence.Plans = plans
+	evidence.Plan = planNameFor(plans)
+	if !plansCompatible {
 		evidence.SchemaCompatible = false
-		evidence.Reason = quotaTransportReason(balanceErr, balanceStatus)
+		evidence.Reason = "upstream_schema_incompatible"
 		return evidence
 	}
 
-	balances, compatible := parseQuotaBalances(balanceBody)
+	balances, compatible := parseQuotaBalances(body)
 	evidence.Balances = balances
 	if !compatible {
 		evidence.SchemaCompatible = false
@@ -196,7 +256,7 @@ func fetchQuotaEvidence(ctx context.Context, jwt string) quotaEvidence {
 		return evidence
 	}
 
-	evidence.Verdict, evidence.Reason = balanceVerdict(balances)
+	evidence.Verdict, evidence.Reason = balanceVerdict(balances, plans)
 	evidence.renderView()
 	return evidence
 }
@@ -210,32 +270,118 @@ func quotaTransportReason(err error, status int) string {
 	return sanitizedDiscoveryStatus(status)
 }
 
-// parseQuotaPlan extracts the subscription name from the billing/current
-// body. The plan is display-only evidence: any shape drift leaves it empty
-// instead of failing the refresh.
-func parseQuotaPlan(body []byte) string {
+// quotaPlan is one Coding Plan subscription row of the balance response. The
+// upstream uses the plan's presence and status, not any balance row, to decide
+// whether the account has a plan at all, so the list is kept as its own
+// evidence rather than being collapsed into a display string.
+type quotaPlan struct {
+	Name string
+	// Status is the plan's effective status after the term-end check, so it is
+	// one of planStatusActive, planStatusExpired, or planStatusUnknown for every
+	// plan the upstream described.
+	Status string
+	// EndsAt is the term end in epoch seconds, when the upstream states one.
+	EndsAt *float64
+}
+
+// Plan statuses. Only an explicit "active" is a live plan: the upstream states
+// the status on every plan row, so a plan read without one is evidence the
+// plugin could not read, not a plan in good standing.
+const (
+	planStatusActive  = "active"
+	planStatusExpired = "expired"
+	planStatusUnknown = ""
+)
+
+// parseQuotaPlans reads data.plans from the balance body. The second result
+// reports whether the envelope still matches the observed shape: data.plans
+// must be a JSON array. An absent field is compatible and reads as no plans —
+// the upstream omits it for accounts that have none, and that is an answer, not
+// a schema change.
+func parseQuotaPlans(body []byte, now time.Time) ([]quotaPlan, bool) {
 	var parsed struct {
 		Data struct {
-			Plans []json.RawMessage `json:"plans"`
+			ServerTime json.Number     `json:"server_time"`
+			Plans      json.RawMessage `json:"plans"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(body), &parsed); err != nil {
-		return ""
+		return nil, false
 	}
-	if len(parsed.Data.Plans) == 0 {
-		return ""
+	trimmed := bytes.TrimSpace(parsed.Data.Plans)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, true
 	}
-	var name string
-	if err := json.Unmarshal(parsed.Data.Plans[0], &name); err == nil {
-		return strings.TrimSpace(name)
+	if trimmed[0] != '[' {
+		return nil, false
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(parsed.Data.Plans[0], &fields); err != nil {
-		return ""
+	var rows []json.RawMessage
+	if err := json.Unmarshal(trimmed, &rows); err != nil {
+		return nil, false
 	}
-	for _, key := range []string{"name", "plan_name", "plan", "tier"} {
-		if value, ok := optionalString(fields[key]); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
+	if len(rows) > maxQuotaBalanceRows {
+		rows = rows[:maxQuotaBalanceRows]
+	}
+	plans := make([]quotaPlan, 0, len(rows))
+	for _, row := range rows {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(bytes.TrimSpace(row), &fields); err != nil {
+			return nil, false
+		}
+		plan := quotaPlan{}
+		plan.Name, _ = optionalString(fields["name"])
+		plan.Status, _ = optionalString(fields["status"])
+		plan.EndsAt, _, _ = optionalNumber(fields["ends_at"])
+		plan.Status = planStatusFor(plan, parsed.Data.ServerTime, now)
+		plans = append(plans, plan)
+	}
+	return plans, true
+}
+
+// planStatusFor resolves a plan's effective status, and is the only place that
+// decides whether a plan is in force.
+//
+// The upstream states "active" while the term has run out, so the term's own
+// end is checked against the server's clock and an elapsed term reads as
+// expired. The server's stated time is preferred over the local one so a clock
+// skew between the plugin and the upstream cannot expire a live plan early or
+// keep a dead one alive.
+//
+// A plan that states no status at all is not treated as live: the upstream
+// always states one, so its absence means this refresh could not read the plan,
+// and reading it as active would report an entitlement it has no evidence for.
+func planStatusFor(plan quotaPlan, serverTime json.Number, now time.Time) string {
+	status := normalizeStatus(plan.Status)
+	reference := now
+	if seconds, err := serverTime.Int64(); err == nil && seconds > 0 {
+		reference = time.Unix(seconds, 0).UTC()
+	}
+	if status == planStatusActive && plan.EndsAt != nil && *plan.EndsAt > 0 {
+		if end := time.Unix(int64(*plan.EndsAt), 0).UTC(); !end.After(reference) {
+			return planStatusExpired
+		}
+	}
+	if status == "" {
+		return planStatusUnknown
+	}
+	return status
+}
+
+// planIsLive reports whether a plan is currently in force. Only an explicit
+// "active" status is a live plan: the absence of a status is unreadable
+// evidence, and reading it as live would report an entitlement the upstream
+// never granted.
+func planIsLive(plan quotaPlan) bool {
+	return plan.Status == planStatusActive
+}
+
+// planNameFor renders the display name of the first plan that names itself.
+// A plan with no name still proves a plan exists; it just cannot be labelled,
+// so the entitlement reading never depends on the name being present.
+func planNameFor(plans []quotaPlan) string {
+	for _, plan := range plans {
+		if plan.Name != "" {
+			return plan.Name
 		}
 	}
 	return ""
@@ -293,6 +439,11 @@ func parseQuotaBalanceRow(row json.RawMessage) (quotaBalance, bool) {
 	if value, present := optionalString(fields["expires_at"]); present {
 		balance.ExpiresAt = value
 	}
+	if capabilities, ok := parseQuotaCapabilities(fields["capabilities"]); ok {
+		balance.Capabilities = capabilities
+	} else if fields["capabilities"] != nil {
+		balance.Malformed = true
+	}
 	// A numeric field that is present but not a number leaves the pointer
 	// nil while marking the row malformed: the drift is visible as schema
 	// evidence, never as a silent zero.
@@ -348,11 +499,84 @@ func optionalNumber(raw json.RawMessage) (*float64, bool, bool) {
 	return &value, true, true
 }
 
-// balanceVerdict decides what explicit balance evidence says about the
-// credential. Only rows with a well-typed remaining_units are evidence: an
-// empty list, or rows without any explicit remaining value, stay unknown —
-// the plugin must never spell "exhausted" from missing data.
-func balanceVerdict(balances []quotaBalance) (quotaVerdict, string) {
+// maxQuotaCapabilitiesRows caps the capabilities of one balance row, so a
+// drifted upstream cannot make a single refresh unbounded.
+const maxQuotaCapabilitiesRows = 64
+
+// parseQuotaCapabilities reads a row's capability list. ok is false only when
+// the field is present and is not an array of strings — a schema change, which
+// the row records as drift rather than as an empty capability set.
+func parseQuotaCapabilities(raw json.RawMessage) ([]string, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, true
+	}
+	if trimmed[0] != '[' {
+		return nil, false
+	}
+	var rows []json.RawMessage
+	if err := json.Unmarshal(trimmed, &rows); err != nil {
+		return nil, false
+	}
+	if len(rows) > maxQuotaCapabilitiesRows {
+		rows = rows[:maxQuotaCapabilitiesRows]
+	}
+	capabilities := make([]string, 0, len(rows))
+	for _, row := range rows {
+		value, ok := optionalString(row)
+		if !ok {
+			// One non-string entry does not invalidate the others; the model
+			// ids it does carry are still evidence.
+			continue
+		}
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			capabilities = append(capabilities, trimmed)
+		}
+	}
+	return capabilities, true
+}
+
+// modelCapabilityPrefix is the capability spelling the upstream uses to declare
+// that a balance covers a model. The remainder is the model id.
+const modelCapabilityPrefix = "model:"
+
+// balanceModelIDs renders the model ids one balance row declares. A row that
+// declares none falls back to its display name, matching the upstream's own
+// reading: a balance whose meter is a model is how the plan advertises that
+// model even without an explicit capability entry.
+func balanceModelIDs(balance quotaBalance) []string {
+	if balance.Malformed {
+		// A row whose fields drifted is not evidence about what it covers.
+		return nil
+	}
+	ids := make([]string, 0, len(balance.Capabilities))
+	for _, capability := range balance.Capabilities {
+		if !strings.HasPrefix(strings.ToLower(capability), modelCapabilityPrefix) {
+			continue
+		}
+		if id := strings.TrimSpace(capability[len(modelCapabilityPrefix):]); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		// A balance whose meter is a model is how the plan advertises that
+		// model even without an explicit capability entry.
+		if name := strings.TrimSpace(balance.Name); name != "" {
+			ids = append(ids, name)
+		}
+	}
+	return ids
+}
+
+// balanceVerdict decides what the balance evidence says about the credential.
+//
+// The plan list is read first because it answers the question the balance rows
+// cannot: an account with no plan has no quota to exhaust, and reporting that
+// as "exhausted" would record a conclusion the upstream never made. A live plan
+// with explicit zero remaining units is exhausted; the same plan with units
+// left is available; rows that state no remaining value are unknown, because
+// the plugin must never spell a verdict from missing data.
+func balanceVerdict(balances []quotaBalance, plans []quotaPlan) (quotaVerdict, string) {
 	sawMalformed := false
 	any := false
 	allZero := true
@@ -368,16 +592,38 @@ func balanceVerdict(balances []quotaBalance) (quotaVerdict, string) {
 			allZero = false
 		}
 	}
-	switch {
-	case !any:
-		if sawMalformed {
-			return verdictUnknown, "upstream_schema_incompatible"
+	live := false
+	for _, plan := range plans {
+		if planIsLive(plan) {
+			live = true
+			break
 		}
-		return verdictUnknown, "no_explicit_balance_evidence"
-	case allZero:
+	}
+	switch {
+	case sawMalformed && !any:
+		return verdictUnknown, "upstream_schema_incompatible"
+	case live && any && allZero:
 		return verdictExhausted, ""
-	default:
+	case live && any:
 		return verdictAvailable, ""
+	case live:
+		// A live plan whose rows state no remaining value: the subscription
+		// exists, but this refresh cannot say what is left in it.
+		return verdictUnknown, "no_explicit_balance_evidence"
+	case len(plans) > 0:
+		// Plans exist and none of them is in force.
+		return verdictExpired, "plan_expired"
+	case any:
+		// Balance rows without a plan row: the numbers are the only evidence
+		// there is, so they are read as such.
+		if allZero {
+			return verdictExhausted, ""
+		}
+		return verdictAvailable, ""
+	default:
+		// Neither a plan nor a balance row: the account has no Start Plan.
+		// That is a real answer, distinct from not knowing.
+		return verdictNoPlan, "no_plan"
 	}
 }
 
@@ -458,18 +704,38 @@ func quotaStateUpdates(evidence quotaEvidence, now time.Time) []recordedState {
 			Code:        "quota_exhausted",
 			NotIfStatus: jwtStatusInvalid,
 		}}
+	case verdictExpired:
+		// An elapsed term is a definitive conclusion about the subscription, and
+		// unlike exhaustion it is not restored by reading the balance: the plan
+		// itself has to be renewed. It is written unguarded because a refresh
+		// that positively read an elapsed term is the strongest statement
+		// available, and a credential already recorded as invalid must not be
+		// revived by an older quota reading.
+		return []recordedState{{
+			Kind:        CredentialJWT,
+			Status:      jwtStatusPlanExpired,
+			Code:        "plan_expired",
+			NotIfStatus: jwtStatusInvalid,
+		}}
 	case verdictAvailable:
 		// Explicit positive balance restores an exhausted credential — the
 		// recovery path the exhausted state exists for. The recovery is
 		// guarded on the persisted status so it cannot overwrite a state that
 		// changed while the upstream call ran: an invalid or verification-
 		// blocked credential recovers through a credential refresh or a
-		// re-login, which re-test it against the Messages endpoint.
+		// re-login, which re-test it against the Messages endpoint. An elapsed
+		// term is restored the same way, because only renewing the plan
+		// changes that conclusion.
 		return []recordedState{{
 			Kind:         CredentialJWT,
 			Status:       jwtStatusActive,
 			Code:         "quota_recovered",
 			OnlyIfStatus: jwtStatusExhausted,
+		}, {
+			Kind:         CredentialJWT,
+			Status:       jwtStatusActive,
+			Code:         "plan_renewed",
+			OnlyIfStatus: jwtStatusPlanExpired,
 		}}
 	default:
 		return nil
@@ -481,10 +747,19 @@ func quotaStateUpdates(evidence quotaEvidence, now time.Time) []recordedState {
 // reading, and persisting it would grow the credential document for
 // information the page can refresh on demand.
 type quotaObservation struct {
-	State     string // "ok" | "exhausted" | "unknown" | "unavailable"
+	// State is the entitlement reading the page renders: "ok" (a plan with
+	// quota), "exhausted", "no_plan", "plan_expired", "unknown" (the upstream
+	// schema or answer was not readable), or "unavailable" (the credential was
+	// rejected). "no_plan" and "plan_expired" are positive readings of an
+	// account the upstream did describe, so they stay distinct from "unknown",
+	// which means the plugin could not tell.
+	State     string
 	Reason    string
 	CheckedAt time.Time
 	Plan      string
+	// PlanCount is how many plan rows the upstream reported, so the page can
+	// tell an account with no plan from a plan it could not name.
+	PlanCount int
 	Balances  []quotaBalance
 }
 
@@ -493,6 +768,7 @@ func observationFor(evidence quotaEvidence, checkedAt time.Time) quotaObservatio
 	observation := quotaObservation{
 		CheckedAt: checkedAt,
 		Plan:      evidence.Plan,
+		PlanCount: len(evidence.Plans),
 		Balances:  evidence.Balances,
 	}
 	switch {
@@ -503,6 +779,12 @@ func observationFor(evidence quotaEvidence, checkedAt time.Time) quotaObservatio
 		observation.State = "ok"
 	case evidence.Verdict == verdictExhausted:
 		observation.State = "exhausted"
+	case evidence.Verdict == verdictNoPlan:
+		observation.State = "no_plan"
+		observation.Reason = evidence.Reason
+	case evidence.Verdict == verdictExpired:
+		observation.State = "plan_expired"
+		observation.Reason = evidence.Reason
 	default:
 		observation.State = "unknown"
 		observation.Reason = evidence.Reason
@@ -550,6 +832,11 @@ type quotaRefreshScope struct {
 	AuthIndex  string
 	IdentityID string
 	JWT        string
+	// AppVersion is the client version declared to the billing endpoint. It
+	// travels with the scope rather than being read from the plugin-wide
+	// config so one refresh is decided by the configuration snapshot the
+	// caller was started with.
+	AppVersion string
 	Document   []byte
 }
 
@@ -558,7 +845,8 @@ type quotaRefreshScope struct {
 // no JWT: the managed API key has no verified billing endpoint, so there is
 // nothing to refresh and nothing to guess. A document without a plugin-owned
 // identity is refused outright.
-func resolveQuotaScope(authIndex string, storageJSON []byte, store AuthStore) (scope quotaRefreshScope, hasJWT bool, err error) {
+func resolveQuotaScope(authIndex string, storageJSON []byte, store AuthStore, cfg Config) (scope quotaRefreshScope, hasJWT bool, err error) {
+	scope.AppVersion = normalizeConfig(cfg).Product.AppVersion
 	scope.AuthIndex = strings.TrimSpace(authIndex)
 	doc := bytes.TrimSpace(storageJSON)
 	if len(doc) == 0 && scope.AuthIndex != "" {
@@ -598,7 +886,7 @@ func runQuotaRefresh(ctx context.Context, store AuthStore, scope quotaRefreshSco
 	if scope.JWT == "" {
 		return quotaEvidence{Verdict: verdictUnknown, Reason: "no_jwt_credential"}, errNoJWTForQuota
 	}
-	evidence := fetchQuotaEvidence(ctx, scope.JWT)
+	evidence := fetchQuotaEvidence(ctx, scope.JWT, scope.AppVersion, now)
 	recordErr := credentialStates.forStore(store).record(ctx, credentialRef{
 		AuthIndex:  scope.AuthIndex,
 		IdentityID: scope.IdentityID,
@@ -643,7 +931,7 @@ func handleQuotaFetch(request []byte) ([]byte, error) {
 		return errorEnvelope("unknown_provider", "quota.fetch does not handle provider "+provider, http.StatusBadRequest), nil
 	}
 	store := authStoreProvider()
-	scope, hasJWT, err := resolveQuotaScope(req.AuthIndex, req.StorageJSON, store)
+	scope, hasJWT, err := resolveQuotaScope(req.AuthIndex, req.StorageJSON, store, currentConfig())
 	if err != nil || !hasJWT {
 		// A credential the plugin cannot read or cannot check is reported as
 		// an empty quota answer, not as an upstream failure: the host UI

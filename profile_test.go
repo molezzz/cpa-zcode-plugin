@@ -46,7 +46,7 @@ func TestPrimaryProfileUsesJWTPrimaryCredential(t *testing.T) {
 	if got := profile.Headers.Get("anthropic-version"); got != anthropicVersionValue {
 		t.Fatalf("anthropic-version = %q", got)
 	}
-	if got := profile.Headers.Get("User-Agent"); got != zcodeUserAgent {
+	if got := profile.Headers.Get("User-Agent"); got != zcodeUserAgent(testConfig().Product.AppVersion) {
 		t.Fatalf("user agent = %q", got)
 	}
 	if profile.Headers.Get("X-ZCode-App-Version") == "" || profile.Headers.Get("X-ZCode-Agent") == "" {
@@ -200,7 +200,7 @@ func TestCallerHeaderAllowlist(t *testing.T) {
 	caller.Set("X-Cpa-Host-Control", "internal")
 	caller.Set("anthropic-beta", "feature-1,feature-2")
 
-	headers := buildUpstreamHeaders(caller)
+	headers := buildUpstreamHeaders(caller, testConfig().Product.AppVersion)
 	for _, name := range []string{"X-Api-Key", "Cookie", "Proxy-Authorization", "Host", "Connection", "X-Cpa-Host-Control"} {
 		if got := headers.Get(name); got != "" {
 			t.Errorf("%s forwarded: %q", name, got)
@@ -209,7 +209,7 @@ func TestCallerHeaderAllowlist(t *testing.T) {
 	if got := headers.Get("X-Zcode-Agent"); got != zcodeAgentHeader {
 		t.Errorf("X-ZCode-Agent = %q, want the plugin-built value", got)
 	}
-	if got := headers.Get("X-Zcode-App-Version"); got != zcodeAppVersionHeader {
+	if got := headers.Get("X-Zcode-App-Version"); got != testConfig().Product.AppVersion {
 		t.Errorf("X-ZCode-App-Version = %q, want the plugin-built value", got)
 	}
 	// The caller's own Authorization never survives the filter; the credential
@@ -231,7 +231,7 @@ func TestCallerHeaderAllowlistDeniesByDefault(t *testing.T) {
 	// do not exist yet.
 	caller := http.Header{}
 	caller.Set("X-Future-Host-Header", "value")
-	if headers := buildUpstreamHeaders(caller); headers.Get("X-Future-Host-Header") != "" {
+	if headers := buildUpstreamHeaders(caller, testConfig().Product.AppVersion); headers.Get("X-Future-Host-Header") != "" {
 		t.Fatal("unknown caller header was forwarded")
 	}
 }

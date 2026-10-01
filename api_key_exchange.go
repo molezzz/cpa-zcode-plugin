@@ -184,7 +184,7 @@ type zaiSecretKeyResponse struct {
 //     ids first, then a single candidate. Anything else records a
 //     needs_selection state with the candidate list; localized display names
 //     are never used to guess.
-func attachManagedAPIKey(doc []byte, accessToken string, now time.Time) []byte {
+func attachManagedAPIKey(doc []byte, identityID, accessToken string, now time.Time) []byte {
 	prevSection, hasPrev := readAPIKeySection(doc)
 	prev := typedAPIKeyState(prevSection)
 	timestamp := now.UTC().Format(time.RFC3339)
@@ -222,7 +222,7 @@ func attachManagedAPIKey(doc []byte, accessToken string, now time.Time) []byte {
 	client := newSessionHTTPClient(cfg)
 	defer client.CloseIdleConnections()
 
-	state, err := runManagedKeyExchange(ctx, client, cfg, prev, accessToken, timestamp)
+	state, err := runManagedKeyExchange(ctx, client, cfg, prev, identityID, accessToken, timestamp)
 	if err != nil {
 		if ctx.Err() != nil {
 			err = errors.New("the managed key exchange did not complete in time")
@@ -247,11 +247,16 @@ func attachManagedAPIKey(doc []byte, accessToken string, now time.Time) []byte {
 // section state. Errors carry their stage; the returned state preserves any
 // recorded key identity so failures stay recoverable without creating a
 // second key.
-func runManagedKeyExchange(ctx context.Context, client *http.Client, cfg Config, prev managedAPIKeyState, accessToken, timestamp string) (managedAPIKeyState, error) {
-	bizToken, err := exchangeBusinessToken(ctx, client, accessToken)
+func runManagedKeyExchange(ctx context.Context, client *http.Client, cfg Config, prev managedAPIKeyState, identityID, accessToken, timestamp string) (managedAPIKeyState, error) {
+	exchanged, err := exchangeBusinessTokenWithExpiry(ctx, client, accessToken)
 	if err != nil {
 		return prev, &keyStageError{Stage: apiKeyStageLogin, Err: err}
 	}
+	// The exchange it just performed is the business credential the account's
+	// own billing calls need, so it is cached for them rather than paid for
+	// again. A caller that never reaches the key stage still benefits.
+	activeBusinessTokens.put(identityID, accessToken, exchanged)
+	bizToken := exchanged.Token
 
 	orgID, projID := strings.TrimSpace(prev.OrganizationID), strings.TrimSpace(prev.ProjectID)
 	if orgID == "" || projID == "" {
@@ -421,31 +426,6 @@ func truncateRunes(value string, maxBytes int) string {
 		cut = index + size
 	}
 	return value[:cut]
-}
-
-// exchangeBusinessToken trades the OAuth access token for a Z.AI business API
-// token, which authorizes the key management calls.
-func exchangeBusinessToken(ctx context.Context, client *http.Client, accessToken string) (string, error) {
-	payload, err := json.Marshal(map[string]string{"token": accessToken})
-	if err != nil {
-		return "", fmt.Errorf("encode key exchange login request: %w", err)
-	}
-	body, err := managedKeyRequest(ctx, client, http.MethodPost, zaiBizLoginURL(), payload, "")
-	if err != nil {
-		return "", err
-	}
-	var parsed zaiBizLoginResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", errors.New("the upstream key login response is not valid JSON")
-	}
-	bizToken := strings.TrimSpace(parsed.Data.AccessToken)
-	if bizToken == "" {
-		bizToken = strings.TrimSpace(parsed.Data.AccessTokenCamel)
-	}
-	if bizToken == "" {
-		return "", errors.New("the upstream key login response did not include a business token")
-	}
-	return bizToken, nil
 }
 
 // fetchCustomerOrganizations lists the upstream organizations and their

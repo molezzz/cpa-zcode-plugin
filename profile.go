@@ -35,14 +35,20 @@ func zaiMessagesEndpointURL() string {
 
 // Observed upstream product headers. The Coding Plan endpoint routes plan
 // traffic by these identifiers; they are plugin-constructed and never copied
-// from caller input.
+// from caller input. The version-dependent headers carry the configured
+// product.app_version rather than a constant, because the upstream judges
+// client capability by it.
 const (
 	anthropicVersionValue = "2023-06-01"
-	zcodeUserAgent        = "ZCode/3.0.1"
-	zcodeAppVersionHeader = "3.0.1"
 	zcodeAgentHeader      = "glm"
 	zcodeReferer          = "https://zcode.z.ai/"
 )
+
+// zcodeUserAgent renders the product User-Agent for one declared client
+// version.
+func zcodeUserAgent(appVersion string) string {
+	return "ZCode/" + strings.TrimSpace(appVersion)
+}
 
 // CredentialKind names which credential form an upstream profile authenticates
 // with. The Coding Plan JWT is the primary credential and the plugin-managed
@@ -67,9 +73,13 @@ const credentialStatusCooldown = "cooldown"
 // JWT credential states persisted in the zcode namespace. Only jwtStatusActive
 // (or an unset status on legacy documents) allows execution attempts.
 const (
-	jwtStatusActive              = "active"
-	jwtStatusInvalid             = "invalid"
-	jwtStatusExhausted           = "exhausted"
+	jwtStatusActive    = "active"
+	jwtStatusInvalid   = "invalid"
+	jwtStatusExhausted = "exhausted"
+	// jwtStatusPlanExpired is a subscription whose term ended. It is kept apart
+	// from exhausted: the remaining units may be untouched, and the account
+	// recovers by renewing the plan, not by a quota refresh reading balance.
+	jwtStatusPlanExpired         = "plan_expired"
 	jwtStatusVerificationBlocked = "verification_blocked"
 	jwtStatusCooldown            = credentialStatusCooldown
 )
@@ -169,7 +179,7 @@ func jwtUsable(status string, retryAfter string, now time.Time) bool {
 	switch status {
 	case "", jwtStatusActive:
 		return true
-	case jwtStatusInvalid, jwtStatusExhausted:
+	case jwtStatusInvalid, jwtStatusExhausted, jwtStatusPlanExpired:
 		return false
 	case jwtStatusVerificationBlocked, jwtStatusCooldown:
 		return !retryWindowPending(retryAfter, now)
@@ -231,7 +241,7 @@ func newProfile(snap credentialSnapshot, kind CredentialKind, cfg Config, model 
 		CredentialKind:   kind,
 		MessagesURL:      messagesEndpointURL(),
 		ModelID:          normalizeRequestModel(model, cfg.Models),
-		Headers:          buildUpstreamHeaders(callerHeaders),
+		Headers:          buildUpstreamHeaders(callerHeaders, cfg.Product.AppVersion),
 		MaxResponseBytes: cfg.Upstream.MaxResponseBytes,
 		ConnectTimeout:   time.Duration(cfg.Upstream.ConnectTimeoutSeconds) * time.Second,
 		HeaderTimeout:    time.Duration(cfg.Upstream.RequestTimeoutSeconds) * time.Second,
@@ -253,7 +263,7 @@ func newProfile(snap credentialSnapshot, kind CredentialKind, cfg Config, model 
 // credential, so a caller Authorization/x-api-key value can never reach the
 // upstream, and the two credential forms cannot inherit each other's header. The
 // result is a fresh header map; mutating it cannot leak into other profiles.
-func buildUpstreamHeaders(callerHeaders http.Header) http.Header {
+func buildUpstreamHeaders(callerHeaders http.Header, appVersion string) http.Header {
 	headers := http.Header{}
 	for name, values := range callerHeaders {
 		if !callerHeaderAllowed(name) {
@@ -268,8 +278,8 @@ func buildUpstreamHeaders(callerHeaders http.Header) http.Header {
 	// never change that.
 	headers.Set("Accept", "text/event-stream")
 	headers.Set("anthropic-version", anthropicVersionValue)
-	headers.Set("User-Agent", zcodeUserAgent)
-	headers.Set("X-ZCode-App-Version", zcodeAppVersionHeader)
+	headers.Set("User-Agent", zcodeUserAgent(appVersion))
+	headers.Set("X-ZCode-App-Version", appVersion)
 	headers.Set("X-ZCode-Agent", zcodeAgentHeader)
 	headers.Set("HTTP-Referer", zcodeReferer)
 	return headers

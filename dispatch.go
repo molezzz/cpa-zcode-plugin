@@ -170,6 +170,7 @@ func pluginRegistration() registration {
 				{Name: "enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable the ZCode provider plugin."},
 				{Name: "priority", Type: pluginapi.ConfigFieldTypeInteger, Description: "Provider priority relative to other host providers."},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Static fallback model IDs, always available when discovery is off or fails."},
+				{Name: "product", Type: pluginapi.ConfigFieldTypeObject, Description: "Client identity settings (app_version). The upstream judges capability and billing entitlement by the declared version, so set it to a real ZCode client release."},
 				{Name: "model_discovery", Type: pluginapi.ConfigFieldTypeObject, Description: "Identity-scoped dynamic model discovery settings (enabled, success_ttl_seconds, failure_cooldown_seconds)."},
 				{Name: "oauth", Type: pluginapi.ConfigFieldTypeObject, Description: "Authorization session settings (session_ttl_seconds, managed_key_name_prefix, organization_id, project_id)."},
 				{Name: "upstream", Type: pluginapi.ConfigFieldTypeObject, Description: "Upstream HTTP limits (connect_timeout_seconds, request_timeout_seconds, max_response_bytes)."},

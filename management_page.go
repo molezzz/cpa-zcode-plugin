@@ -119,13 +119,33 @@ const managementPageHTML = `<!DOCTYPE html>
 
   function oauthText(oauth) {
     if (!oauth) { return "none"; }
+    if (oauth.reauth_required) {
+      return "re-authorization required (business API access lapsed)";
+    }
     return oauth.has_access_token ? "material present" : "no material";
   }
 
+  // quotaText renders the entitlement state. The three readings an operator
+  // must be able to tell apart are kept visually distinct: a plan with quota
+  // ("ok"), an account the upstream positively reports as having no plan
+  // ("no_plan" / "plan_expired"), and a reading the plugin could not make
+  // ("unknown"). Collapsing the last two into one "unknown" is what made the
+  // earlier empty billing answer look like a missing subscription.
+  var QUOTA_STATES = {
+    ok: "plan with quota",
+    exhausted: "plan exhausted",
+    no_plan: "no Coding Plan on this account",
+    plan_expired: "plan expired",
+    unknown: "unknown (upstream answer not readable)",
+    unavailable: "unavailable (credential rejected)"
+  };
+
   function quotaText(quota) {
     if (!quota) { return "not checked"; }
-    var parts = [quota.state];
+    var state = QUOTA_STATES[quota.state] || quota.state;
+    var parts = [state];
     if (quota.plan) { parts.push(quota.plan); }
+    else if (quota.plan_count > 0) { parts.push(quota.plan_count + " unnamed plan(s)"); }
     if (quota.reason) { parts.push(quota.reason); }
     return parts.join(" \u00b7 ");
   }
@@ -214,6 +234,10 @@ const managementPageHTML = `<!DOCTYPE html>
     if (account.jwt && account.jwt.last_checked_at) {
       jwtCell.appendChild(el("br"));
       text(jwtCell, "checked " + account.jwt.last_checked_at);
+    }
+    if (account.jwt && account.jwt.reauth_suggested) {
+      jwtCell.appendChild(el("br"));
+      text(jwtCell, "past the re-authorization age \u00b7 Re-auth to keep using it");
     }
     var keyCell = cell(row, "", "");
     keyCell.appendChild(statusSpan(apiKeyText(account.api_key)));

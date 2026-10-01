@@ -159,3 +159,52 @@ func TestConfigureSnapshotIsAtomic(t *testing.T) {
 		t.Fatal("snapshot must be normalized")
 	}
 }
+
+// TestProductAppVersionIsConfigurable covers the P3 requirement: the declared
+// client version is configuration, not a constant, because the upstream applies
+// the policy of the version a client claims.
+func TestProductAppVersionIsConfigurable(t *testing.T) {
+	base := normalizeConfig(defaultConfig())
+	if base.Product.AppVersion != defaultAppVersion {
+		t.Fatalf("default app version = %q, want %q", base.Product.AppVersion, defaultAppVersion)
+	}
+
+	override, err := parseConfig([]byte("product:\n  app_version: \"9.9.9\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := normalizeConfig(mergeConfig(defaultConfig(), override))
+	if merged.Product.AppVersion != "9.9.9" {
+		t.Fatalf("merged app version = %q, want the configured value", merged.Product.AppVersion)
+	}
+
+	// An empty or whitespace value falls back to the documented default rather
+	// than sending the upstream an empty version to judge capability by.
+	blank, err := parseConfig([]byte("product:\n  app_version: \"   \"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback := normalizeConfig(mergeConfig(defaultConfig(), blank))
+	if fallback.Product.AppVersion != defaultAppVersion {
+		t.Fatalf("blank app version = %q, want the default", fallback.Product.AppVersion)
+	}
+}
+
+// TestProductAppVersionReachesEveryRequestHeader pins that one configured value
+// drives the User-Agent and the version header together: the upstream compares
+// them, and a profile that sent different versions would be incoherent.
+func TestProductAppVersionReachesEveryRequestHeader(t *testing.T) {
+	cfg := normalizeConfig(defaultConfig())
+	cfg.Product.AppVersion = "9.9.9"
+	profile := newProfile(credentialSnapshot{IdentityID: "id", JWTToken: "jwt"},
+		CredentialJWT, cfg, "GLM-5.2", nil)
+	if got := profile.Headers.Get("User-Agent"); got != "ZCode/9.9.9" {
+		t.Errorf("user agent = %q", got)
+	}
+	if got := profile.Headers.Get("X-ZCode-App-Version"); got != "9.9.9" {
+		t.Errorf("app version header = %q", got)
+	}
+	if got := zcodeUserAgent("9.9.9"); got != "ZCode/9.9.9" {
+		t.Errorf("zcodeUserAgent = %q", got)
+	}
+}

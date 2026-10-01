@@ -219,6 +219,11 @@ type jwtView struct {
 	RetryAfter    string `json:"retry_after,omitempty"`
 	LastCheckedAt string `json:"last_checked_at,omitempty"`
 	LastErrorCode string `json:"last_error_code,omitempty"`
+	// ReauthSuggested asks the user to authorize again. The zcode-plan JWT
+	// states no expiry, so the plugin cannot know the credential has been
+	// revoked; past the re-authorization age it stops preferring it and says so
+	// here, rather than letting the account fail requests silently.
+	ReauthSuggested bool `json:"reauth_suggested,omitempty"`
 }
 
 type apiKeyView struct {
@@ -235,6 +240,14 @@ type apiKeyView struct {
 type oauthView struct {
 	HasAccessToken bool   `json:"has_access_token"`
 	ReceivedAt     string `json:"received_at,omitempty"`
+	// ReauthRequired reports that the OAuth material can no longer produce a
+	// Z.AI business token, so the subscription and quota surfaces that need one
+	// will answer 401 until the user authorizes again. It is surfaced rather
+	// than logged because the failure it describes is otherwise invisible: the
+	// Coding Plan JWT keeps working, so nothing else tells the user their
+	// business-side access has lapsed.
+	ReauthRequired bool   `json:"reauth_required,omitempty"`
+	Reason         string `json:"reason,omitempty"`
 }
 
 type quotaView struct {
@@ -242,6 +255,7 @@ type quotaView struct {
 	Reason    string             `json:"reason,omitempty"`
 	CheckedAt string             `json:"checked_at,omitempty"`
 	Plan      string             `json:"plan,omitempty"`
+	PlanCount int                `json:"plan_count"`
 	Balances  []quotaBalanceView `json:"balances,omitempty"`
 }
 
@@ -328,6 +342,14 @@ func readAccountNamespace(doc []byte) (accountNamespace, error) {
 			LastCheckedAt: stringField(root.Zcode.JWT, "last_checked_at"),
 			LastErrorCode: stringField(root.Zcode.JWT, "last_error_code"),
 		}
+		// The suggestion is only meaningful for a credential that is otherwise
+		// usable: one already recorded invalid or exhausted says what is wrong
+		// more precisely than an age would.
+		if namespace.JWT.Present && jwtUsable(namespace.JWT.Status, namespace.JWT.RetryAfter, time.Now()) {
+			namespace.JWT.ReauthSuggested = jwtPastReauth(
+				strings.TrimSpace(stringField(root.Zcode.JWT, "token")),
+				readOAuthMaterial(doc), time.Now())
+		}
 	}
 	if root.Zcode.APIKey != nil {
 		view := &apiKeyView{
@@ -353,6 +375,13 @@ func readAccountNamespace(doc []byte) (accountNamespace, error) {
 			HasAccessToken: strings.TrimSpace(stringField(root.Zcode.OAuth, "access_token")) != "",
 			ReceivedAt:     stringField(root.Zcode.OAuth, "received_at"),
 		}
+		// A recorded exchange failure is only still true when no business token
+		// has been obtained since; a later successful exchange clears both.
+		if reason := stringField(root.Zcode.OAuth, "business_token_error"); reason != "" &&
+			strings.TrimSpace(stringField(root.Zcode.OAuth, "business_token")) == "" {
+			namespace.OAuth.ReauthRequired = true
+			namespace.OAuth.Reason = reason
+		}
 	}
 	return namespace, nil
 }
@@ -371,6 +400,7 @@ func quotaViewFor(observation quotaObservation) *quotaView {
 		Reason:    observation.Reason,
 		CheckedAt: observation.CheckedAt.UTC().Format(time.RFC3339),
 		Plan:      observation.Plan,
+		PlanCount: observation.PlanCount,
 	}
 	for _, balance := range observation.Balances {
 		view.Balances = append(view.Balances, quotaBalanceView{
@@ -496,7 +526,7 @@ type credentialOutcomeView struct {
 // state machine. It is the manual recovery path for invalid and exhausted
 // states that a quota refresh may not touch.
 func (s managementService) refreshCredential(ctx context.Context, authIndex string, doc []byte, snap credentialSnapshot, now time.Time) pluginapi.ManagementResponse {
-	outcomes := refreshCredentialsForAccount(ctx, s.recorder, authIndex, doc, snap, now)
+	outcomes := refreshCredentialsForAccount(ctx, s.recorder, s.cfg, authIndex, doc, snap, now)
 	payload := map[string]any{
 		"action":      actionRefreshCredential,
 		"auth_index":  authIndex,
@@ -511,7 +541,7 @@ func (s managementService) refreshCredential(ctx context.Context, authIndex stri
 // refresh cannot diverge from what execution observes. Unlike the model
 // cache path, an unusable credential is probed anyway: re-testing it is the
 // point of the action.
-func refreshCredentialsForAccount(ctx context.Context, recorder *credentialStateRecorder, authIndex string, doc []byte, snap credentialSnapshot, now time.Time) []credentialOutcomeView {
+func refreshCredentialsForAccount(ctx context.Context, recorder *credentialStateRecorder, cfg Config, authIndex string, doc []byte, snap credentialSnapshot, now time.Time) []credentialOutcomeView {
 	outcomes := []credentialOutcomeView{}
 	for _, kind := range []CredentialKind{CredentialJWT, CredentialAPIKey} {
 		env := discoveryEnvironments[kind]
@@ -521,7 +551,7 @@ func refreshCredentialsForAccount(ctx context.Context, recorder *credentialState
 			outcomes = append(outcomes, view)
 			continue
 		}
-		target, ok := buildDiscoveryTarget(kind, snap)
+		target, ok := buildDiscoveryTarget(kind, snap, cfg)
 		if !ok {
 			view.Reason = "credential_unavailable"
 			outcomes = append(outcomes, view)
@@ -621,6 +651,7 @@ func (s managementService) refreshQuota(ctx context.Context, authIndex string, d
 		AuthIndex:  authIndex,
 		IdentityID: snap.IdentityID,
 		JWT:        snap.JWTToken,
+		AppVersion: s.cfg.Product.AppVersion,
 		Document:   doc,
 	}
 	evidence, recordErr := runQuotaRefresh(ctx, s.store, scope, now)
@@ -629,15 +660,18 @@ func (s managementService) refreshQuota(ctx context.Context, authIndex string, d
 		"auth_index": authIndex,
 		"quota":      quotaViewFor(observationFor(evidence, now)),
 	}
-	if updates := quotaStateUpdates(evidence, now); len(updates) > 0 {
-		conclusions := make([]string, 0, len(updates))
-		for _, update := range updates {
-			conclusions = append(conclusions, update.Status)
+	// Only a conclusion that actually applies to the credential's recorded
+	// state is reported. The recovery conclusions are guarded on that state, so
+	// a refresh that cleared exhaustion must not also claim to have cleared an
+	// unrelated conclusion it never matched.
+	conclusions := []string{}
+	for _, update := range quotaStateUpdates(evidence, now) {
+		if !conclusionApplies(update, snap.JWTStatus) {
+			continue
 		}
-		payload["recorded"] = conclusions
-	} else {
-		payload["recorded"] = []string{}
+		conclusions = append(conclusions, update.Status)
 	}
+	payload["recorded"] = conclusions
 	// The upstream reading succeeded even when its state write did not, so
 	// the evidence is reported with the write loss named instead of turning
 	// the whole action into an error that hides the observation.
@@ -792,7 +826,7 @@ func (s managementService) batchRefreshOne(ctx context.Context, authIndex, ident
 		result.Message = "the account's credential record could not be read"
 		return result
 	}
-	credentialOutcomes := refreshCredentialsForAccount(ctx, s.recorder, authIndex, doc, snap, now)
+	credentialOutcomes := refreshCredentialsForAccount(ctx, s.recorder, s.cfg, authIndex, doc, snap, now)
 	attempted := 0
 	for _, outcome := range credentialOutcomes {
 		if outcome.Attempted {
@@ -804,6 +838,7 @@ func (s managementService) batchRefreshOne(ctx context.Context, authIndex, ident
 			AuthIndex:  authIndex,
 			IdentityID: snap.IdentityID,
 			JWT:        snap.JWTToken,
+			AppVersion: s.cfg.Product.AppVersion,
 			Document:   doc,
 		}
 		if _, err := runQuotaRefresh(ctx, s.store, scope, now); err != nil {

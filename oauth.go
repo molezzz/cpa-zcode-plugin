@@ -461,7 +461,46 @@ func completeLoginStorage(token, accessToken string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("authorization result could not be stored")
 	}
-	return attachManagedAPIKey(doc, accessToken, time.Now()), identityID, nil
+	// The managed key exchange runs first because it already performs the
+	// business-token login and primes the cache, so recording the business
+	// token afterwards costs no second upstream call. Doing it in this order is
+	// also the only order that leaves the exchange result cached when the key
+	// exchange fails: a failed key exchange still obtained a business token.
+	doc = attachManagedAPIKey(doc, identityID, accessToken, time.Now())
+	return attachBusinessToken(doc, identityID, accessToken, time.Now()), identityID, nil
+}
+
+// attachBusinessToken records the Z.AI business token for the identity, so the
+// account is usable against the business API from the moment it is created
+// rather than failing the first subscription or quota call that needs it.
+//
+// It is a recording step, not a second exchange: the managed key exchange
+// already called the same login endpoint and cached the result. When that
+// cache is cold the exchange happens here, and a refusal is not a login
+// failure — the Coding Plan JWT does not depend on it, and the exchange is
+// retried on demand once the OAuth material is usable again.
+func attachBusinessToken(doc []byte, identityID, accessToken string, now time.Time) []byte {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return doc
+	}
+	cached, ok := activeBusinessTokens.get(identityID, accessToken, now)
+	if ok {
+		return writeBusinessToken(doc, businessToken{Token: cached}, now)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), managedKeyExchangeTimeout)
+	defer cancel()
+	client := newSessionHTTPClient(currentConfig())
+	defer client.CloseIdleConnections()
+	exchanged, err := exchangeBusinessTokenWithExpiry(ctx, client, accessToken)
+	if err != nil {
+		// The Coding Plan credential is unaffected, so the login still
+		// succeeds. The failure is recorded instead of discarded: it is the
+		// only thing that tells the user their business-side access lapsed.
+		return recordBusinessTokenFailure(doc, now)
+	}
+	activeBusinessTokens.put(identityID, accessToken, exchanged)
+	return writeBusinessToken(doc, exchanged, now)
 }
 
 // oauthStoreReadTimeout bounds the host auth store round trip during login

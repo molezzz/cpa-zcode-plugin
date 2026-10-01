@@ -138,7 +138,9 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 // could be attempted.
 func newExecutionScope(req executorRequestRPC, cfg Config, model string) (executionScope, []ResolvedProfile, *upstreamFailure) {
 	now := time.Now()
-	plan := executionPlan(req.StorageJSON, cfg, model, req.Headers, now)
+	authIndex := strings.TrimSpace(req.AuthID)
+	doc := currentAuthDocument(authIndex, req.StorageJSON)
+	plan := executionPlan(doc, cfg, model, req.Headers, now)
 	if plan.Failure != nil {
 		return executionScope{}, nil, plan.Failure
 	}
@@ -148,12 +150,12 @@ func newExecutionScope(req executorRequestRPC, cfg Config, model string) (execut
 	// would keep the primary blocked forever.
 	skipBlockStatus, skipBlockRetry := "", time.Time{}
 	if plan.SkipBlockStatus != "" {
-		skipBlockStatus, skipBlockRetry = skipBlockConclusion(req.StorageJSON, plan.SkipBlockStatus, now)
+		skipBlockStatus, skipBlockRetry = skipBlockConclusion(doc, plan.SkipBlockStatus, now)
 	}
 	return executionScope{
-		AuthIndex:       strings.TrimSpace(req.AuthID),
+		AuthIndex:       authIndex,
 		IdentityID:      plan.Primary.IdentityID,
-		Document:        req.StorageJSON,
+		Document:        doc,
 		Primary:         plan.Primary,
 		SkipBlockStatus: skipBlockStatus,
 		SkipBlockRetry:  skipBlockRetry,
@@ -161,6 +163,39 @@ func newExecutionScope(req executorRequestRPC, cfg Config, model string) (execut
 		Now:             func() time.Time { return now },
 	}, plan.Attempts, nil
 }
+
+// currentAuthDocument returns the credential document one request should plan
+// against.
+//
+// The host hands each request the document as it was when the request was
+// scheduled, but the upstream rotates and revokes credentials underneath the
+// plugin: a re-login replaces the JWT, a state conclusion from another request
+// lands on the record, and none of it is visible in a copy captured earlier. So
+// the record is re-read here, once per request, and that fresh copy is what
+// plans the attempt and what the request's own state conclusions are written
+// against. This is the plugin's equivalent of the official client's
+// shouldRefreshBeforeModelRequest, which never caches a credential across
+// requests either.
+//
+// A store that cannot be read, or a record that is gone, falls back to the
+// document the host supplied: a request the plugin can still act on is better
+// than a failed one, and the store read is bounded so a slow host cannot stall
+// execution.
+func currentAuthDocument(authIndex string, supplied []byte) []byte {
+	if authIndex == "" {
+		return supplied
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), credentialRefreshReadTimeout)
+	defer cancel()
+	doc, err := authStoreProvider().Get(ctx, authIndex)
+	if err != nil || len(bytes.TrimSpace(doc)) == 0 {
+		return supplied
+	}
+	return bytes.TrimSpace(doc)
+}
+
+// credentialRefreshReadTimeout bounds the per-request credential re-read.
+const credentialRefreshReadTimeout = 5 * time.Second
 
 // handleExecutorExecuteStream acknowledges the stream immediately and pumps
 // upstream SSE frames through host callbacks in the background. The stream
@@ -293,6 +328,15 @@ func executionPlan(doc []byte, cfg Config, model string, callerHeaders http.Head
 	primary, primaryErr := primaryProfile(snap, cfg, model, callerHeaders, now)
 	fallback, fallbackErr := fallbackProfile(snap, cfg, model, callerHeaders, now)
 
+	// A JWT past its re-authorization age is still attempted — the upstream may
+	// well accept it, and skipping a possibly-working primary would spend a
+	// working fallback for nothing. But the fallback is then guaranteed a turn,
+	// so a credential the upstream has quietly stopped honouring costs one
+	// extra request rather than every subsequent one.
+	if primaryErr == nil && fallbackErr == nil && jwtPastReauth(snap.JWTToken, readOAuthMaterial(doc), now) {
+		return credentialPlan{Primary: primary, Attempts: []ResolvedProfile{primary, fallback}}
+	}
+
 	switch {
 	case primaryErr == nil:
 		// The primary is attempted first. The fallback is added only when it
@@ -377,7 +421,7 @@ func credentialProfileFailure(err error) *upstreamFailure {
 // worse than recording nothing.
 func skipBlockConclusion(doc []byte, status string, now time.Time) (string, time.Time) {
 	switch status {
-	case jwtStatusVerificationBlocked, jwtStatusExhausted, jwtStatusCooldown, jwtStatusInvalid:
+	case jwtStatusVerificationBlocked, jwtStatusExhausted, jwtStatusPlanExpired, jwtStatusCooldown, jwtStatusInvalid:
 	default:
 		return "", time.Time{}
 	}
@@ -651,13 +695,18 @@ var statusVocabulary = map[CredentialKind]map[failureClass]string{
 		failureVerificationBlocked: jwtStatusVerificationBlocked,
 		failureInvalid:             jwtStatusInvalid,
 		failureExhausted:           jwtStatusExhausted,
+		failurePlanExpired:         jwtStatusPlanExpired,
 		failureCooldown:            jwtStatusCooldown,
 	},
 	CredentialAPIKey: {
 		failureVerificationBlocked: apiKeyStatusCooldown,
 		failureInvalid:             apiKeyStatusInvalid,
 		failureExhausted:           apiKeyStatusExhausted,
-		failureCooldown:            apiKeyStatusCooldown,
+		// The managed key is not held against a Coding Plan term, so an expired
+		// plan says nothing about it: the key is temporary as far as the
+		// upstream is concerned.
+		failurePlanExpired: apiKeyStatusCooldown,
+		failureCooldown:    apiKeyStatusCooldown,
 	},
 }
 

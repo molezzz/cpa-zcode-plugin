@@ -231,7 +231,7 @@ func lastErrorStage(t *testing.T, doc []byte) (string, string) {
 
 func mustAttach(t *testing.T, doc []byte, accessToken string) []byte {
 	t.Helper()
-	return attachManagedAPIKey(doc, accessToken, time.Now())
+	return attachManagedAPIKey(doc, "identity-test", accessToken, time.Now())
 }
 
 func TestBuildManagedKeyNameUsesConfiguredPrefixAndRandomSuffix(t *testing.T) {

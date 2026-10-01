@@ -134,6 +134,7 @@ const (
 	failureVerificationBlocked failureClass = "verification_blocked"
 	failureInvalid             failureClass = "invalid"
 	failureExhausted           failureClass = "exhausted"
+	failurePlanExpired         failureClass = "plan_expired"
 	failureCooldown            failureClass = "cooldown"
 	failureRejected            failureClass = "upstream_rejected"
 	failureUnavailable         failureClass = "upstream_unavailable"
@@ -190,16 +191,17 @@ func containsMarker(body string, markers []string) bool {
 
 // credentialRejectionClass reports the failure class one upstream status
 // implies about the credential itself, as opposed to the request or the
-// transport. The captcha-bearing 403 is a verification block, any other
-// 401/403 rejects the credential, and the 402 status itself is the payment
-// verdict. Everything else — rate limits, 5xx, request problems — says
-// nothing about the credential, so ok is false. Every caller that maps an
-// upstream rejection onto a credential conclusion shares this one ruleset,
-// so the Messages executor and the billing checks cannot drift apart.
+// transport. Any 401/403 rejects the credential, and the 402 status itself is
+// the payment verdict. Everything else — rate limits, 5xx, request problems —
+// says nothing about the credential, so ok is false. Every caller that maps an
+// upstream rejection onto a credential conclusion shares this one ruleset, so
+// the Messages executor and the billing checks cannot drift apart.
+//
+// A captcha-bearing 403 is not handled here: classifyUpstreamFailure settles
+// the verification requirement before it consults this, because that conclusion
+// takes precedence over whatever status or business code accompanies it.
 func credentialRejectionClass(status int, bodyText string) (failureClass, bool) {
 	switch {
-	case status == http.StatusForbidden && containsMarker(bodyText, captchaMarkers):
-		return failureVerificationBlocked, true
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		return failureInvalid, true
 	case status == http.StatusPaymentRequired:
@@ -210,10 +212,36 @@ func credentialRejectionClass(status int, bodyText string) (failureClass, bool) 
 }
 
 // classifyUpstreamFailure turns a non-2xx upstream response into a sanitized,
-// classified failure. The body is used only for classification and, for plain
-// request-rejection classes, a bounded structured excerpt.
+// classified failure. The answer is read in a fixed precedence, each step
+// because the one below it would otherwise misread it:
+//
+//  1. A captcha/verify requirement in the body. The upstream signals
+//     verification from the body, and it is the one conclusion that is always
+//     about this credential — a verification block must never be re-read as
+//     whatever business code happens to ride along with it, because that
+//     would trade a five-minute automatic retry for a permanent conclusion.
+//  2. The Z.AI business verdict. The upstream reuses HTTP statuses as carriers
+//     for business outcomes — notably 405 for a risk-control block — so a
+//     recognised code describes the rejection better than its status does.
+//  3. HTTP semantics, for an answer that carries neither.
 func classifyUpstreamFailure(status int, body []byte) *upstreamFailure {
 	bodyText := string(body)
+	if status == http.StatusForbidden && containsMarker(bodyText, captchaMarkers) {
+		// A verification requirement is a definitive conclusion about this
+		// credential, so the request moves on to the fallback credential
+		// instead of repeating the primary.
+		return &upstreamFailure{
+			Class:                 failureVerificationBlocked,
+			UpstreamStatus:        status,
+			ClientStatus:          http.StatusForbidden,
+			Code:                  "upstream_verification_required",
+			Message:               "upstream verification is required before the Coding Plan credential can be used; no verification is automated",
+			RetryableBeforeOutput: true,
+		}
+	}
+	if failure := classifyBusinessFailure(status, body); failure != nil {
+		return failure
+	}
 	if class, rejected := credentialRejectionClass(status, bodyText); rejected {
 		switch class {
 		case failureVerificationBlocked:
@@ -282,6 +310,85 @@ func classifyUpstreamFailure(status int, body []byte) *upstreamFailure {
 	}
 }
 
+// classifyBusinessFailure classifies one upstream answer from the Z.AI business
+// verdict it carries. It returns nil when the answer carries no recognised
+// verdict, which leaves the caller on HTTP semantics.
+//
+// The two halves of the result are deliberately separate. The failure class
+// says whether the answer is a statement about the credential, and therefore
+// whether the state machine may move a credential; RetryableBeforeOutput says
+// whether another credential may serve this request before anything reached the
+// caller. A request-level rejection such as 3012 concludes nothing about the
+// credential, yet it must still let the fallback key try — otherwise a
+// verification block would strand an account that has a working fallback.
+func classifyBusinessFailure(status int, body []byte) *upstreamFailure {
+	semantics, code, ok := zaiBusinessSemanticsFor(body)
+	if !ok {
+		return nil
+	}
+	class, credentialVerdict := failureClassForSemantics(semantics)
+	if !credentialVerdict {
+		return &upstreamFailure{
+			Class:          failureRejected,
+			UpstreamStatus: status,
+			ClientStatus:   clientStatusForSemantics(semantics, status),
+			Code:           "upstream_rejected_" + string(semantics),
+			Message:        businessRejectionMessage(semantics, code, body),
+			// A rejection about the request rather than the credential is
+			// exactly when the fallback credential is worth trying: it may
+			// serve a request the primary's plan or risk state cannot.
+			RetryableBeforeOutput: true,
+		}
+	}
+	return &upstreamFailure{
+		Class:                 class,
+		UpstreamStatus:        status,
+		ClientStatus:          clientStatusForSemantics(semantics, status),
+		Code:                  "upstream_" + string(semantics),
+		Message:               businessRejectionMessage(semantics, code, body),
+		RetryableBeforeOutput: true,
+	}
+}
+
+// businessRejectionMessage renders the sanitized message for a business
+// verdict, preferring the upstream's own explanation so an operator can see
+// what the upstream actually said, and naming the code so two rejections of
+// the same class stay distinguishable. The message is bounded and reduced to
+// a single line; no body content beyond that excerpt can reach the caller.
+func businessRejectionMessage(semantics zaiBusinessSemantics, code zaiBusinessCode, body []byte) string {
+	lead := businessVerdictPhrase(semantics)
+	if excerpt := zaiBusinessMessage(body); excerpt != "" {
+		return lead + ": " + excerpt + " (upstream code " + normalizeZaiBusinessCode(string(code)) + ")"
+	}
+	return lead + " (upstream code " + normalizeZaiBusinessCode(string(code)) + ")"
+}
+
+// businessVerdictPhrase is the plugin's own one-line reading of each business
+// meaning. It says what the plugin concluded, so the operator is not left
+// reading only the upstream's prose.
+func businessVerdictPhrase(semantics zaiBusinessSemantics) string {
+	switch semantics {
+	case zaiSemQuotaExhausted:
+		return "upstream reports no remaining quota for this credential"
+	case zaiSemPlanExpired:
+		return "upstream reports the Coding Plan subscription has expired"
+	case zaiSemPlanAccessDenied:
+		return "upstream denies this plan access to the requested model"
+	case zaiSemAuthFailed:
+		return "upstream rejected the credential"
+	case zaiSemRateLimited:
+		return "upstream rate limit reached; retry later"
+	case zaiSemProviderOverloaded:
+		return "upstream is at capacity; retry later"
+	case zaiSemUpstreamError:
+		return "upstream reported an internal error; retry later"
+	case zaiSemRequestRejected:
+		return "upstream rejected the request"
+	default:
+		return "upstream rejected the request"
+	}
+}
+
 // sanitizedRejectionMessage builds the message for plain request rejections
 // (typically 4xx schema errors). It extracts only a bounded, single-line
 // message field from a JSON error body; unparsable bodies stay generic so
@@ -300,6 +407,12 @@ func sanitizedRejectionMessage(status int, body []byte) string {
 	excerpt := parsed.Error.Message
 	if strings.TrimSpace(excerpt) == "" {
 		excerpt = parsed.Message
+	}
+	// Z.AI spells its explanation "msg" at the top level rather than "message"
+	// or under "error"; without this the upstream's only description of a
+	// rejection is discarded and the caller sees the bare status.
+	if strings.TrimSpace(excerpt) == "" {
+		excerpt = zaiBusinessMessage(body)
 	}
 	excerpt = strings.TrimSpace(singleLine(excerpt))
 	if excerpt == "" {

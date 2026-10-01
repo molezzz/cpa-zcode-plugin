@@ -233,7 +233,7 @@ type discoveryTarget struct {
 // buildDiscoveryTarget resolves one environment's discovery request from a
 // credential snapshot. ok is false when the credential carries no material or
 // the environment has no derivable models endpoint.
-func buildDiscoveryTarget(kind CredentialKind, snap credentialSnapshot) (discoveryTarget, bool) {
+func buildDiscoveryTarget(kind CredentialKind, snap credentialSnapshot, cfg Config) (discoveryTarget, bool) {
 	env, ok := discoveryEnvironments[kind]
 	if !ok {
 		return discoveryTarget{}, false
@@ -248,7 +248,7 @@ func buildDiscoveryTarget(kind CredentialKind, snap credentialSnapshot) (discove
 	}
 	// The same product header set as the environment's Messages profile,
 	// except discovery is a plain JSON GET rather than an SSE stream.
-	headers := buildUpstreamHeaders(nil)
+	headers := buildUpstreamHeaders(nil, cfg.Product.AppVersion)
 	headers.Set("Accept", "application/json")
 	env.authenticate(headers, material)
 	return discoveryTarget{
@@ -421,7 +421,7 @@ func modelsForAuth(ctx context.Context, cfg Config, catalog *modelCatalog, authI
 		if catalog.coolingDown(scope, now) {
 			continue
 		}
-		target, ok := buildDiscoveryTarget(kind, snap)
+		target, ok := buildDiscoveryTarget(kind, snap, cfg)
 		if !ok {
 			continue
 		}
@@ -441,7 +441,11 @@ func modelsForAuth(ctx context.Context, cfg Config, catalog *modelCatalog, authI
 
 	successTTL := time.Duration(cfg.ModelDiscovery.SuccessTTLSeconds) * time.Second
 	cooldown := time.Duration(cfg.ModelDiscovery.FailureCooldownSeconds) * time.Second
-	supplements := cached
+	// The Coding Plan's own model declaration is authoritative for the JWT
+	// environment: the balance endpoint states which models the plan covers.
+	// It supplements discovery rather than replacing it, so a billing endpoint
+	// the plugin could not read costs nothing.
+	supplements := append(cached, planModelIDs(snap, now))
 	for i := range attempts {
 		attempt := &attempts[i]
 		if attempt.reason == "" {
@@ -452,6 +456,43 @@ func modelsForAuth(ctx context.Context, cfg Config, catalog *modelCatalog, authI
 		catalog.recordFailure(attempt.scope, attempt.reason, cooldown, now)
 	}
 	return catalogModelList(static, supplements)
+}
+
+// planModelIDs returns the model ids the identity's last quota refresh
+// observed the plan covering. It reads the cached observation, so it costs no
+// upstream call, and returns nothing whenever the observation is not a positive
+// reading of a live plan: an unreadable or absent balance is not evidence about
+// which models exist.
+func planModelIDs(snap credentialSnapshot, now time.Time) []string {
+	identity := strings.TrimSpace(snap.IdentityID)
+	if identity == "" {
+		return nil
+	}
+	observation, ok := activeQuotaCache.get(identity)
+	if !ok {
+		return nil
+	}
+	switch observation.State {
+	case "ok", "exhausted":
+	default:
+		return nil
+	}
+	ids := make([]string, 0, len(observation.Balances))
+	seen := map[string]struct{}{}
+	for _, balance := range observation.Balances {
+		if balance.Malformed {
+			continue
+		}
+		for _, id := range balanceModelIDs(balance) {
+			key := strings.ToLower(id)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // handleModelForAuth serves one identity's catalog for the host's
@@ -582,7 +623,7 @@ func refreshAccountModels(ctx context.Context, cfg Config, catalog *modelCatalog
 			})
 			continue
 		}
-		target, ok := buildDiscoveryTarget(kind, snap)
+		target, ok := buildDiscoveryTarget(kind, snap, cfg)
 		if !ok {
 			outcomes = append(outcomes, modelRefreshOutcome{
 				Environment: environment,
