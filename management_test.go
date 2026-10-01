@@ -345,6 +345,53 @@ func TestManagementResourcePathNeverServesData(t *testing.T) {
 	}
 }
 
+// TestManagementPageAlignsEveryTable guards the rendered shape rather than the
+// source text. A cell helper that returns its inner stack instead of its <td>
+// still renders every word the operator reads, so only the structure shows the
+// row lost a column. The assertion is therefore on the tag sequence the script
+// produces: a row is one <td> per column, with no element parented straight to
+// <tr>.
+func TestManagementPageAlignsEveryTable(t *testing.T) {
+	page := managementPageHTML
+	scriptStart := strings.Index(page, "<script>")
+	scriptEnd := strings.LastIndex(page, "</script>")
+	if scriptStart < 0 || scriptEnd < scriptStart {
+		t.Fatal("page carries no script body")
+	}
+	script := page[scriptStart:scriptEnd]
+
+	// Every credential cell builder hands the caller a <td> to append. If one
+	// returned the stack instead, its div would be parented directly to <tr> and
+	// the table would silently lose a column. The check is that each builder is
+	// actually consumed: an unappended builder renders a correct-looking row
+	// with a column missing.
+	for _, helper := range []string{"jwtCell", "apiKeyCell", "oauthCell", "quotaCell"} {
+		if !strings.Contains(script, "function "+helper+"(") {
+			t.Errorf("page is missing the %s builder", helper)
+			continue
+		}
+		if !strings.Contains(script, "row.appendChild("+helper+"(") {
+			t.Errorf("%s is built but never appended to a row; the table loses that column", helper)
+		}
+	}
+	// appendStack must close by appending to the cell and returning that cell:
+	// returning the stack nests a div under tr and drops the column.
+	if !strings.Contains(script, "td.appendChild(stack);\n    return td;") {
+		t.Error("appendStack must append the stack to the cell and return the cell, not the stack")
+	}
+
+	// Every appendStack call site passes plain strings. A pre-built element
+	// would be stringified by the loop into [object HTMLDivElement], which still
+	// renders and still passes a word-count check, so the check is that no call
+	// site constructs its own line element.
+	for _, call := range strings.Split(script, "appendStack(")[1:] {
+		line := call[:min(len(call), 80)]
+		if strings.Contains(line, "text(el(") {
+			t.Errorf("appendStack is handed a built element: %s", strings.TrimSpace(line))
+		}
+	}
+}
+
 // TestManagementPageCarriesOnlyAnUnauthenticatedShellContract asserts the page's
 // own rules, which are what make serving it without authentication safe: every
 // request carries the operator's key, the key lives only in localStorage, and
