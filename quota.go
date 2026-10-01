@@ -118,13 +118,18 @@ func balanceURL(appVersion string) string {
 // Authorization header is the bare Coding Plan JWT: this endpoint does not
 // accept a Bearer prefix, and sending one is answered as though no credential
 // were presented.
-func quotaGet(ctx context.Context, url string, jwt string) ([]byte, int, error) {
+//
+// deviceID must be a well-formed UUID. The endpoint gates on it and answers a
+// request without one with 3001 "parameter error" — a rejection that reads as
+// a malformed query rather than a missing header.
+func quotaGet(ctx context.Context, url string, jwt string, deviceID string) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, 0, err
 	}
 	req.Header.Set("Authorization", jwt)
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set(deviceMidHeader, deviceID)
 	resp, err := quotaHTTPClient.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -210,10 +215,10 @@ func quotaAuthFailure(status int, body []byte) *upstreamFailure {
 // verdict are settled before any field is read; only explicit, well-typed
 // balance evidence produces a verdict. A verdict of unknown always carries a
 // sanitized reason.
-func fetchQuotaEvidence(ctx context.Context, jwt string, appVersion string, now time.Time) quotaEvidence {
+func fetchQuotaEvidence(ctx context.Context, jwt string, appVersion string, deviceID string, now time.Time) quotaEvidence {
 	evidence := quotaEvidence{Verdict: verdictUnknown, SchemaCompatible: true}
 
-	body, status, err := quotaGet(ctx, balanceURL(appVersion), jwt)
+	body, status, err := quotaGet(ctx, balanceURL(appVersion), jwt, deviceID)
 
 	// The credential verdict is concluded before any body field is read: a
 	// rejection of the billing call is a statement about the credential itself,
@@ -837,7 +842,11 @@ type quotaRefreshScope struct {
 	// config so one refresh is decided by the configuration snapshot the
 	// caller was started with.
 	AppVersion string
-	Document   []byte
+	// DeviceID is the identity token the billing endpoint gates on. It is
+	// resolved once per refresh so a credential reports the same device across
+	// restarts instead of appearing as a new install each time.
+	DeviceID string
+	Document []byte
 }
 
 // resolveQuotaScope reads the JWT credential a quota refresh authenticates
@@ -886,7 +895,10 @@ func runQuotaRefresh(ctx context.Context, store AuthStore, scope quotaRefreshSco
 	if scope.JWT == "" {
 		return quotaEvidence{Verdict: verdictUnknown, Reason: "no_jwt_credential"}, errNoJWTForQuota
 	}
-	evidence := fetchQuotaEvidence(ctx, scope.JWT, scope.AppVersion, now)
+	if scope.DeviceID == "" {
+		scope.DeviceID = deviceIdentity(scope.AuthIndex, scope.Document)
+	}
+	evidence := fetchQuotaEvidence(ctx, scope.JWT, scope.AppVersion, scope.DeviceID, now)
 	recordErr := credentialStates.forStore(store).record(ctx, credentialRef{
 		AuthIndex:  scope.AuthIndex,
 		IdentityID: scope.IdentityID,

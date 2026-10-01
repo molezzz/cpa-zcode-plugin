@@ -14,8 +14,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
+// testDeviceID is the device identity balance calls are made with when the
+// test is about something else. The upstream gates the balance endpoint on a
+// well-formed id, so a refresh made without one is rejected as a parameter
+// error before any credential conclusion is drawn.
+const testDeviceID = "11111111-2222-4333-8444-555555555555"
+
 // quotaFixture points the billing base at an httptest server and the auth
-// store at a fake, recording every billing request.
 type quotaFixture struct {
 	t     *testing.T
 	srv   *httptest.Server
@@ -23,6 +28,7 @@ type quotaFixture struct {
 
 	mu            sync.Mutex
 	balanceAuth   []string
+	balanceDevice []string
 	balanceQuery  []string
 	balanceStatus int
 	balanceBody   string
@@ -61,9 +67,20 @@ func (f *quotaFixture) lastAppVersion() string {
 	return f.balanceQuery[len(f.balanceQuery)-1]
 }
 
+// lastDeviceID returns the X-Device-Mid the most recent balance call carried.
+func (f *quotaFixture) lastDeviceID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.balanceDevice) == 0 {
+		return ""
+	}
+	return f.balanceDevice[len(f.balanceDevice)-1]
+}
+
 func (f *quotaFixture) serveBalance(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.balanceAuth = append(f.balanceAuth, r.Header.Get("Authorization"))
+	f.balanceDevice = append(f.balanceDevice, r.Header.Get(deviceMidHeader))
 	f.balanceQuery = append(f.balanceQuery, r.URL.Query().Get("app_version"))
 	status, body := f.balanceStatus, f.balanceBody
 	f.mu.Unlock()
@@ -410,7 +427,7 @@ func TestFetchQuotaEvidenceClassifiesOutcomes(t *testing.T) {
 			fixture.balanceStatus = tc.balanceStatus
 			fixture.balanceBody = tc.balanceBody
 
-			evidence := fetchQuotaEvidence(context.Background(), jwt, defaultConfig().Product.AppVersion, time.Now())
+			evidence := fetchQuotaEvidence(context.Background(), jwt, defaultConfig().Product.AppVersion, testDeviceID, time.Now())
 			if evidence.Verdict != tc.verdict {
 				t.Fatalf("verdict = %q, want %q (%s)", evidence.Verdict, tc.verdict, evidence.Reason)
 			}
@@ -435,7 +452,7 @@ func TestFetchQuotaEvidenceClassifiesOutcomes(t *testing.T) {
 func TestFetchQuotaEvidenceSendsBareJWT(t *testing.T) {
 	fixture := newQuotaFixture(t)
 	fixture.balanceBody = balanceBody(balanceRow("GLM", 10, 1, 9))
-	evidence := fetchQuotaEvidence(context.Background(), "jwt-token-value", defaultConfig().Product.AppVersion, time.Now())
+	evidence := fetchQuotaEvidence(context.Background(), "jwt-token-value", defaultConfig().Product.AppVersion, testDeviceID, time.Now())
 	if evidence.Verdict != verdictAvailable {
 		t.Fatalf("verdict = %q, want available", evidence.Verdict)
 	}
@@ -455,9 +472,224 @@ func TestFetchQuotaEvidenceSendsBareJWT(t *testing.T) {
 func TestFetchQuotaEvidenceDeclaresTheConfiguredAppVersion(t *testing.T) {
 	fixture := newQuotaFixture(t)
 	fixture.balanceBody = balanceBody(balanceRow("GLM", 10, 1, 9))
-	fetchQuotaEvidence(context.Background(), "jwt-token-value", "9.9.9", time.Now())
+	fetchQuotaEvidence(context.Background(), "jwt-token-value", "9.9.9", testDeviceID, time.Now())
 	if got := fixture.lastAppVersion(); got != "9.9.9" {
 		t.Fatalf("app_version = %q, want the configured 9.9.9", got)
+	}
+}
+
+// TestFetchQuotaEvidenceDeclaresTheDeviceIdentity pins that the balance call
+// carries a device identity. The upstream rejects a request without one as
+// 3001 "parameter error" — indistinguishable from a malformed query — which is
+// why this was the whole reason the refresh never produced any evidence.
+func TestFetchQuotaEvidenceDeclaresTheDeviceIdentity(t *testing.T) {
+	fixture := newQuotaFixture(t)
+	fixture.balanceBody = balanceBody(balanceRow("GLM", 10, 1, 9))
+	fetchQuotaEvidence(context.Background(), "jwt-token-value", "3.14.4", testDeviceID, time.Now())
+	if got := fixture.lastDeviceID(); got != testDeviceID {
+		t.Fatalf("%s = %q, want %q", deviceMidHeader, got, testDeviceID)
+	}
+}
+
+// TestDeviceIdentityIsGeneratedOnceAndReused covers the continuity the header
+// exists for: a credential that reported a new id on every refresh would look
+// like a fresh install on each poll instead of one continuing installation.
+func TestDeviceIdentityIsGeneratedOnceAndReused(t *testing.T) {
+	resetDeviceIDCache(t)
+
+	first := deviceIdentity("auth-1", nil)
+	if !isUUID(first) {
+		t.Fatalf("generated id = %q, want a well-formed UUID", first)
+	}
+	if second := deviceIdentity("auth-1", nil); second != first {
+		t.Fatalf("second call = %q, want the same id %q", second, first)
+	}
+	if other := deviceIdentity("auth-2", nil); other == first {
+		t.Fatal("a different credential shared the first credential's device id")
+	}
+}
+
+// TestDeviceIdentityPrefersTheRecordedValue keeps a restart from changing the
+// reported device: an id already in the auth document is authoritative.
+func TestDeviceIdentityPrefersTheRecordedValue(t *testing.T) {
+	resetDeviceIDCache(t)
+	recorded := `{"zcode":{"device_mid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}}`
+	if got := deviceIdentity("auth-1", []byte(recorded)); got != "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" {
+		t.Fatalf("device id = %q, want the recorded value", got)
+	}
+}
+
+// TestRecordDeviceIDPersistsForReuse checks a recorded id reaches the
+// credential document, which is what makes it survive a restart.
+func TestRecordDeviceIDPersistsForReuse(t *testing.T) {
+	resetDeviceIDCache(t)
+	store := &fakeAuthStore{docs: map[string]json.RawMessage{
+		"auth-1": json.RawMessage(`{"type":"zcode","zcode":{"identity_id":"id-1"}}`),
+	}}
+	generated := deviceIdentity("auth-1", nil)
+	if err := recordDeviceID("auth-1", generated, store); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	saved, err := store.Get(context.Background(), "auth-1")
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got := recordedDeviceID(saved); got != generated {
+		t.Fatalf("persisted device id = %q, want %q", got, generated)
+	}
+	// A fresh process reading the stored document must reach the same id.
+	resetDeviceIDCache(t)
+	if got := deviceIdentity("auth-1", saved); got != generated {
+		t.Fatalf("after restart device id = %q, want %q", got, generated)
+	}
+}
+
+// TestDeviceIdentityDoesNotWriteOnTheReadPath keeps a refresh read-only. A
+// quota observation must leave the credential byte-for-byte as it found it, so
+// resolving an identity may not save the document: a second write would be
+// indistinguishable from a credential-state change to everything that watches
+// the store, including the guarantee that unknown evidence writes nothing.
+func TestDeviceIdentityDoesNotWriteOnTheReadPath(t *testing.T) {
+	resetDeviceIDCache(t)
+	store := &fakeAuthStore{docs: map[string]json.RawMessage{
+		"auth-1": json.RawMessage(`{"type":"zcode","zcode":{"identity_id":"id-1"}}`),
+	}}
+	deviceIdentity("auth-1", nil)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.saves) != 0 {
+		t.Fatalf("read path wrote the credential %d times", len(store.saves))
+	}
+}
+
+func resetDeviceIDCache(t *testing.T) {
+	t.Helper()
+	deviceIDMu.Lock()
+	previous := deviceIDCache
+	deviceIDCache = map[string]string{}
+	deviceIDMu.Unlock()
+	t.Cleanup(func() {
+		deviceIDMu.Lock()
+		deviceIDCache = previous
+		deviceIDMu.Unlock()
+	})
+}
+
+// isUUID reports whether the value has the shape the upstream accepts. The
+// endpoint rejects anything else with the same 3001 a missing id produces.
+func isUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i, r := range value {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			if !strings.ContainsRune("0123456789abcdef", r) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// TestFetchQuotaEvidenceReadsTheRealBalancePayload parses a response captured
+// verbatim from the upstream for a Start Plan account: one active plan whose
+// two entitlements each carry a daily token bucket. It is the shape the
+// management page renders, so a field the code failed to read would show up as
+// an empty or unknown quota rather than as a parse error.
+func TestFetchQuotaEvidenceReadsTheRealBalancePayload(t *testing.T) {
+	fixture := newQuotaFixture(t)
+	fixture.balanceBody = realBalancePayload
+	evidence := fetchQuotaEvidence(context.Background(), "jwt-token-value", "3.14.4", testDeviceID, time.Now())
+
+	if !evidence.SchemaCompatible {
+		t.Fatalf("schema incompatible, reason %q", evidence.Reason)
+	}
+	if evidence.Verdict != verdictAvailable {
+		t.Fatalf("verdict = %q, want available (%s)", evidence.Verdict, evidence.Reason)
+	}
+	if len(evidence.Plans) != 1 {
+		t.Fatalf("plans = %d, want 1", len(evidence.Plans))
+	}
+	if got := evidence.Plans[0].Name; got != "ZCode Start Plan" {
+		t.Fatalf("plan name = %q", got)
+	}
+	if got := evidence.Plans[0].Status; got != planStatusActive {
+		t.Fatalf("plan status = %q, want active", got)
+	}
+	if len(evidence.Balances) != 2 {
+		t.Fatalf("balances = %d, want 2 buckets", len(evidence.Balances))
+	}
+
+	byName := map[string]quotaBalance{}
+	for _, balance := range evidence.Balances {
+		if balance.Malformed {
+			t.Fatalf("bucket %q read as malformed", balance.Name)
+		}
+		byName[balance.Name] = balance
+	}
+	glm, ok := byName["GLM-5.3"]
+	if !ok {
+		t.Fatalf("buckets = %v, want a GLM-5.3 bucket", byName)
+	}
+	if glm.Total == nil || *glm.Total != 3000000 {
+		t.Fatalf("GLM-5.3 total = %v, want 3000000", glm.Total)
+	}
+	if glm.Remaining == nil || *glm.Remaining != 3000000 {
+		t.Fatalf("GLM-5.3 remaining = %v, want 3000000", glm.Remaining)
+	}
+	// The capabilities array is the only place the upstream declares which
+	// models the plan covers, and it is read as the authoritative model source.
+	if len(glm.Capabilities) != 1 || glm.Capabilities[0] != "model:glm-5.3" {
+		t.Fatalf("GLM-5.3 capabilities = %v, want [model:glm-5.3]", glm.Capabilities)
+	}
+	if _, ok := byName["GLM-5.3-Flash"]; !ok {
+		t.Fatal("missing the GLM-5.3-Flash bucket")
+	}
+}
+
+// realBalancePayload is a billing/balance success response captured verbatim
+// from the upstream for a Start Plan account, with logid and identity fields
+// left in place so the parser reads exactly what it will read in production.
+const realBalancePayload = `{"code":0,"msg":"","data":{"server_time":1790833679,"plans":[{"user_plan_id":"upl_2105534823644946432","plan_id":"zcode-v3-start-plan-0817","name":"ZCode Start Plan","description":"免费 GLM 旗舰模型体验","priority":90,"status":"active","starts_at":1790833595,"ends_at":1791215999,"entitlements":[{"entitlement_id":"ent_2_0817_glm_5p3","show_name":"GLM-5.3","meter":"model_usage","unit_type":"token","capabilities":["model:glm-5.3"],"grant_units":3000000,"period":"daily","priority":110,"effective_at":0},{"entitlement_id":"ent_2_0817_glm_5p3f","show_name":"GLM-5.3-Flash","meter":"model_usage","unit_type":"token","capabilities":["model:glm-5.3-flash"],"grant_units":5000000,"period":"daily","priority":80,"effective_at":0}]}],"balances":[{"bucket_id":"bucket_2105534823678500864","user_plan_id":"upl_2105534823644946432","plan_id":"zcode-v3-start-plan-0817","entitlement_id":"ent_2_0817_glm_5p3","show_name":"GLM-5.3","meter":"model_usage","unit_type":"token","capabilities":["model:glm-5.3"],"priority":110,"plan_priority":90,"entitlement_priority":110,"total_units":3000000,"used_units":0,"remaining_units":3000000,"available_units":3000000,"period_start":1790784000,"period_end":1790870399,"expires_at":1790870399},{"bucket_id":"bucket_2105534823682695168","user_plan_id":"upl_2105534823644946432","plan_id":"zcode-v3-start-plan-0817","entitlement_id":"ent_2_0817_glm_5p3f","show_name":"GLM-5.3-Flash","meter":"model_usage","unit_type":"token","capabilities":["model:glm-5.3-flash"],"priority":80,"plan_priority":90,"entitlement_priority":80,"total_units":5000000,"used_units":0,"remaining_units":5000000,"available_units":5000000,"period_start":1790784000,"period_end":1790870399,"expires_at":1790870399}]},"logid":"2026100105475959a32e0d7aaa4280f5ed"}`
+
+// TestFetchQuotaEvidenceRejectsTheRealParameterErrorCarrier pins how the
+// upstream actually delivers 3001: on HTTP 400, not inside a 200. A refresh that
+// only recognized the 200 carrier would read this as a transport failure and
+// lose the reason, which is the whole difficulty of this failure — it looks
+// like a parameter complaint, and the parameter it names is not the missing one.
+func TestFetchQuotaEvidenceRejectsTheRealParameterErrorCarrier(t *testing.T) {
+	fixture := newQuotaFixture(t)
+	fixture.balanceStatus = http.StatusBadRequest
+	fixture.balanceBody = `{"code":3001,"msg":"parameter error","logid":"2026100105443300cff798cd2094aba1dd"}`
+	evidence := fetchQuotaEvidence(context.Background(), "jwt-token-value", "3.14.4", testDeviceID, time.Now())
+	if evidence.Verdict != verdictUnknown {
+		t.Fatalf("verdict = %q, want unknown", evidence.Verdict)
+	}
+	if evidence.Reason != "quota_invalid_request" {
+		t.Fatalf("reason = %q, want quota_invalid_request", evidence.Reason)
+	}
+	// The rejection is reported as a reason, but it is a request-level verdict:
+	// it must not be classified as anything that moves the credential, or a
+	// missing device header would read as a dead credential. failureRejected has
+	// no status in the JWT vocabulary, so the update it produces concludes
+	// nothing and the recorded state is left alone.
+	if evidence.AuthFailure == nil {
+		t.Fatal("3001 produced no reported reason")
+	}
+	if evidence.AuthFailure.Class != failureRejected {
+		t.Fatalf("3001 classified as %q, want a request-level rejection", evidence.AuthFailure.Class)
+	}
+	for _, update := range quotaStateUpdates(evidence, time.Now()) {
+		if update.Status != "" {
+			t.Fatalf("3001 concluded credential status %q, want it left untouched", update.Status)
+		}
 	}
 }
 
@@ -467,7 +699,7 @@ func TestFetchQuotaEvidenceDeclaresTheConfiguredAppVersion(t *testing.T) {
 func TestFetchQuotaEvidenceRejectsBusinessFailureOnHTTP200(t *testing.T) {
 	fixture := newQuotaFixture(t)
 	fixture.balanceBody = `{"code":3001,"msg":"parameter error"}`
-	evidence := fetchQuotaEvidence(context.Background(), "jwt-token-value", "3.14.3", time.Now())
+	evidence := fetchQuotaEvidence(context.Background(), "jwt-token-value", "3.14.3", testDeviceID, time.Now())
 	if evidence.Verdict != verdictUnknown {
 		t.Fatalf("verdict = %q, want unknown", evidence.Verdict)
 	}
