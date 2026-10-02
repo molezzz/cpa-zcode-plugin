@@ -20,7 +20,7 @@ func TestPrimaryProfileUsesJWTPrimaryCredential(t *testing.T) {
 	zcodePlanUpstreamBase = "https://upstream.test"
 	t.Cleanup(func() { zcodePlanUpstreamBase = original })
 
-	plan := executionPlan(testAuthDoc("jwt-token-1", jwtStatusActive), testConfig(), "glm-5.2", nil, "", time.Now())
+	plan := executionPlan(testAuthDoc("jwt-token-1", jwtStatusActive), testConfig(), "glm-5.2", nil, requestIdentity{}, time.Now())
 	if plan.Failure != nil {
 		t.Fatalf("executionPlan: %+v", plan.Failure)
 	}
@@ -69,7 +69,7 @@ func TestFallbackProfileUsesManagedAPIKey(t *testing.T) {
 
 	doc := []byte(`{"zcode":{"identity_id":"zcode-user-1","jwt":{"token":"jwt-token-1","status":"` +
 		jwtStatusInvalid + `"},"api_key":{"status":"active","key_material":"key-1.secret"}}}`)
-	plan := executionPlan(doc, testConfig(), "glm-5.2", nil, "", time.Now())
+	plan := executionPlan(doc, testConfig(), "glm-5.2", nil, requestIdentity{}, time.Now())
 	if plan.Failure != nil {
 		t.Fatalf("executionPlan: %+v", plan.Failure)
 	}
@@ -98,14 +98,14 @@ func TestFallbackProfileUsesManagedAPIKey(t *testing.T) {
 
 func TestProfilesAreImmutablePerRequest(t *testing.T) {
 	doc := testAuthDoc("jwt-token-1", "")
-	first := executionPlan(doc, testConfig(), "GLM-5.2", nil, "", time.Now())
+	first := executionPlan(doc, testConfig(), "GLM-5.2", nil, requestIdentity{}, time.Now())
 	if first.Failure != nil {
 		t.Fatalf("executionPlan: %+v", first.Failure)
 	}
 	// Mutating one profile's headers must not affect the next request.
 	first.Primary.Headers.Set("Authorization", "Bearer tampered")
 	first.Primary.Headers.Set("X-Injected", "yes")
-	second := executionPlan(doc, testConfig(), "GLM-5.2", nil, "", time.Now())
+	second := executionPlan(doc, testConfig(), "GLM-5.2", nil, requestIdentity{}, time.Now())
 	if second.Failure != nil {
 		t.Fatalf("executionPlan: %+v", second.Failure)
 	}
@@ -124,7 +124,7 @@ func TestExecutionPlanRejectsMissingCredentials(t *testing.T) {
 		[]byte(`{"zcode":{"identity_id":"x"}}`),
 		[]byte(`not json`),
 	} {
-		if failure := executionPlan(doc, testConfig(), "GLM-5.2", nil, "", time.Now()).Failure; failure == nil {
+		if failure := executionPlan(doc, testConfig(), "GLM-5.2", nil, requestIdentity{}, time.Now()).Failure; failure == nil {
 			t.Fatalf("doc %q: expected an error", doc)
 		} else if failure.Code != "no_credential" || failure.ClientStatus != http.StatusUnauthorized {
 			t.Fatalf("doc %q: failure = %+v", doc, failure)
@@ -157,7 +157,7 @@ func TestExecutionPlanSkipsBlockedCredentialStates(t *testing.T) {
 			if tc.windowed {
 				doc = withRetryWindow(t, doc, time.Now().Add(time.Minute))
 			}
-			failure := executionPlan(doc, testConfig(), "GLM-5.2", nil, "", time.Now()).Failure
+			failure := executionPlan(doc, testConfig(), "GLM-5.2", nil, requestIdentity{}, time.Now()).Failure
 			if failure == nil {
 				t.Fatal("expected a classified failure")
 			}
@@ -176,7 +176,7 @@ func TestExecutionPlanAllowsActiveAndUnknownStatus(t *testing.T) {
 	// Empty status (legacy document) and unknown status strings stay usable:
 	// the upstream verifies the token on every request.
 	for _, status := range []string{"", jwtStatusActive, "some-future-state"} {
-		plan := executionPlan(testAuthDoc("jwt-token-1", status), testConfig(), "GLM-5.2", nil, "", time.Now())
+		plan := executionPlan(testAuthDoc("jwt-token-1", status), testConfig(), "GLM-5.2", nil, requestIdentity{}, time.Now())
 		if plan.Failure != nil {
 			t.Fatalf("status %q: executionPlan: %+v", status, plan.Failure)
 		}
@@ -200,7 +200,7 @@ func TestCallerHeaderAllowlist(t *testing.T) {
 	caller.Set("X-Cpa-Host-Control", "internal")
 	caller.Set("anthropic-beta", "feature-1,feature-2")
 
-	headers := buildUpstreamHeaders(caller, testConfig(), "")
+	headers := buildUpstreamHeaders(caller, testConfig(), requestIdentity{})
 	for _, name := range []string{"X-Api-Key", "Cookie", "Proxy-Authorization", "Host", "Connection", "X-Cpa-Host-Control"} {
 		if got := headers.Get(name); got != "" {
 			t.Errorf("%s forwarded: %q", name, got)
@@ -231,7 +231,7 @@ func TestCallerHeaderAllowlistDeniesByDefault(t *testing.T) {
 	// do not exist yet.
 	caller := http.Header{}
 	caller.Set("X-Future-Host-Header", "value")
-	if headers := buildUpstreamHeaders(caller, testConfig(), ""); headers.Get("X-Future-Host-Header") != "" {
+	if headers := buildUpstreamHeaders(caller, testConfig(), requestIdentity{}); headers.Get("X-Future-Host-Header") != "" {
 		t.Fatal("unknown caller header was forwarded")
 	}
 }

@@ -20,7 +20,7 @@ import (
 
 func TestUpstreamRequestCarriesDeclaredClientFingerprint(t *testing.T) {
 	cfg := normalizeConfig(defaultConfig())
-	headers := buildUpstreamHeaders(nil, cfg, "11111111-2222-4333-8444-555555555555")
+	headers := buildUpstreamHeaders(nil, cfg, requestIdentity{DeviceID: "11111111-2222-4333-8444-555555555555"})
 
 	want := map[string]string{
 		titleHeader:        "Z Code@" + defaultSourceTitle,
@@ -54,21 +54,26 @@ func TestUpstreamRequestCarriesDeclaredClientFingerprint(t *testing.T) {
 	}
 }
 
-func TestRequestAttributionIDsArePresentAndUUIDShaped(t *testing.T) {
+func TestRequestAttributionIDsArePresentAndCorrelated(t *testing.T) {
+	// The official attribution headers express one correlated request event:
+	// request/trace/query share the request's id (the official client allows
+	// the three to be the same value or derived), and the session id is the
+	// caller session's stable value rather than a fresh random one.
+	const session = "aaaaaaaa-bbbb-4333-8444-555555555555"
 	headers := http.Header{}
-	applyRequestAttribution(headers)
+	applyRequestAttribution(headers, session)
 
 	uuidForm := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	seen := map[string]bool{}
-	for _, name := range []string{requestIDHeader, traceIDHeader, queryIDHeader, sessionIDHeader} {
-		value := headers.Get(name)
-		if !uuidForm.MatchString(value) {
-			t.Errorf("%s = %q, want a UUID", name, value)
+	for _, name := range []string{requestIDHeader, traceIDHeader, queryIDHeader} {
+		if !uuidForm.MatchString(headers.Get(name)) {
+			t.Errorf("%s = %q, want a UUID", name, headers.Get(name))
 		}
-		if seen[value] {
-			t.Errorf("%s reuses %q across attribution ids; they must be distinct", name, value)
+		if headers.Get(name) != headers.Get(requestIDHeader) {
+			t.Errorf("%s = %q does not correlate with the request id", name, headers.Get(name))
 		}
-		seen[value] = true
+	}
+	if got := headers.Get(sessionIDHeader); got != session {
+		t.Errorf("%s = %q, want the caller session's stable id", sessionIDHeader, got)
 	}
 }
 
@@ -87,12 +92,18 @@ func TestCallerCannotForgeClientFingerprint(t *testing.T) {
 		caller.Set(name, "attacker-value")
 	}
 
-	headers := buildUpstreamHeaders(caller, normalizeConfig(defaultConfig()), "99999999-8888-4777-8666-555555555555")
+	headers := buildUpstreamHeaders(caller, normalizeConfig(defaultConfig()), requestIdentity{DeviceID: "99999999-8888-4777-8666-555555555555"})
 
-	for _, name := range []string{titleHeader, platformHeader, osCategoryHeader, clientTimezoneHead, sessionTypeHeader, requestIDHeader, traceIDHeader, queryIDHeader, sessionIDHeader} {
+	for _, name := range []string{titleHeader, platformHeader, osCategoryHeader, clientTimezoneHead, sessionTypeHeader, requestIDHeader, traceIDHeader, queryIDHeader} {
 		if got := headers.Get(name); got == "attacker-value" {
 			t.Errorf("%s = %q, want the plugin-declared value", name, got)
 		}
+	}
+	// The identity resolved for this request has no session context, so the
+	// caller's x-session-id is not forwarded either: the session id is
+	// plugin-derived or absent, never caller-supplied.
+	if got := headers.Get(sessionIDHeader); got != "" {
+		t.Errorf("%s = %q, want it omitted rather than the caller's value", sessionIDHeader, got)
 	}
 	if got := headers.Get(deviceMidHeader); got != "99999999-8888-4777-8666-555555555555" {
 		t.Errorf("%s = %q, want the credential's own device identity", deviceMidHeader, got)
@@ -110,7 +121,7 @@ func TestMessagesAndBalanceShareOneDeviceIdentity(t *testing.T) {
 		t.Fatalf("deviceIdentity = %q, want the recorded id", recorded)
 	}
 
-	plan := executionPlan(doc, normalizeConfig(defaultConfig()), "GLM-5.2", nil, recorded, time.Now())
+	plan := executionPlan(doc, normalizeConfig(defaultConfig()), "GLM-5.2", nil, requestIdentity{DeviceID: recorded}, time.Now())
 	if len(plan.Attempts) == 0 {
 		t.Fatal("no credential attempt was planned")
 	}
@@ -124,7 +135,7 @@ func TestMessagesAndBalanceShareOneDeviceIdentity(t *testing.T) {
 func TestEmptyDeviceIdentityOmitsTheHeader(t *testing.T) {
 	// The upstream gates on the header being a well-formed UUID and answers a
 	// blank one as a parameter error, so an absent identity is omitted instead.
-	headers := buildUpstreamHeaders(nil, normalizeConfig(defaultConfig()), "")
+	headers := buildUpstreamHeaders(nil, normalizeConfig(defaultConfig()), requestIdentity{})
 	if got := headers.Get(deviceMidHeader); got != "" {
 		t.Errorf("%s = %q, want it omitted", deviceMidHeader, got)
 	}
@@ -265,7 +276,7 @@ func TestClientFingerprintConfigOverrideIsApplied(t *testing.T) {
 		ReleaseChannel: "beta",
 		SourceTitle:    "cli",
 	})
-	headers := buildUpstreamHeaders(nil, cfg, "")
+	headers := buildUpstreamHeaders(nil, cfg, requestIdentity{})
 	if got := headers.Get(titleHeader); got != "Z Code@cli" {
 		t.Errorf("%s = %q, want the configured surface", titleHeader, got)
 	}

@@ -307,6 +307,85 @@ func TestExecutorExecuteAggregatesUpstreamStream(t *testing.T) {
 	}
 }
 
+func TestExecutorExecuteCarriesOneIdentityInBodyAndHeaders(t *testing.T) {
+	// The official client describes one installation and one session in both
+	// places the upstream reads: the body's metadata.user_id and the
+	// fingerprint/attribution headers. The plugin must present the same
+	// resolved identity in both, keep it stable across the requests of one
+	// caller session, and rotate only the per-request attribution ids.
+	upstream := newUpstreamRecorder(t)
+	overrideHost(t)
+
+	env := callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, testExecutorDoc(), testRequestPayload(), "", nil))
+	if !env.OK {
+		t.Fatalf("execute failed: %+v", env.Error)
+	}
+	if upstream.count() != 1 {
+		t.Fatalf("upstream request count = %d, want 1", upstream.count())
+	}
+
+	deviceID := upstream.lastHeader(deviceMidHeader)
+	if deviceID == "" {
+		t.Fatalf("%s = empty, want the credential's device identity", deviceMidHeader)
+	}
+	firstRequestID := upstream.lastHeader(requestIDHeader)
+	userID := upstreamBodyUserID(t, upstream.requestBodies()[0])
+	if got := userID["device_id"]; got != deviceID {
+		t.Errorf("body device_id = %v, want the header's %q", got, deviceID)
+	}
+	if got, want := userID["account_uuid"], ""; got != want {
+		t.Errorf("account_uuid = %v, want the official empty string", got)
+	}
+	sessionID, ok := userID["session_id"].(string)
+	if !ok || sessionID == "" {
+		t.Fatalf("session_id = %v, want the derived session id", userID["session_id"])
+	}
+	if got := upstream.lastHeader(sessionIDHeader); got != sessionID {
+		t.Errorf("header session %q != body session %q; one request must describe one session", got, sessionID)
+	}
+	if got := upstream.lastHeader(sessionTypeHeader); got != mainSessionType {
+		t.Errorf("%s = %q, want %q", sessionTypeHeader, got, mainSessionType)
+	}
+
+	env = callMethod(t, pluginabi.MethodExecutorExecute, executorRequestJSON(t, testExecutorDoc(), testRequestPayload(), "", nil))
+	if !env.OK {
+		t.Fatalf("second execute failed: %+v", env.Error)
+	}
+	secondUserID := upstreamBodyUserID(t, upstream.requestBodies()[1])
+	if secondUserID["session_id"] != sessionID {
+		t.Errorf("session id drifted across requests: %q then %v", sessionID, secondUserID["session_id"])
+	}
+	if secondUserID["device_id"] != deviceID {
+		t.Errorf("device id drifted: %q then %v", deviceID, secondUserID["device_id"])
+	}
+	if upstream.lastHeader(requestIDHeader) == firstRequestID {
+		t.Error("request attribution id was reused across requests, want a fresh one per request")
+	}
+}
+
+// upstreamBodyUserID extracts the parsed metadata.user_id of one recorded
+// upstream body.
+func upstreamBodyUserID(t *testing.T, body string) map[string]any {
+	t.Helper()
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(body), &sent); err != nil {
+		t.Fatalf("upstream body not JSON: %v", err)
+	}
+	metadata, ok := sent["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("upstream body carries no metadata: %v", sent["metadata"])
+	}
+	raw, ok := metadata["user_id"].(string)
+	if !ok {
+		t.Fatalf("metadata.user_id = %T, want the official stringified JSON form", metadata["user_id"])
+	}
+	var userID map[string]any
+	if err := json.Unmarshal([]byte(raw), &userID); err != nil {
+		t.Fatalf("metadata.user_id is not JSON: %v", err)
+	}
+	return userID
+}
+
 func TestExecutorExecuteOnlyForwardsAllowlistedHeaders(t *testing.T) {
 	upstream := newUpstreamRecorder(t)
 	overrideHost(t)

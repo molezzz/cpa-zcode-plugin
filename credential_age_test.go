@@ -137,7 +137,7 @@ func TestAgedJWTStillGetsItsTurnWithAFallback(t *testing.T) {
 	now := time.Now()
 	old := makeJWTWithClaims(t, map[string]any{"sub": "user-1", "iat": now.Add(-jwtReauthAfter - time.Hour).Unix()})
 	doc := buildPlanDoc(t, old, "key-material-1")
-	plan := executionPlan(doc, normalizeConfig(testConfig()), "GLM-5.2", nil, "", now)
+	plan := executionPlan(doc, normalizeConfig(testConfig()), "GLM-5.2", nil, requestIdentity{}, now)
 	if plan.Failure != nil {
 		t.Fatalf("plan failed: %+v", plan.Failure)
 	}
@@ -166,7 +166,7 @@ func TestFreshJWTIsNotAgedOut(t *testing.T) {
 		t.Error("a JWT issued now must not need re-authorization")
 	}
 	doc := buildPlanDoc(t, fresh, "key-material-1")
-	plan := executionPlan(doc, normalizeConfig(testConfig()), "GLM-5.2", nil, "", now)
+	plan := executionPlan(doc, normalizeConfig(testConfig()), "GLM-5.2", nil, requestIdentity{}, now)
 	if plan.Failure != nil {
 		t.Fatalf("plan failed: %+v", plan.Failure)
 	}

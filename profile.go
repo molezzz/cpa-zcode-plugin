@@ -247,10 +247,12 @@ type ResolvedProfile struct {
 // in x-api-key — stays an open question until an authorized capture proves it,
 // so the profile declares only the bearer form.
 //
-// deviceID is the credential's persisted device identity, sent as the client
-// fingerprint's X-Device-Mid so a Messages request and a balance request for the
-// same account describe one installation.
-func newProfile(snap credentialSnapshot, kind CredentialKind, cfg Config, model string, callerHeaders http.Header, deviceID string) ResolvedProfile {
+// identity is the request's caller-facing identity (device and session); its
+// device id is the credential's persisted device identity, sent as the client
+// fingerprint's X-Device-Mid and, in the same value, as the request body's
+// metadata.user_id, so a Messages request and a balance request for the same
+// account describe one installation.
+func newProfile(snap credentialSnapshot, kind CredentialKind, cfg Config, model string, callerHeaders http.Header, identity requestIdentity) ResolvedProfile {
 	route := resolveRoute(kind)
 	profile := ResolvedProfile{
 		IdentityID:       snap.IdentityID,
@@ -258,7 +260,7 @@ func newProfile(snap credentialSnapshot, kind CredentialKind, cfg Config, model 
 		Route:            route,
 		MessagesURL:      route.URL,
 		ModelID:          normalizeRequestModel(model, cfg.Models),
-		Headers:          buildUpstreamHeaders(callerHeaders, cfg, deviceID),
+		Headers:          buildUpstreamHeaders(callerHeaders, cfg, identity),
 		MaxResponseBytes: cfg.Upstream.MaxResponseBytes,
 		ConnectTimeout:   time.Duration(cfg.Upstream.ConnectTimeoutSeconds) * time.Second,
 		HeaderTimeout:    time.Duration(cfg.Upstream.RequestTimeoutSeconds) * time.Second,
@@ -285,7 +287,7 @@ func newProfile(snap credentialSnapshot, kind CredentialKind, cfg Config, model 
 // credential, so a caller Authorization/x-api-key value can never reach the
 // upstream, and the two credential forms cannot inherit each other's header. The
 // result is a fresh header map; mutating it cannot leak into other profiles.
-func buildUpstreamHeaders(callerHeaders http.Header, cfg Config, deviceID string) http.Header {
+func buildUpstreamHeaders(callerHeaders http.Header, cfg Config, identity requestIdentity) http.Header {
 	headers := http.Header{}
 	for name, values := range callerHeaders {
 		if !callerHeaderAllowed(name) {
@@ -305,7 +307,7 @@ func buildUpstreamHeaders(callerHeaders http.Header, cfg Config, deviceID string
 	headers.Set("X-ZCode-App-Version", appVersion)
 	headers.Set("X-ZCode-Agent", zcodeAgentHeader)
 	headers.Set("HTTP-Referer", zcodeReferer)
-	applyClientFingerprint(headers, cfg, deviceID)
+	applyClientFingerprint(headers, cfg, identity)
 	return headers
 }
 

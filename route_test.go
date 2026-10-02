@@ -63,7 +63,7 @@ func TestNewProfileMatchesItsRoute(t *testing.T) {
 			IdentityID:  "id-1",
 			JWTToken:    "jwt-token-1",
 			APIKeyToken: "key-1.secret",
-		}, tc.kind, normalizeConfig(testConfig()), "GLM-5.2", nil, "")
+		}, tc.kind, normalizeConfig(testConfig()), "GLM-5.2", nil, requestIdentity{})
 		if profile.MessagesURL != profile.Route.URL {
 			t.Errorf("%s: profile url %q does not match its route url %q", tc.kind, profile.MessagesURL, profile.Route.URL)
 		}
@@ -76,7 +76,7 @@ func TestJWTProfileAuthenticatesWithBearerOnly(t *testing.T) {
 	// then the profile declares only the bearer form, and this test pins that
 	// default so it cannot drift silently.
 	snap := credentialSnapshot{IdentityID: "id-1", JWTToken: "jwt-token-1"}
-	profile := newProfile(snap, CredentialJWT, normalizeConfig(testConfig()), "GLM-5.2", nil, "")
+	profile := newProfile(snap, CredentialJWT, normalizeConfig(testConfig()), "GLM-5.2", nil, requestIdentity{})
 	if got := profile.Headers.Get("Authorization"); got != "Bearer jwt-token-1" {
 		t.Errorf("authorization = %q, want the bearer JWT", got)
 	}

@@ -99,14 +99,20 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 	}
 	cfg := currentConfig()
 	tag := diagRequestTag()
-	payload, model, envErr := prepareUpstreamPayload(req.Payload, req.Model, cfg.Models)
+	authIndex := strings.TrimSpace(req.AuthID)
+	// The document is read once and the identity resolved from that same read,
+	// so the payload's metadata.device_id and the profile's X-Device-Mid
+	// header come from one resolution and can never describe two devices.
+	doc := currentAuthDocument(authIndex, req.StorageJSON)
+	identity := requestIdentityFor(authIndex, doc)
+	payload, model, envErr := prepareUpstreamPayload(req.Payload, req.Model, cfg.Models, identity)
 	if envErr != nil {
 		diagf("request tag=%s mode=aggregate rejected: payload could not be prepared", tag)
 		return envErr, nil
 	}
 	diagf("request tag=%s mode=aggregate auth=%s model_in=%q model_out=%q payload=%dB",
 		tag, strings.TrimSpace(req.AuthID), req.Model, model, len(payload))
-	scope, profiles, failure := newExecutionScope(req, cfg, model, tag)
+	scope, profiles, failure := newExecutionScope(req, cfg, model, doc, identity, tag)
 	if failure != nil {
 		diagf("plan tag=%s auth=%s no-credential class=%s code=%s msg=%q",
 			tag, strings.TrimSpace(req.AuthID), failure.Class, failure.Code, failure.Message)
@@ -142,15 +148,16 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 }
 
 // newExecutionScope resolves the credential attempts of one request and the
-// auth record their states belong to. The scope is the only place the
-// credential recorder is wired in, so the attempt loop itself stays free of
-// host handles. It returns a non-nil failure only when no credential at all
-// could be attempted.
-func newExecutionScope(req executorRequestRPC, cfg Config, model string, diagTag string) (executionScope, []ResolvedProfile, *upstreamFailure) {
+// auth record their states belong to. The document and the request identity
+// are resolved once by the entry point and passed in, so the plan, the payload
+// metadata, and the profile headers all consume the same read of the record
+// and the same identity. The scope is the only place the credential recorder
+// is wired in, so the attempt loop itself stays free of host handles. It
+// returns a non-nil failure only when no credential at all could be attempted.
+func newExecutionScope(req executorRequestRPC, cfg Config, model string, doc []byte, identity requestIdentity, diagTag string) (executionScope, []ResolvedProfile, *upstreamFailure) {
 	now := time.Now()
 	authIndex := strings.TrimSpace(req.AuthID)
-	doc := currentAuthDocument(authIndex, req.StorageJSON)
-	plan := executionPlan(doc, cfg, model, req.Headers, deviceIdentity(authIndex, doc), now)
+	plan := executionPlan(doc, cfg, model, req.Headers, identity, now)
 	if plan.Failure != nil {
 		return executionScope{}, nil, plan.Failure
 	}
@@ -222,14 +229,19 @@ func handleExecutorExecuteStream(request []byte) ([]byte, error) {
 	}
 	cfg := currentConfig()
 	tag := diagRequestTag()
-	payload, model, envErr := prepareUpstreamPayload(req.Payload, req.Model, cfg.Models)
+	authIndex := strings.TrimSpace(req.AuthID)
+	// Same single resolution as the aggregate path: one document read, one
+	// identity, shared by the payload metadata and the profile headers.
+	doc := currentAuthDocument(authIndex, req.StorageJSON)
+	identity := requestIdentityFor(authIndex, doc)
+	payload, model, envErr := prepareUpstreamPayload(req.Payload, req.Model, cfg.Models, identity)
 	if envErr != nil {
 		diagf("request tag=%s mode=stream rejected: payload could not be prepared", tag)
 		return envErr, nil
 	}
 	diagf("request tag=%s mode=stream stream_id=%s auth=%s model_in=%q model_out=%q payload=%dB",
 		tag, streamID, strings.TrimSpace(req.AuthID), req.Model, model, len(payload))
-	scope, profiles, failure := newExecutionScope(req, cfg, model, tag)
+	scope, profiles, failure := newExecutionScope(req, cfg, model, doc, identity, tag)
 	if failure != nil {
 		diagf("plan tag=%s auth=%s no-credential class=%s code=%s msg=%q",
 			tag, strings.TrimSpace(req.AuthID), failure.Class, failure.Code, failure.Message)
@@ -283,10 +295,12 @@ func decodeExecutorRequest(request []byte) (executorRequestRPC, []byte) {
 	return req, nil
 }
 
-// prepareUpstreamPayload normalizes the payload's model id and forces
-// upstream streaming: both streaming and non-streaming callers consume the
-// same upstream SSE pump. The failure envelope carries the sanitized reason.
-func prepareUpstreamPayload(payload []byte, model string, catalog []string) ([]byte, string, []byte) {
+// prepareUpstreamPayload normalizes the payload's model id, forces upstream
+// streaming, and injects the request-body identity: both streaming and
+// non-streaming callers consume the same upstream SSE pump, and the official
+// client writes its identity into every Anthropic request body. The failure
+// envelope carries the sanitized reason.
+func prepareUpstreamPayload(payload []byte, model string, catalog []string, identity requestIdentity) ([]byte, string, []byte) {
 	trimmed := bytes.TrimSpace(payload)
 	if len(trimmed) == 0 {
 		return nil, "", errorEnvelope("invalid_request", "request payload is empty", http.StatusBadRequest)
@@ -305,6 +319,7 @@ func prepareUpstreamPayload(payload []byte, model string, catalog []string) ([]b
 		body["model"] = normalizedModel
 	}
 	body["stream"] = true
+	applyRequestMetadata(body, identity)
 	out, err := json.Marshal(body)
 	if err != nil {
 		return nil, "", errorEnvelope("invalid_request", "request payload could not be encoded", http.StatusBadRequest)
@@ -338,15 +353,15 @@ type credentialPlan struct {
 // recorded as unusable is skipped in favour of the key, and a key that is not
 // recorded as usable removes the fallback entirely. Failures are classified and
 // sanitized. now is the clock the recorded retry windows are measured against.
-func executionPlan(doc []byte, cfg Config, model string, callerHeaders http.Header, deviceID string, now time.Time) credentialPlan {
+func executionPlan(doc []byte, cfg Config, model string, callerHeaders http.Header, identity requestIdentity, now time.Time) credentialPlan {
 	snap, err := readCredentialSnapshot(doc)
 	if err != nil {
 		return credentialPlan{Failure: credentialProfileFailure(err)}
 	}
 	cfg = normalizeConfig(cfg)
 
-	primary, primaryErr := primaryProfile(snap, cfg, model, callerHeaders, deviceID, now)
-	fallback, fallbackErr := fallbackProfile(snap, cfg, model, callerHeaders, deviceID, now)
+	primary, primaryErr := primaryProfile(snap, cfg, model, callerHeaders, identity, now)
+	fallback, fallbackErr := fallbackProfile(snap, cfg, model, callerHeaders, identity, now)
 
 	// A JWT past its re-authorization age is still attempted — the upstream may
 	// well accept it, and skipping a possibly-working primary would spend a
@@ -385,26 +400,26 @@ func executionPlan(doc []byte, cfg Config, model string, callerHeaders http.Head
 
 // primaryProfile builds the Coding Plan JWT profile, or the classified failure
 // explaining why this credential may not be attempted.
-func primaryProfile(snap credentialSnapshot, cfg Config, model string, callerHeaders http.Header, deviceID string, now time.Time) (ResolvedProfile, error) {
+func primaryProfile(snap credentialSnapshot, cfg Config, model string, callerHeaders http.Header, identity requestIdentity, now time.Time) (ResolvedProfile, error) {
 	if strings.TrimSpace(snap.JWTToken) == "" {
 		return ResolvedProfile{}, errNoCredential
 	}
 	if !jwtUsable(snap.JWTStatus, snap.JWTRetryAfter, now) {
 		return ResolvedProfile{}, credentialStatusError{Status: snap.JWTStatus}
 	}
-	return newProfile(snap, CredentialJWT, cfg, model, callerHeaders, deviceID), nil
+	return newProfile(snap, CredentialJWT, cfg, model, callerHeaders, identity), nil
 }
 
 // fallbackProfile builds the managed API key profile, or the classified failure
 // explaining why no fallback credential is available.
-func fallbackProfile(snap credentialSnapshot, cfg Config, model string, callerHeaders http.Header, deviceID string, now time.Time) (ResolvedProfile, error) {
+func fallbackProfile(snap credentialSnapshot, cfg Config, model string, callerHeaders http.Header, identity requestIdentity, now time.Time) (ResolvedProfile, error) {
 	if strings.TrimSpace(snap.APIKeyToken) == "" {
 		return ResolvedProfile{}, credentialStatusError{Status: apiKeyStatusUnavailable}
 	}
 	if !apiKeyUsable(snap.APIKeyStatus, snap.APIKeyRetryAfter, now) {
 		return ResolvedProfile{}, credentialStatusError{Status: snap.APIKeyStatus}
 	}
-	return newProfile(snap, CredentialAPIKey, cfg, model, callerHeaders, deviceID), nil
+	return newProfile(snap, CredentialAPIKey, cfg, model, callerHeaders, identity), nil
 }
 
 // credentialProfileFailure maps profile construction errors onto sanitized,

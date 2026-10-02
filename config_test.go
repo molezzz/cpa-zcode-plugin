@@ -197,7 +197,7 @@ func TestProductAppVersionReachesEveryRequestHeader(t *testing.T) {
 	cfg := normalizeConfig(defaultConfig())
 	cfg.Product.AppVersion = "9.9.9"
 	profile := newProfile(credentialSnapshot{IdentityID: "id", JWTToken: "jwt"},
-		CredentialJWT, cfg, "GLM-5.2", nil, "")
+		CredentialJWT, cfg, "GLM-5.2", nil, requestIdentity{})
 	if got := profile.Headers.Get("User-Agent"); got != "ZCode/9.9.9" {
 		t.Errorf("user agent = %q", got)
 	}

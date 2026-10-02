@@ -247,8 +247,10 @@ func buildDiscoveryTarget(kind CredentialKind, snap credentialSnapshot, cfg Conf
 		return discoveryTarget{}, false
 	}
 	// The same product header set as the environment's Messages profile,
-	// except discovery is a plain JSON GET rather than an SSE stream.
-	headers := buildUpstreamHeaders(nil, cfg, deviceID)
+	// except discovery is a plain JSON GET rather than an SSE stream. A
+	// discovery request serves no caller conversation, so its identity holds
+	// only the device id and no session.
+	headers := buildUpstreamHeaders(nil, cfg, requestIdentity{DeviceID: deviceID})
 	headers.Set("Accept", "application/json")
 	env.authenticate(headers, material)
 	return discoveryTarget{

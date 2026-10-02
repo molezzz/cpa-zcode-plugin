@@ -9,9 +9,11 @@ import (
 
 // The official ZCode client describes itself to the upstream on every model
 // request: platform, OS, locale, timezone, release channel, surface title,
-// device identity, and per-request attribution ids (docs/ZCode
-// packages/shared/src/zcode-source-headers.ts and
-// packages/services/src/providers/sourceHeaders.ts). The upstream admits a
+// device identity, a request-body identity, and attribution ids that tie a
+// request to its caller session (docs/ZCode
+// packages/shared/src/zcode-source-headers.ts,
+// packages/services/src/providers/sourceHeaders.ts,
+// adapters/src/model/anthropic-request-metadata.ts). The upstream admits a
 // Coding Plan request to a resource package partly by the client identity the
 // request carries, and business code 1113 ("Insufficient balance or no
 // resource package") is what a request that authenticated but matched no
@@ -136,11 +138,11 @@ func officialArchName(goarch string) string {
 // applyClientFingerprint sets the declared client identity on one upstream
 // request.
 //
-// deviceID is the same device identity the billing endpoint already accepts for
-// this credential, so the Messages request and the balance request describe one
-// installation. An empty deviceID omits the header rather than sending it
-// blank: the upstream gates on it being a well-formed UUID.
-func applyClientFingerprint(headers http.Header, cfg Config, deviceID string) {
+// identity.DeviceID is the same device identity the billing endpoint already
+// accepts for this credential, so the Messages request and the balance request
+// describe one installation. An empty device id omits the header rather than
+// sending it blank: the upstream gates on it being a well-formed UUID.
+func applyClientFingerprint(headers http.Header, cfg Config, identity requestIdentity) {
 	client := normalizedClientConfig(cfg.Client)
 	headers.Set(titleHeader, clientTitleTemplate+client.SourceTitle)
 	headers.Set(platformHeader, client.Platform+"-"+officialArchName(runtime.GOARCH))
@@ -153,24 +155,33 @@ func applyClientFingerprint(headers http.Header, cfg Config, deviceID string) {
 	headers.Set(clientLanguageHead, client.Language)
 	headers.Set(clientTimezoneHead, client.Timezone)
 	headers.Set(releaseChannelHead, client.ReleaseChannel)
-	if id := strings.TrimSpace(deviceID); id != "" {
+	if id := strings.TrimSpace(identity.DeviceID); id != "" {
 		headers.Set(deviceMidHeader, id)
 	}
-	applyRequestAttribution(headers)
+	applyRequestAttribution(headers, identity.SessionID)
 }
 
-// applyRequestAttribution sets the per-request ids the Coding Plan service
-// reads to attribute a model request to a session and a trace (source-confirmed
-// header names and session-type vocabulary in the official client's
-// runner-attribution). The official client derives them from its own session
-// context; this plugin holds no session state, so it generates a fresh
-// correlated set per request. They are observability fields only — no
-// entitlement decision reads them.
-func applyRequestAttribution(headers http.Header) {
-	headers.Set(requestIDHeader, attributionID())
-	headers.Set(traceIDHeader, attributionID())
-	headers.Set(queryIDHeader, attributionID())
-	headers.Set(sessionIDHeader, attributionID())
+// applyRequestAttribution sets the ids the Coding Plan service reads to
+// attribute a model request to a session and a trace (source-confirmed header
+// names and session-type vocabulary in the official client's
+// runner-attribution). The official ids come from its trace context: the
+// session id is stable across the requests of one caller session, and the
+// trace spans the request's life. This plugin holds no per-conversation
+// session state, so the session id is derived from the caller's stable context
+// (requestSessionID) and one per-request id is shared across
+// request/trace/query — the official headers allow those to be the same value
+// or derived, and one shared value is what expresses that a request is one
+// correlated event. A request without session context omits the session
+// header, exactly as the official client does. They are observability fields
+// only — no entitlement decision reads them.
+func applyRequestAttribution(headers http.Header, sessionID string) {
+	request := attributionID()
+	headers.Set(requestIDHeader, request)
+	headers.Set(traceIDHeader, request)
+	headers.Set(queryIDHeader, request)
+	if sessionID != "" {
+		headers.Set(sessionIDHeader, sessionID)
+	}
 	// This plugin serves top-level agent traffic only, so every request is
 	// main-session traffic; the upstream reads the header to tell a subagent's
 	// request from the main loop's.

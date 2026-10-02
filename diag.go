@@ -54,10 +54,13 @@ const diagValueLimit = 120
 // itself or the caller allowlists; every other header — authentication,
 // cookies, anything added by future host versions — prints as redacted.
 //
-// X-Device-Mid is deliberately absent: the device identity is the account's
-// installation token, and debug lines are evidence, not identity leakage. The
-// per-request attribution ids are present on purpose — they are the plugin's
-// own request/trace/session correlation ids and part of the evidence.
+// X-Device-Mid and X-Session-Id are deliberately absent: the device identity
+// is the account's installation token, and the session id — stable across a
+// caller session's requests since the request-body identity work — is a
+// durable correlation of the same kind, so printing its value would put a
+// lasting identity tie into the logs. The per-request attribution ids stay on
+// the list on purpose: they live exactly one request and are part of the
+// evidence.
 var diagSafeHeaderNames = map[string]struct{}{
 	"Accept":               {},
 	"Content-Type":         {},
@@ -77,7 +80,6 @@ var diagSafeHeaderNames = map[string]struct{}{
 	"X-Request-Id":         {},
 	"X-Zcode-Trace-Id":     {},
 	"X-Query-Id":           {},
-	"X-Session-Id":         {},
 	"X-Zcode-Session-Type": {},
 }
 

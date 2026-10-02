@@ -62,6 +62,8 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
 - [ ] 用流式客户端(Claude Code 等发 Anthropic 格式请求的客户端)发起请求,JWT 主凭证生效,增量输出正常。
 - [ ] 用非流式客户端发起同一请求,输出完整、无重复、无截断。
 - [ ] 客户端自带的 `Authorization` / `x-api-key` / `Cookie` 不会出现在上游请求中(宿主日志或抓包确认上游只收到插件构造的凭证)。
+- [ ] 上游请求体携带 `metadata.user_id`,且形态与官方客户端一致(证据等级:**源码/单元测试已确认** + 抓包比对见 1.10):字符串化 JSON `{"device_id":...,"account_uuid":"","session_id":...}`,其中 `device_id` 与同一请求的 `X-Device-Mid` 头同值(同一来源解析),`account_uuid` 为空串(官方即此形态),`session_id` 为按 auth 记录派生的稳定 UUID——同一调用方会话的多轮请求 `session_id` 不变,不同账号不同;无设备身份时整个字段省略而非发空值。调用方自带的 `metadata.user_id` 被替换为插件声明的身份,无关的 caller `metadata` 键保留。
+- [ ] 归因头可关联(证据等级:**源码/单元测试已确认** + 抓包比对见 1.10):`x-request-id` / `x-zcode-trace-id` / `x-query-id` 同一请求内同值(官方允许同值或派生),跨请求换新;`x-session-id` 跨请求稳定(与 body `session_id` 同值),无会话上下文时省略;`x-zcode-session-type` 维持 `main`。
 
 ### 1.6 验证受阻回退(无 CAPTCHA 自动化)
 
@@ -75,7 +77,7 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
   - JWT 状态**不**变为 `invalid`/`exhausted`,API Key 状态也**不**变——`3012` 在官方遥测归因中是请求级 `invalid_request`,成因未被官方源码或抓包证实,不是凭证失效;
   - 请求**不**回退到受管 API Key:两条路径的计费/权益域不同,请求级拒绝不得因"可重试"就静默跨域消耗 API Key 余额(带 captcha/verify 证据的 403 回退不受影响);
   - 错误消息包含上游自己的 `msg` 与业务码,而不是一句 `upstream rejected the request (http 405)`;
-  - 开启 `debug` 后,日志按请求记录 route、计费域、凭证种类、上游状态、业务码、有界 `msg`、`logid` 与回退决策;日志中不出现 token、API Key、Cookie、prompt、原始请求/响应 body 或设备 ID(仅 request/trace/session 归因 ID 与脱敏头部)。
+  - 开启 `debug` 后,日志按请求记录 route、计费域、凭证种类、上游状态、业务码、有界 `msg`、`logid` 与回退决策;日志中不出现 token、API Key、Cookie、prompt、原始请求/响应 body、设备 ID 或会话 ID(`X-Session-Id` 的值自请求身份稳定后与 `X-Device-Mid` 一样只打印脱敏标记,仅 request/trace/query 归因 ID 打印值)。
 
 ### 1.7 模型与额度
 
@@ -109,6 +111,25 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
 - [ ] 在每个目标平台上,用发布压缩包(经 `SHA256SUMS` 校验)按 `docs/install.md` 安装,宿主成功加载并注册。
   自动化冒烟的覆盖面:CI 在 Ubuntu 原生执行加载/注册冒烟;release 工作流在 linux/amd64 与 darwin/arm64 原生冒烟。windows/amd64 与 darwin/amd64 产物未做自动化加载冒烟,依赖本项的人工宿主加载验证。
 - [ ] 按 `docs/install.md` 第 4 节完成一次升级与一次回滚演练。
+
+### 1.10 请求身份与归因差分抓包(#15 后续,证据等级:**需授权真实环境抓包**)
+
+用现有 openai_reg mitmproxy 链路,在隔离身份上分别抓官方 CLI 与本插件同一场景的
+`POST /api/v1/zcode-plan/anthropic/v1/messages` 出站请求,逐头逐 body 比对以下项目。比对
+结论按证据等级回填到对应文档;**不得**在抓包前把任何一条写成默认协议承诺。
+
+- [ ] body `metadata` 形态:官方 `metadata.user_id` 是否确为字符串化 JSON,字段序与取值
+  (`device_id` / `account_uuid` / `session_id`)与插件注入的是否一致;官方无会话上下文的请求
+  (如有)`session_id` 是省略还是空串。
+- [ ] 四个归因头的关系:官方同一会话多轮请求间 `x-session-id` 是否稳定、`x-zcode-trace-id`
+  是随请求还是随会话、`x-request-id` / `x-query-id` 与 trace 的同值/派生关系,插件"同请求内
+  同值、session 稳定"的形态是否需要修正。
+- [ ] 双头鉴权形态:官方是否同时携带 `x-api-key` 与 `Authorization: Bearer`(官方源码
+  `model-execution.ts` 的 `withAnthropicAuthorizationHeader` 注释声称网关同时读取两者)。
+  **抓包证实前,插件维持仅 `Authorization: Bearer`;证实后另行决定是否将 `x-api-key` 双头
+  纳入默认协议**(沿用 #14 的 route resolver 与验证门槛)。
+- [ ] 若插件补齐请求构造后仍被 `3012` 拒绝:对比请求被拒前后所有可观测差异,只记录差异本身,
+  不推断成因——`3012` 的风控语义维持 #14 的结论纪律。
 
 ## 2. 记录与脱敏要求
 
