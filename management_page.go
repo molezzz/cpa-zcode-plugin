@@ -13,9 +13,16 @@ package main
 // no accounts rendered and stays that way until a key is entered.
 //
 // Operator-facing copy is Chinese; protocol identifiers (action names, JSON
-// field names, the localStorage key) stay verbatim in English because they are
+// field names, the localStorage keys) stay verbatim in English because they are
 // the wire contract, and a translated action name would be rejected by the
 // route.
+//
+// Layout follows the workbuddy-cliproxy-plus management page: dark surfaces,
+// one card per account on a responsive grid, a remaining-quota progress bar per
+// bucket, and a status message line instead of a JSON dump area. There is no
+// auto-refresh timer: the page paints a cached snapshot (kept in localStorage)
+// with actions disabled, then revalidates once against the live state, and
+// every later reload is operator-initiated.
 //
 // Asynchronous responses guard on a generation counter so a slow older reply
 // can never overwrite newer state, and action buttons disable themselves while
@@ -28,21 +35,19 @@ const managementPageHTML = `<!DOCTYPE html>
 <title>ZCode 管理</title>
 <style>
   :root {
-    color-scheme: light;
-    --bg: #f4f5f7;
-    --surface: #ffffff;
-    --surface-sunken: #fafbfc;
-    --border: #e3e6ea;
-    --border-strong: #d0d5dd;
-    --text: #1a1d21;
-    --text-muted: #667085;
-    --accent: #2f6feb;
-    --ok: #067647;
-    --ok-bg: #ecfdf3;
-    --warn: #b54708;
-    --warn-bg: #fffaeb;
-    --bad: #b42318;
-    --bad-bg: #fef3f2;
+    color-scheme: dark;
+    --bg: #0a0a0d;
+    --surface: #17171a;
+    --surface-raised: #09090b;
+    --border: #303034;
+    --text: #dedfe0;
+    --text-muted: #a1a1aa;
+    --primary: #c8ff00;
+    --primary-press: #d9ff57;
+    --ok: #00bf6f;
+    --warn: #ffc41f;
+    --bad: #ff2d55;
+    --info: #fcfcfe;
     --radius: 10px;
   }
   * { box-sizing: border-box; }
@@ -52,11 +57,15 @@ const managementPageHTML = `<!DOCTYPE html>
     font: 14px/1.6 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
   }
   .page { max-width: 1180px; margin: 0 auto; }
-  h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.01em; }
+  h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.01em; color: var(--primary); }
   h2 { margin: 0; font-size: 15px; font-weight: 600; }
-  .subtitle { margin: 6px 0 20px; color: var(--text-muted); font-size: 13px; }
-  .muted { color: var(--text-muted); }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .subtitle { margin: 6px 0 4px; color: var(--text-muted); font-size: 13px; }
+
+  /* One status line for everything the operator must read now: results,
+     failures, and the snapshot notice all land here with a severity class. */
+  #message { min-height: 1.5rem; margin: 8px 0 16px; font-size: 13px; color: var(--ok); }
+  #message.error { color: var(--bad); }
+  #message.pending { color: var(--text-muted); }
 
   .card {
     background: var(--surface); border: 1px solid var(--border);
@@ -64,21 +73,18 @@ const managementPageHTML = `<!DOCTYPE html>
   }
   .card-head {
     display: flex; align-items: center; justify-content: space-between; gap: 12px;
-    padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--surface-sunken);
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
   }
   .card-head .count { color: var(--text-muted); font-size: 12px; font-weight: 400; }
-  .card-body { padding: 0; }
   .card-body.padded { padding: 16px; }
 
   table { border-collapse: collapse; width: 100%; }
   th {
     text-align: left; font-size: 12px; font-weight: 600; color: var(--text-muted);
-    padding: 9px 16px; background: var(--surface-sunken);
-    border-bottom: 1px solid var(--border); white-space: nowrap;
+    padding: 9px 16px; border-bottom: 1px solid var(--border); white-space: nowrap;
   }
   td { padding: 11px 16px; border-bottom: 1px solid var(--border); vertical-align: top; font-size: 13px; }
   tbody tr:last-child td { border-bottom: none; }
-  tbody tr:hover { background: #fcfcfd; }
   .empty { padding: 28px 16px; text-align: center; color: var(--text-muted); font-size: 13px; }
 
   /* Status pills carry the verdict as text, not only as colour, so the state
@@ -86,11 +92,11 @@ const managementPageHTML = `<!DOCTYPE html>
   .pill {
     display: inline-block; padding: 2px 9px; border-radius: 999px;
     font-size: 12px; font-weight: 600; line-height: 1.7; white-space: nowrap;
-    background: #f2f4f7; color: var(--text-muted); border: 1px solid transparent;
+    background: #26262b; color: var(--text-muted); border: 1px solid transparent;
   }
-  .pill-ok { background: var(--ok-bg); color: var(--ok); }
-  .pill-warn { background: var(--warn-bg); color: var(--warn); }
-  .pill-bad { background: var(--bad-bg); color: var(--bad); }
+  .pill-ok { background: rgba(0,191,111,.12); color: var(--ok); border-color: rgba(0,191,111,.45); }
+  .pill-warn { background: rgba(255,196,31,.1); color: var(--warn); border-color: rgba(255,196,31,.45); }
+  .pill-bad { background: rgba(255,45,85,.12); color: var(--bad); border-color: rgba(255,45,85,.45); }
 
   .stack { display: flex; flex-direction: column; gap: 3px; }
   .sub { font-size: 12px; color: var(--text-muted); }
@@ -98,40 +104,79 @@ const managementPageHTML = `<!DOCTYPE html>
 
   button {
     font: inherit; font-size: 12px; cursor: pointer; border-radius: 7px;
-    border: 1px solid var(--border-strong); background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); background: var(--surface-raised); color: var(--text);
     padding: 5px 11px; transition: background .12s, border-color .12s;
   }
-  button:hover:not(:disabled) { background: var(--surface-sunken); border-color: #b9c0ca; }
+  button:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
   button:disabled { opacity: .45; cursor: default; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.primary:hover:not(:disabled) { background: #2559c4; border-color: #2559c4; }
+  button.primary { background: var(--primary); border-color: var(--primary); color: #0a0a0d; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: var(--primary-press); border-color: var(--primary-press); color: #0a0a0d; }
+  button.loading { opacity: .8; cursor: progress; }
+  button.loading::before {
+    content: ""; display: inline-block; width: .65em; height: .65em; margin-right: .35rem;
+    border: .125em solid currentColor; border-right-color: transparent; border-radius: 50%;
+    vertical-align: .05em; animation: button-spin .7s linear infinite;
+  }
+  @keyframes button-spin { to { transform: rotate(360deg); } }
 
   input {
     font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 7px;
-    border: 1px solid var(--border-strong); background: var(--surface); color: var(--text); min-width: 260px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text); min-width: 260px;
   }
-  input:focus { outline: 2px solid #bfd3f7; outline-offset: 1px; border-color: var(--accent); }
+  input:focus { outline: none; border-color: var(--primary); }
 
-  #error:not(:empty) {
-    margin-bottom: 16px; padding: 10px 14px; border-radius: var(--radius);
-    background: var(--bad-bg); color: var(--bad); border: 1px solid #fbd5d2; font-size: 13px;
+  details.raw {
+    margin-top: 12px; border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface); padding: 10px 14px;
   }
-  #result:not(:empty) {
-    margin-top: 16px; padding: 14px 16px; border-radius: var(--radius);
-    background: var(--surface); border: 1px solid var(--border);
-    font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
-    white-space: pre-wrap; overflow-wrap: anywhere;
+  details.raw summary { cursor: pointer; color: var(--text-muted); font-size: 12px; }
+  details.raw pre {
+    margin: 10px 0 0; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text);
   }
   .link-cell { margin-top: 10px; }
-  .link-cell a { color: var(--accent); }
+  .link-cell a { color: var(--primary); }
 
-  .empty-hint { color: var(--text-muted); font-size: 13px; padding: 4px 0; }
+  /* Account cards: one card per account on a responsive grid, replacing the
+     wide one-row-per-account table that forced horizontal scanning. */
+  #accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr)); gap: .75rem; }
+  .account {
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--surface); padding: 14px; min-width: 0;
+  }
+  .account h2 { font-size: 14px; color: var(--info); overflow-wrap: anywhere; }
+  .account .identity { font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-muted); overflow-wrap: anywhere; }
+  .account .unreadable { margin-top: 8px; }
+
+  /* Quota bucket: a "remaining" bar coloured by share, with the full bucket
+     evidence kept as text below it. The bar is drawn only when the plugin
+     already computed remaining_fraction; an unread share is never drawn. */
+  .bucket { margin: 10px 0 0; }
+  .bucket-head {
+    display: flex; justify-content: space-between; gap: 8px;
+    font-size: 12px; color: var(--text-muted);
+  }
+  .bucket-head .bucket-name { color: var(--text); overflow-wrap: anywhere; }
+  .bar { height: .5rem; margin-top: .3rem; border-radius: 999px; background: #26262b; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 999px; background: var(--primary); transition: width .3s ease; }
+  .bar-fill.warn { background: var(--warn); }
+  .bar-fill.danger { background: var(--bad); }
+  .bucket-lines { margin-top: 4px; font-size: 12px; color: var(--text-muted); line-height: 1.55; }
+
+  dl.facts {
+    display: grid; grid-template-columns: max-content minmax(0, 1fr);
+    gap: 4px 12px; margin: 12px 0 0; font-size: 12.5px;
+  }
+  dl.facts dt { color: var(--text-muted); white-space: nowrap; }
+  dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
 <div class="page">
 <h1>ZCode 管理</h1>
 <p class="subtitle">上游身份、凭证与额度的脱敏运行状态。密钥、授权参数、上游响应原文与用户 prompt 永不展示。</p>
+
+<div id="message" role="status" aria-live="polite"></div>
 
 <div class="card">
   <div class="card-head">
@@ -144,36 +189,29 @@ const managementPageHTML = `<!DOCTYPE html>
         <input id="management-key" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴管理密钥">
         <button id="save-key" class="primary" type="button">保存</button>
         <button id="clear-key" type="button">清除</button>
-        <button id="key-show" type="button" hidden>更换密钥</button>
       </div>
       <p class="sub" style="margin:10px 0 0">
         本页只是静态外壳：下方所有账号、额度与凭证状态都用这里填入的密钥取回。密钥只保存在本浏览器的
         localStorage，以 Bearer 方式发送，一旦请求被拒绝即从本地删除。
       </p>
     </div>
+    <button id="key-show" type="button" hidden>🔑 管理密钥已保存，点击可重新设定</button>
   </div>
 </div>
-
-<div id="error" role="alert"></div>
 
 <div class="card">
   <div class="card-head">
     <h2>账号</h2>
     <div class="actions">
       <span id="accounts-count" class="count"></span>
-      <button id="batch-refresh" class="primary" type="button">刷新全部账号</button>
+      <button id="reload-state" class="primary" type="button">刷新状态</button>
+      <button id="batch-refresh" type="button">刷新全部账号</button>
     </div>
   </div>
-  <div class="card-body">
-    <table>
-      <thead>
-        <tr><th>账号</th><th>上游身份</th><th>JWT(主凭证)</th><th>API Key(回退)</th><th>OAuth</th><th>额度</th><th>操作</th></tr>
-      </thead>
-      <tbody id="accounts"></tbody>
-    </table>
+  <div class="card-body padded">
+    <div id="accounts"></div>
   </div>
 </div>
-
 
 <div class="card">
   <div class="card-head">
@@ -201,7 +239,10 @@ const managementPageHTML = `<!DOCTYPE html>
   </div>
 </div>
 
-<div id="result"></div>
+<details id="raw" class="raw" hidden>
+  <summary>最近一次操作结果(原始 JSON)</summary>
+  <pre id="raw-body"></pre>
+</details>
 
 <script>
 "use strict";
@@ -209,17 +250,23 @@ const managementPageHTML = `<!DOCTYPE html>
   var STATE_URL = "/v0/management/zcode/state";
   var ACTION_URL = "/v0/management/zcode/action";
   var KEY_STORAGE = "zcode_management_key";
+  var STATE_CACHE = "zcode_state_cache";
   var generation = 0;      // bumped per state fetch; stale replies are dropped
-  var busy = 0;            // in-flight action count for global batch guard
 
   var keyInput = document.getElementById("management-key");
   var keyFields = document.getElementById("key-fields");
   var keyState = document.getElementById("key-state");
+  var keyShow = document.getElementById("key-show");
+  var message = document.getElementById("message");
+  var rawDetails = document.getElementById("raw");
+  var rawBody = document.getElementById("raw-body");
 
   // localStorage is the only store the key may live in: sessionStorage dies
   // with the tab and a cookie would ride along on every host request. Each
   // access is guarded because a blocked or full store is an ordinary browser
-  // state, not an error worth breaking the page over.
+  // state, not an error worth breaking the page over. The state snapshot is an
+  // acceleration layer with the same guards: if it cannot be read or written,
+  // the page falls back to the network path without complaint.
   function storedKey() {
     try {
       return window.localStorage.getItem(KEY_STORAGE) || "";
@@ -246,34 +293,70 @@ const managementPageHTML = `<!DOCTYPE html>
     }
   }
 
+  function readCache() {
+    try {
+      var parsed = JSON.parse(window.localStorage.getItem(STATE_CACHE) || "null");
+      return parsed && Array.isArray(parsed.accounts) ? parsed : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function writeCache(data) {
+    if (!data || !Array.isArray(data.accounts)) { return false; }
+    try {
+      window.localStorage.setItem(STATE_CACHE, JSON.stringify({ saved_at: Date.now(), data: data }));
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function clearStateCache() {
+    try {
+      window.localStorage.removeItem(STATE_CACHE);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function show(text_, kind) {
+    message.textContent = text_;
+    message.className = kind || "";
+  }
+
+  // A saved key collapses the input row to one explicit re-entry button, so
+  // the credential is not left sitting on screen while the operator reads
+  // status — and re-setting it stays discoverable instead of hidden behind a
+  // tiny secondary control.
+  function showKeyPanel(collapsed) {
+    keyFields.hidden = collapsed;
+    keyShow.hidden = !collapsed;
+    text(keyState, collapsed ? "已保存在本浏览器" : "");
+  }
+
   // forgetKey drops a key that the host rejected or that the operator asked to
   // drop. Rendering is cleared with it: leaving the previous accounts on screen
   // after the key is gone would keep showing data the page can no longer
   // re-fetch or prove is still authorized.
-  function forgetKey(message) {
+  function forgetKey(text_, kind) {
     clearStoredKey();
+    clearStateCache();
     generation += 1;
     keyInput.value = "";
-    clearTables();
-    text(document.getElementById("result"), "");
+    renderEmpty();
+    hideRaw();
     showKeyPanel(false);
     keyInput.focus();
-    if (message) { showError(message); }
-  }
-
-  // A saved key collapses the input row to a single confirmation line, so the
-  // credential is not left sitting on screen while the operator reads status.
-  function showKeyPanel(collapsed) {
-    keyFields.hidden = collapsed;
-    document.getElementById("key-show").hidden = !collapsed;
-    text(keyState, collapsed ? "已保存在本浏览器" : "");
+    if (text_) { show(text_, kind); }
   }
 
   // apiFetch is the page's only network entry point. Refusing to send without a
   // key is the point: the shell answers every visitor, and the data behind it
   // must not be requested at all until an operator supplies the key. A 401
   // means the stored key is wrong or revoked, so it is discarded rather than
-  // retried — a wrong key would otherwise be replayed on every timer tick.
+  // retried — the page has no timer that would replay it anyway.
   function apiFetch(url, method, body) {
     var key = storedKey();
     if (!key) {
@@ -289,7 +372,7 @@ const managementPageHTML = `<!DOCTYPE html>
       body: body === undefined ? undefined : JSON.stringify(body)
     }).then(function (reply) {
       if (reply.status === 401) {
-        forgetKey("管理密钥缺失或无效，请重新填写。");
+        forgetKey("管理密钥缺失或无效，请重新填写。", "error");
         return Promise.reject(new Error("unauthorized"));
       }
       return reply.json().catch(function () {
@@ -300,8 +383,6 @@ const managementPageHTML = `<!DOCTYPE html>
     });
   }
 
-  // describeFailure keeps the message an operator sees about a request that
-  // never reached the host, as opposed to one the host answered and refused.
   function describeFailure(failure) {
     if (failure && failure.message === "unauthorized") { return ""; }
     return failure && failure.message ? failure.message : "请求未能发出";
@@ -325,12 +406,15 @@ const managementPageHTML = `<!DOCTYPE html>
     return td;
   }
 
-  function show(message) {
-    text(document.getElementById("result"), message);
+  function hideRaw() {
+    rawDetails.hidden = true;
+    text(rawBody, "");
   }
 
-  function showError(message) {
-    text(document.getElementById("error"), message);
+  function showRaw(label, data) {
+    text(rawDetails.querySelector("summary"), "最近一次操作结果(原始 JSON)" + (label ? " · " + label : ""));
+    text(rawBody, JSON.stringify(data, null, 2));
+    rawDetails.hidden = false;
   }
 
   // The wire vocabulary is English; only the reading an operator acts on is
@@ -360,81 +444,43 @@ const managementPageHTML = `<!DOCTYPE html>
     return span;
   }
 
-  // appendPill writes a verdict plus optional secondary lines into one cell, so
-  // a credential's state, its error code and its age read as one fact rather
-  // than as three unrelated fragments. It returns the cell so a caller can
-  // append it to the row; the caller must do that itself, because appending the
-  // stack instead would put a div directly under tr.
-  function appendStack(td, pill, lines) {
+  // appendStack writes a verdict plus optional secondary lines into one block,
+  // so a credential's state, its error code and its age read as one fact rather
+  // than as three unrelated fragments. It returns the block so a caller can
+  // append it where it belongs.
+  function appendStack(container, pill, lines) {
     var stack = el("div", "stack");
     stack.appendChild(pill);
     (lines || []).forEach(function (line) {
       if (line) { stack.appendChild(text(el("div", "sub"), line)); }
     });
-    td.appendChild(stack);
-    return td;
+    container.appendChild(stack);
+    return container;
   }
 
-  function jwtCell(jwt) {
-    var td = el("td");
-    if (!jwt) { td.appendChild(statusSpan("未记录", "")); return td; }
+  function jwtLines(jwt) {
     var lines = [];
+    if (!jwt) { return lines; }
     if (jwt.last_error_code) { lines.push("错误码 " + jwt.last_error_code); }
     if (jwt.retry_after) { lines.push(jwt.retry_after + " 后可重试"); }
     if (jwt.last_checked_at) { lines.push("检查于 " + jwt.last_checked_at); }
     if (jwt.reauth_suggested) { lines.push("已超过重新授权期限,建议重新授权"); }
-    return appendStack(td, credentialPill(jwt.status), lines);
+    return lines;
   }
 
-  function apiKeyCell(key) {
-    var td = el("td");
-    if (!key) { td.appendChild(statusSpan("未记录", "")); return td; }
+  function apiKeyLines(key) {
     var lines = [];
+    if (!key) { return lines; }
     if (key.name) { lines.push(key.name); }
     if (key.last_error && key.last_error.stage) {
       lines.push(key.last_error.stage + (key.last_error.message ? ":" + key.last_error.message : ""));
     }
     if (key.updated_at) { lines.push("更新于 " + key.updated_at); }
-    return appendStack(td, credentialPill(key.status), lines);
+    return lines;
   }
 
-  function oauthCell(oauth) {
-    var td = el("td");
-    if (!oauth) { td.appendChild(statusSpan("无", "")); return td; }
-    if (oauth.reauth_required) {
-      appendStack(td, statusSpan("需重新授权", "pill-bad"), [oauth.reason || "业务 API 访问已失效"]);
-      return td;
-    }
-    var lines = [];
-    if (oauth.received_at) { lines.push("获取于 " + oauth.received_at); }
-    appendStack(td, statusSpan(oauth.has_access_token ? "材料完整" : "无材料", "pill-ok"), lines);
-    return td;
-  }
-
-  // quotaText renders the entitlement state. The three readings an operator
-  // must be able to tell apart are kept visually distinct: a plan with quota
-  // ("ok"), an account the upstream positively reports as having no plan
-  // ("no_plan" / "plan_expired"), and a reading the plugin could not make
-  // ("unknown"). Collapsing the last two into one "unknown" is what made the
-  // earlier empty billing answer look like a missing subscription.
-  var QUOTA_STATES = {
-    ok: ["有套餐且有额度", "pill-ok"],
-    exhausted: ["套餐额度耗尽", "pill-bad"],
-    no_plan: ["该账号没有 Coding Plan", "pill-warn"],
-    plan_expired: ["套餐已到期", "pill-bad"],
-    unknown: ["未知(上游返回无法解析)", "pill-warn"],
-    unavailable: ["不可用(凭证被拒绝)", "pill-bad"]
-  };
-
-  // An unreadable number is not a zero. Every optional field the upstream may
-  // omit renders through this one helper, so a missing value reads as "未知"
-  // rather than as a measurement the plugin never received.
-  function unknownNumber(value) {
-    return value === null || value === undefined ? "未知" : value.toLocaleString();
-  }
-
-  // Bucket recurrence as the page reads it. A one_time grant does not come
-  // back, so showing it a reset time would tell an operator to wait for
+  // Quota bucket recurrence as the page reads it. A one_time grant does not
+  // come back, so showing it a reset time would tell an operator to wait for
   // something that will never arrive; a recurring window comes back on its own
   // and the reset time is what decides whether to switch accounts now. An
   // unread period is neither of those, and says so.
@@ -486,19 +532,22 @@ const managementPageHTML = `<!DOCTYPE html>
       : { year: "numeric", month: "numeric", day: "numeric" });
   }
 
-  // quotaBucket renders one evidence line per bucket. The order is what an
-  // operator acts on: how much is left in share first (the fraction is
-  // computed by the plugin so this page cannot disagree with the host about
-  // it), then whether waiting is an option at all, then the raw counts — which
-  // are what the share was derived from and what an operator checks the
-  // upstream against.
+  // An unreadable number is not a zero. Every optional field the upstream may
+  // omit renders through this one helper, so a missing value reads as "未知"
+  // rather than as a measurement the plugin never received.
+  function unknownNumber(value) {
+    return value === null || value === undefined ? "未知" : value.toLocaleString();
+  }
+
+  // quotaBucket renders one bucket: a remaining-share bar when the plugin
+  // computed one, then the evidence lines. The bar width is the fraction the
+  // Go side already derived — this page never divides remaining by total, so
+  // it cannot disagree with the host quota group about the same bucket. A
+  // bucket with no readable share keeps its text evidence and gets no bar:
+  // an unread fraction is not a zero, and a bar drawn at 0% or 100% would
+  // assert a measurement the plugin never received.
   function quotaBucket(balance) {
     var lines = [];
-    var fraction = balance.remaining_fraction;
-    var share = fraction === null || fraction === undefined
-      ? "剩余比例未知"
-      : "剩余 " + (fraction * 100).toFixed(1) + "%";
-    lines.push((balance.name || "未命名额度") + (balance.malformed ? "(字段漂移)" : "") + " " + share);
     var unit = balance.unit_type ? " " + balance.unit_type : "";
     lines.push(unknownNumber(balance.remaining) + " / " + unknownNumber(balance.total) + unit);
     // The upstream always states expires_at, but what it means depends on the
@@ -521,129 +570,164 @@ const managementPageHTML = `<!DOCTYPE html>
     return lines;
   }
 
-  function quotaCell(quota) {
-    var td = el("td");
-    if (!quota) { td.appendChild(statusSpan("未查询", "")); return td; }
+  // quotaBar builds the remaining-share bar for one bucket, or null when the
+  // plugin did not hand over a fraction. The share is what remains, so a
+  // nearly-empty bar is the danger state; thresholds read on the remaining
+  // side (>=50% fine, 20–50% warn, <20% danger).
+  function quotaBar(balance) {
+    var fraction = balance.remaining_fraction;
+    if (fraction === null || fraction === undefined) { return null; }
+    var percent = Math.min(100, Math.max(0, fraction * 100));
+    var wrap = el("div", "bucket");
+    var head = el("div", "bucket-head");
+    head.appendChild(text(el("span", "bucket-name"),
+      (balance.name || "未命名额度") + (balance.malformed ? "(字段漂移)" : "")));
+    head.appendChild(text(el("span"), "剩余 " + percent.toFixed(1) + "%"));
+    var bar = el("div", "bar");
+    var fill = el("div", "bar-fill" + (percent < 20 ? " danger" : percent < 50 ? " warn" : ""));
+    fill.style.width = percent + "%";
+    bar.appendChild(fill);
+    wrap.appendChild(head);
+    wrap.appendChild(bar);
+    return wrap;
+  }
+
+  // quotaCard renders the quota slot of one account card: one bar plus its
+  // evidence lines per bucket. The four readings an operator must tell apart —
+  // a plan with quota, an account the upstream positively reports as having no
+  // plan, a lapsed plan, and a reading the plugin could not make — stay
+  // distinct as pills before any bucket is drawn.
+  var QUOTA_STATES = {
+    ok: ["有套餐且有额度", "pill-ok"],
+    exhausted: ["套餐额度耗尽", "pill-bad"],
+    no_plan: ["该账号没有 Coding Plan", "pill-warn"],
+    plan_expired: ["套餐已到期", "pill-bad"],
+    unknown: ["未知(上游返回无法解析)", "pill-warn"],
+    unavailable: ["不可用(凭证被拒绝)", "pill-bad"]
+  };
+
+  function quotaCard(quota) {
+    var box = el("div");
+    if (!quota) {
+      appendStack(box, statusSpan("未查询", ""), []);
+      return box;
+    }
     var known = QUOTA_STATES[quota.state] || [quota.state || "未知", ""];
     var lines = [];
     if (quota.plan) { lines.push(quota.plan); }
     else if (quota.plan_count > 0) { lines.push(quota.plan_count + " 个未命名套餐"); }
     if (quota.reason) { lines.push(quota.reason); }
     if (quota.checked_at) { lines.push("查询于 " + quota.checked_at); }
+    appendStack(box, statusSpan(known[0], known[1]), lines);
     (quota.balances || []).forEach(function (balance) {
-      lines.push.apply(lines, quotaBucket(balance));
+      var bar = quotaBar(balance);
+      if (bar) { box.appendChild(bar); }
+      var bucketLines = quotaBucket(balance);
+      var block = el("div", "bucket-lines");
+      bucketLines.forEach(function (line) {
+        block.appendChild(text(el("div"), line));
+      });
+      box.appendChild(block);
     });
-    return appendStack(td, statusSpan(known[0], known[1]), lines);
+    return box;
   }
 
-  function actionButton(label, action, authIndex, row) {
+  // Account cards are built from semantic facts. Each credential slot has a
+  // dedicated builder returning one element the card must mount: a test can
+  // then assert every builder is consumed, because a builder whose return
+  // value is dropped renders a plausible card missing a whole section.
+  function jwtCard(jwt) {
+    var dd = el("dd");
+    if (!jwt) { dd.appendChild(statusSpan("未记录", "")); return dd; }
+    appendStack(dd, credentialPill(jwt.status), jwtLines(jwt));
+    return dd;
+  }
+
+  function apiKeyCard(key) {
+    var dd = el("dd");
+    if (!key) { dd.appendChild(statusSpan("未记录", "")); return dd; }
+    appendStack(dd, credentialPill(key.status), apiKeyLines(key));
+    return dd;
+  }
+
+  function oauthCard(oauth) {
+    var dd = el("dd");
+    if (!oauth) { dd.appendChild(statusSpan("无", "")); return dd; }
+    if (oauth.reauth_required) {
+      appendStack(dd, statusSpan("需重新授权", "pill-bad"), [oauth.reason || "业务 API 访问已失效"]);
+      return dd;
+    }
+    var lines = [];
+    if (oauth.received_at) { lines.push("获取于 " + oauth.received_at); }
+    appendStack(dd, statusSpan(oauth.has_access_token ? "材料完整" : "无材料", "pill-ok"), lines);
+    return dd;
+  }
+
+  function factRow(list, label, valueNode) {
+    var dt = el("dt");
+    text(dt, label);
+    list.appendChild(dt);
+    list.appendChild(valueNode);
+  }
+
+  function actionButton(label, action, authIndex) {
     var button = el("button");
     text(button, label);
     button.type = "button";
-    button.addEventListener("click", function () { runAction(action, authIndex, button, row); });
+    button.addEventListener("click", function () { runAction(action, authIndex, button); });
     return button;
   }
 
-  function setRowDisabled(row, disabled) {
-    var buttons = row.querySelectorAll("button");
-    for (var i = 0; i < buttons.length; i += 1) { buttons[i].disabled = disabled; }
-  }
+  // renderAccount mounts one account card. Each credential builder is appended
+  // exactly once; dropping one of these lines would silently lose that
+  // credential section while the card still looks finished.
+  function renderAccount(account) {
+    var card = el("article", "account");
+    card.appendChild(text(el("h2"), account.label || account.auth_index || "(未命名)"));
+    card.appendChild(text(el("div", "identity"), account.identity_id || "—"));
 
-  function setBatchDisabled(disabled) {
-    document.getElementById("batch-refresh").disabled = disabled;
-  }
+    if (account.read_error) {
+      var note = el("div", "unreadable");
+      appendStack(note, statusSpan("无法读取该记录", "pill-bad"), [account.read_error]);
+      card.appendChild(note);
+      return card;
+    }
 
-  // ACTION_LABELS names an operation in the operator's language while the
-  // request keeps sending the wire name, so a log line and the button that
-  // produced it still match.
-  var ACTION_LABELS = {
-    refresh_credential: "刷新凭证",
-    refresh_quota: "刷新额度",
-    refresh_models: "刷新模型缓存",
-    oauth_retry: "重新授权",
-    batch_refresh: "刷新全部账号"
-  };
+    var quotaSlot = el("div");
+    quotaSlot.appendChild(quotaCard(account.quota));
+    card.appendChild(quotaSlot);
 
-  function actionName(action) {
-    return ACTION_LABELS[action] || action;
-  }
-
-  function runAction(action, authIndex, button, row) {
-    if (button.disabled) { return; }
-    generation += 1;              // in-flight replies from earlier renders are void
-    var localGeneration = generation;
-    busy += 1;
-    setBatchDisabled(true);
-    if (row) { setRowDisabled(row, true); }
-    showError("");
-    apiFetch(ACTION_URL, "POST", { action: action, auth_index: authIndex || "" })
-    .then(function (outcome) {
-      // A newer action or state fetch superseded this reply; rendering it
-      // would put a stale result over a fresh one.
-      if (localGeneration !== generation) { return; }
-      if (outcome.ok) {
-        show(actionName(action) + (authIndex ? "(" + authIndex + ")" : "") + " 完成:\n" +
-          JSON.stringify(outcome.data, null, 2));
-        var session = outcome.data && outcome.data.session;
-        if (session && session.authorize_url) { renderAuthorizeLink(session); }
-      } else {
-        var error = (outcome.data && outcome.data.error) || {};
-        showError(actionName(action) + " 失败:" + (error.message || error.code || "未知错误"));
-      }
-    }).catch(function (failure) {
-      if (localGeneration !== generation) { return; }
-      var reason = describeFailure(failure);
-      if (reason) { showError(actionName(action) + " 未能执行:" + reason); }
-    }).then(function () {
-      busy -= 1;
-      setBatchDisabled(false);
-      if (row) { setRowDisabled(row, false); }
-      loadState();
-    });
-  }
-
-  function renderAuthorizeLink(session) {
-    var url = session.authorize_url;
-    if (typeof url !== "string" || url.slice(0, 8) !== "https://") { return; }
-    var line = el("p", "link-cell");
-    var anchor = document.createElement("a");
-    anchor.setAttribute("href", url);
-    anchor.setAttribute("target", "_blank");
-    anchor.setAttribute("rel", "noopener noreferrer");
-    text(anchor, "打开授权页面以完成登录");
-    line.appendChild(anchor);
-    document.getElementById("result").appendChild(line);
-  }
-
-  // A record the plugin could not read keeps its row and says so, instead of
-  // collapsing into a blank cell that reads like "no credential".
-  function renderUnreadable(row, account) {
-    cell(row, account.label || account.auth_index || "(未命名)");
-    cell(row, account.identity_id || "—");
-    var note = el("td");
-    note.colSpan = 5;
-    appendStack(note, statusSpan("无法读取该记录", "pill-bad"), [account.read_error]);
-    row.appendChild(note);
-  }
-
-  function renderAccount(row, account) {
-    if (account.read_error) { renderUnreadable(row, account); return; }
-    cell(row, account.label || account.auth_index || "(未命名)");
-    cell(row, account.identity_id || "—");
-    row.appendChild(jwtCell(account.jwt));
-    row.appendChild(apiKeyCell(account.api_key));
-    row.appendChild(oauthCell(account.oauth));
-    row.appendChild(quotaCell(account.quota));
+    var facts = el("dl", "facts");
+    factRow(facts, "JWT(主凭证)", jwtCard(account.jwt));
+    factRow(facts, "API Key(回退)", apiKeyCard(account.api_key));
+    factRow(facts, "OAuth", oauthCard(account.oauth));
+    card.appendChild(facts);
 
     var authIndex = account.auth_index || "";
-    var actions = el("td");
     var group = el("div", "actions");
-    group.appendChild(actionButton("刷新凭证", "refresh_credential", authIndex, row));
-    group.appendChild(actionButton("刷新额度", "refresh_quota", authIndex, row));
-    group.appendChild(actionButton("刷新模型", "refresh_models", authIndex, row));
-    group.appendChild(actionButton("重新授权", "oauth_retry", authIndex, row));
-    actions.appendChild(group);
-    row.appendChild(actions);
+    group.appendChild(actionButton("刷新凭证", "refresh_credential", authIndex));
+    group.appendChild(actionButton("刷新额度", "refresh_quota", authIndex));
+    group.appendChild(actionButton("刷新模型", "refresh_models", authIndex));
+    group.appendChild(actionButton("重新授权", "oauth_retry", authIndex));
+    card.appendChild(group);
+    return card;
+  }
+
+  // Cached cards are optimistic paint only: no action is clickable until a
+  // fresh authenticated state response has revalidated the accounts.
+  var statusVerified = false;
+
+  function setCardButtonsDisabled(container, disabled) {
+    var buttons = container.querySelectorAll("button");
+    for (var i = 0; i < buttons.length; i += 1) {
+      if (disabled) {
+        buttons[i].disabled = true;
+        buttons[i].title = "正在刷新真实状态，请稍候。";
+      } else {
+        buttons[i].disabled = false;
+        buttons[i].removeAttribute("title");
+      }
+    }
   }
 
   var SESSION_STATES = { pending: ["等待授权", "pill-warn"], complete: ["已完成", "pill-ok"] };
@@ -658,13 +742,13 @@ const managementPageHTML = `<!DOCTYPE html>
   // renderSection fills one table and updates its header count, so an empty
   // section still reads as "checked, nothing found" rather than as a broken
   // table.
-  function renderSection(tbodyID, countID, rows, renderRow, emptyText) {
+  function renderSection(tbodyID, countID, rows, renderRow, emptyText, colSpan) {
     var body = document.getElementById(tbodyID);
     while (body.firstChild) { body.removeChild(body.firstChild); }
     if (!rows.length) {
       var tr = el("tr");
       var td = el("td");
-      td.colSpan = 8;
+      td.colSpan = colSpan;
       td.className = "empty";
       text(td, emptyText);
       tr.appendChild(td);
@@ -679,8 +763,29 @@ const managementPageHTML = `<!DOCTYPE html>
     text(document.getElementById(countID), rows.length ? rows.length + " 项" : "");
   }
 
+  var accountsBox = document.getElementById("accounts");
+
+  function renderAccounts(data) {
+    var list = data.accounts || [];
+    while (accountsBox.firstChild) { accountsBox.removeChild(accountsBox.firstChild); }
+    if (!list.length) {
+      accountsBox.appendChild(text(el("p", "empty"), "没有账号"));
+    } else {
+      list.forEach(function (account) {
+        accountsBox.appendChild(renderAccount(account));
+      });
+    }
+    text(document.getElementById("accounts-count"), list.length ? list.length + " 个账号" : "");
+  }
+
+  function renderEmpty() {
+    renderAccounts({});
+    renderSection("sessions", "sessions-count", [], null, "没有进行中的授权会话", 5);
+    renderSection("model-cache", "cache-count", [], null, "没有模型缓存记录", 6);
+  }
+
   function render(data) {
-    renderSection("accounts", "accounts-count", data.accounts || [], renderAccount, "没有账号");
+    renderAccounts(data);
     renderSection("sessions", "sessions-count", data.sessions || [], function (row, session) {
       var known = SESSION_STATES[session.state] || [session.state || "未知", ""];
       var td = el("td");
@@ -690,7 +795,7 @@ const managementPageHTML = `<!DOCTYPE html>
       cell(row, session.created_at || "—");
       cell(row, session.expires_at || "—");
       cell(row, session.message || "—");
-    }, "没有进行中的授权会话");
+    }, "没有进行中的授权会话", 5);
 
     renderSection("model-cache", "cache-count", data.model_cache || [], function (row, entry) {
       var known = CACHE_STATES[entry.state] || [entry.state || "未知", ""];
@@ -702,15 +807,90 @@ const managementPageHTML = `<!DOCTYPE html>
       cell(row, entry.state === "cached" ? entry.model_count : "—");
       cell(row, entry.expires_at || entry.cooldown_until || "—");
       cell(row, entry.failure_reason || "—");
-    }, "没有模型缓存记录");
+    }, "没有模型缓存记录", 6);
+
+    setCardButtonsDisabled(accountsBox, !statusVerified);
   }
 
-  function loadState() {
+  var ACTION_LABELS = {
+    refresh_credential: "刷新凭证",
+    refresh_quota: "刷新额度",
+    refresh_models: "刷新模型缓存",
+    oauth_retry: "重新授权",
+    batch_refresh: "刷新全部账号"
+  };
+
+  function actionName(action) {
+    return ACTION_LABELS[action] || action;
+  }
+
+  function runAction(action, authIndex, button) {
+    if (button.disabled) { return; }
+    generation += 1;              // in-flight replies from earlier renders are void
+    var localGeneration = generation;
+    setBusy(button, true);
+    if (button === document.getElementById("batch-refresh")) {
+      document.getElementById("reload-state").disabled = true;
+    }
+    show("正在执行" + actionName(action) + (authIndex ? "(" + authIndex + ")" : "") + "…", "pending");
+    apiFetch(ACTION_URL, "POST", { action: action, auth_index: authIndex || "" })
+    .then(function (outcome) {
+      // A newer action or state fetch superseded this reply; rendering it
+      // would put a stale result over a fresh one.
+      if (localGeneration !== generation) { return; }
+      if (outcome.ok) {
+        showRaw(actionName(action), outcome.data);
+        show(actionName(action) + (authIndex ? "(" + authIndex + ")" : "") + " 完成。", "");
+        var session = outcome.data && outcome.data.session;
+        if (session && session.authorize_url) { renderAuthorizeLink(session); }
+      } else {
+        var error = (outcome.data && outcome.data.error) || {};
+        show(actionName(action) + " 失败:" + (error.message || error.code || "未知错误"), "error");
+      }
+    }).catch(function (failure) {
+      if (localGeneration !== generation) { return; }
+      var reason = describeFailure(failure);
+      if (reason) { show(actionName(action) + " 未能执行:" + reason, "error"); }
+    }).then(function () {
+      setBusy(button, false);
+      document.getElementById("reload-state").disabled = false;
+      loadState({ silent: true });
+    });
+  }
+
+  function setBusy(button, busy) {
+    if (busy) {
+      button.disabled = true;
+      button.classList.add("loading");
+      button.setAttribute("aria-busy", "true");
+    } else {
+      button.disabled = false;
+      button.classList.remove("loading");
+      button.removeAttribute("aria-busy");
+    }
+  }
+
+  function renderAuthorizeLink(session) {
+    var url = session.authorize_url;
+    if (typeof url !== "string" || url.slice(0, 8) !== "https://") { return; }
+    var line = el("p", "link-cell");
+    var anchor = document.createElement("a");
+    anchor.setAttribute("href", url);
+    anchor.setAttribute("target", "_blank");
+    anchor.setAttribute("rel", "noopener noreferrer");
+    text(anchor, "打开授权页面以完成登录");
+    line.appendChild(anchor);
+    message.appendChild(line);
+  }
+
+  // loadState is the page's only refresh path, and it runs when an operator
+  // acts: on save, on the reload button, and after each management action.
+  // There is deliberately no interval — a periodic full re-fetch would blank
+  // the page under the reader and replay a revoked key for no reason.
+  function loadState(options) {
     generation += 1;
     var localGeneration = generation;
-    // Rendering is cleared before the fetch so the tables never show one
-    // generation's accounts while the next request is in flight.
-    clearTables();
+    show("正在加载状态…", "pending");
     apiFetch(STATE_URL, "GET")
       .then(function (outcome) {
         // A newer fetch or action superseded this reply; applying it would
@@ -718,65 +898,85 @@ const managementPageHTML = `<!DOCTYPE html>
         if (localGeneration !== generation) { return; }
         if (!outcome.ok) {
           var error = (outcome.data && outcome.data.error) || {};
-          showError("状态加载失败:" + (error.message || error.code || "未知错误"));
+          show("状态加载失败:" + (error.message || error.code || "未知错误"), "error");
           return;
         }
-        showError("");
+        statusVerified = true;
         render(outcome.data);
+        writeCache(outcome.data);
+        if (!options || !options.silent) {
+          show("状态已加载。", "");
+        }
       })
       .catch(function (failure) {
         if (localGeneration !== generation) { return; }
         var reason = describeFailure(failure);
         // Without a key this is the expected opening state, not a failure: the
         // shell is public, so the prompt is the page's first job.
-        if (reason) { showError(reason); }
+        if (reason) { show(reason, "error"); }
       });
   }
 
-  function clearTables() {
-    var sections = ["accounts", "sessions", "model-cache"];
-    for (var i = 0; i < sections.length; i += 1) {
-      var body = document.getElementById(sections[i]);
-      while (body.firstChild) { body.removeChild(body.firstChild); }
-    }
-    ["accounts-count", "sessions-count", "cache-count"].forEach(function (id) {
-      text(document.getElementById(id), "");
-    });
-  }
+  document.getElementById("reload-state").addEventListener("click", function () {
+    loadState();
+  });
 
   document.getElementById("batch-refresh").addEventListener("click", function () {
-    runAction("batch_refresh", "", document.getElementById("batch-refresh"), null);
+    runAction("batch_refresh", "", document.getElementById("batch-refresh"));
   });
 
   document.getElementById("save-key").addEventListener("click", function () {
     var key = keyInput.value.trim();
     if (!key) {
-      showError("请先填写管理密钥再保存。");
+      show("请先填写管理密钥再保存。", "error");
       keyInput.focus();
       return;
     }
     if (!storeKey(key)) {
-      showError("管理密钥无法保存在此浏览器。");
+      show("管理密钥无法保存在此浏览器。", "error");
       return;
     }
     keyInput.value = "";
     showKeyPanel(true);
-    showError("");
+    // Saving a key is a claim, not a proof: the first fetch under it decides
+    // whether it stays. A wrong key answers 401 and forgetKey removes it.
     loadState();
   });
 
   document.getElementById("clear-key").addEventListener("click", function () {
-    forgetKey("管理密钥已清除,请重新填写。");
+    forgetKey("管理密钥已清除,请重新填写。", "");
   });
 
-  document.getElementById("key-show").addEventListener("click", function () {
+  // Re-setting the key re-opens the same panel the key was first entered in;
+  // the saved value is replaced only when the operator saves again.
+  keyShow.addEventListener("click", function () {
     showKeyPanel(false);
     keyInput.focus();
   });
 
-  showKeyPanel(!!storedKey());
-  loadState();
-  setInterval(loadState, 20000);
+  // Opening paint. A saved key plus a cached snapshot renders instantly with
+  // actions locked, and the snapshot notice names its age so stale data is
+  // never mistaken for a fresh reading; a live revalidation follows either
+  // way. Nothing here retries on a timer — every later fetch has an operator
+  // behind it.
+  (function boot() {
+    var hasKey = !!storedKey();
+    var cached = hasKey ? readCache() : null;
+    if (cached) {
+      render(cached.data);
+      var cachedAt = cached.saved_at ? new Date(cached.saved_at).toLocaleString() : "";
+      show("已显示上次缓存的状态" + (cachedAt ? "（" + cachedAt + "）" : "") + "，正在刷新真实状态…", "pending");
+      loadState({ silent: true });
+    } else if (hasKey) {
+      showKeyPanel(true);
+      loadState();
+    } else {
+      clearStateCache();
+      renderEmpty();
+      showKeyPanel(false);
+      show("请先填写并保存管理密钥。", "pending");
+    }
+  }());
 }());
 </script>
 </body>

@@ -104,9 +104,12 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
 - [ ] 宿主控制面板左侧导航出现 **ZCode** 入口,点击可打开管理页;直接访问 `/v0/resource/plugins/zcode/page` 返回 200 HTML 外壳,不带任何鉴权头也能取到。
 - [ ] 对该外壳做敏感词扫描(`grep -nE 'eyJ|sk-|cpa-zcode-[0-9a-f]'`),只命中 JS 字段名,无任何真实凭据值;外壳与 `/v0/management/zcode/page` 逐字节一致。
 - [ ] 未填管理密钥时:页面不发起任何状态请求、不展示任何账号行,并给出"Enter and save the management key"提示。
-- [ ] 填入密钥后状态可读(账号表、OAuth 会话、额度、模型缓存);五个操作(`refresh_credential` / `refresh_quota` / `refresh_models` / `oauth_retry` / `batch_refresh`)各执行一次并观察结果与串行提示。
-- [ ] 密钥错误或被撤销时(宿主答 401):密钥从 localStorage 清除、表格清空、输入框重新聚焦、给出可读提示,且不再按 20 秒定时器重试该密钥。
+- [ ] 填入密钥后状态可读(账号卡片、OAuth 会话、额度进度条、模型缓存);五个操作(`refresh_credential` / `refresh_quota` / `refresh_models` / `oauth_retry` / `batch_refresh`)各执行一次并观察结果与串行提示。
+- [ ] 密钥错误或被撤销时(宿主答 401):密钥从 localStorage 清除、数据区清空、输入框重新聚焦、给出可读提示;页面无自动定时器,不会在无人操作时用错误密钥重试。
 - [ ] 密钥只落在 localStorage:DevTools 里 sessionStorage 与 cookie 均无该值。
+- [ ] 二次打开页面先渲染本地快照(标注缓存时间,操作按钮禁用),后台真实拉取成功后替换并启用按钮;刷新只由手动触发,页面无自动定时器。
+- [ ] 每个携带 `remaining_fraction` 的额度桶渲染进度条并按剩余比例变色;缺失比例的桶仍为文字证据,不画条。
+- [ ] 管理密钥保存后,密钥面板折叠为图标 + 提示;点击可重新设定,保存后立即用新密钥拉取验证,401 走清除逻辑。
 - [ ] OAuth 重试返回的授权链接可完成登录,完成后账号状态与凭证正确落盘。
 - [ ] 页面无重复提交、无旧响应覆盖新状态的现象。
 - [ ] `POST /v0/resource/plugins/zcode/page` 不被路由到(资源路由仅 GET);`/v0/resource/plugins/zcode/state` 返回 404 而不是账号数据。

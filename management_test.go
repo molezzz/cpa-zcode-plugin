@@ -345,13 +345,13 @@ func TestManagementResourcePathNeverServesData(t *testing.T) {
 	}
 }
 
-// TestManagementPageAlignsEveryTable guards the rendered shape rather than the
-// source text. A cell helper that returns its inner stack instead of its <td>
-// still renders every word the operator reads, so only the structure shows the
-// row lost a column. The assertion is therefore on the tag sequence the script
-// produces: a row is one <td> per column, with no element parented straight to
-// <tr>.
-func TestManagementPageAlignsEveryTable(t *testing.T) {
+// TestManagementPageAlignsEveryAccountCard guards the rendered shape rather
+// than the source text. The page replaced the wide account table with one card
+// per account; the equivalent structural failure is a credential builder whose
+// return value is dropped — the card renders plausible but missing a whole
+// section. The assertion is therefore that every builder's result is consumed
+// by the fact-row mount (or the quota slot), not merely invoked.
+func TestManagementPageAlignsEveryAccountCard(t *testing.T) {
 	page := managementPageHTML
 	scriptStart := strings.Index(page, "<script>")
 	scriptEnd := strings.LastIndex(page, "</script>")
@@ -360,24 +360,34 @@ func TestManagementPageAlignsEveryTable(t *testing.T) {
 	}
 	script := page[scriptStart:scriptEnd]
 
-	// Every credential cell builder hands the caller a <td> to append. If one
-	// returned the stack instead, its div would be parented directly to <tr> and
-	// the table would silently lose a column. The check is that each builder is
-	// actually consumed: an unappended builder renders a correct-looking row
-	// with a column missing.
-	for _, helper := range []string{"jwtCell", "apiKeyCell", "oauthCell", "quotaCell"} {
-		if !strings.Contains(script, "function "+helper+"(") {
-			t.Errorf("page is missing the %s builder", helper)
-			continue
-		}
-		if !strings.Contains(script, "row.appendChild("+helper+"(") {
-			t.Errorf("%s is built but never appended to a row; the table loses that column", helper)
+	// Every credential builder hands its result to factRow, which appends the
+	// term and the built node to the card's fact list. A builder invoked but
+	// discarded would render a card silently missing that credential section,
+	// so the full call shape is pinned, not just the name.
+	for _, mount := range []string{
+		`factRow(facts, "JWT(主凭证)", jwtCard(account.jwt))`,
+		`factRow(facts, "API Key(回退)", apiKeyCard(account.api_key))`,
+		`factRow(facts, "OAuth", oauthCard(account.oauth))`,
+	} {
+		if !strings.Contains(script, mount) {
+			t.Errorf("page does not mount a credential section via %q; the card loses that section", mount)
 		}
 	}
-	// appendStack must close by appending to the cell and returning that cell:
-	// returning the stack nests a div under tr and drops the column.
-	if !strings.Contains(script, "td.appendChild(stack);\n    return td;") {
-		t.Error("appendStack must append the stack to the cell and return the cell, not the stack")
+	for _, builder := range []string{"jwtCard", "apiKeyCard", "oauthCard", "quotaCard"} {
+		if !strings.Contains(script, "function "+builder+"(") {
+			t.Errorf("page is missing the %s builder", builder)
+		}
+	}
+	// The quota slot is mounted through appendChild; pinning the statement
+	// keeps a refactor from re-invoking quotaCard and dropping its result.
+	if !strings.Contains(script, "appendChild(quotaCard(account.quota))") {
+		t.Error("quotaCard is not appended to the account card; the card loses the quota section")
+	}
+	// appendStack must close by appending to the container and returning that
+	// container: returning the inner stack would strand the verdict outside
+	// the slot it belongs to.
+	if !strings.Contains(script, "container.appendChild(stack);\n    return container;") {
+		t.Error("appendStack must append the stack to the container and return the container, not the stack")
 	}
 
 	// Every appendStack call site passes plain strings. A pre-built element
@@ -554,6 +564,89 @@ func TestManagementPageRendersQuotaAsActionableEvidence(t *testing.T) {
 	}
 	if strings.Contains(page, "余额") {
 		t.Error("the page uses the wording 余额, which reads as money; this upstream meters tokens")
+	}
+}
+
+// TestManagementPageDrawsTheRemainingBarFromTheComputedFraction pins the
+// progress-bar contract added with the card layout (#20). The bar exists to
+// make the share readable at a glance, so it must be drawn from the fraction
+// the Go side already computed — a page that divides again can disagree with
+// the host quota group about the same bucket. A bucket without a fraction gets
+// no bar at all: an unread share is not a zero, and a bar at 0% or 100% would
+// assert a measurement the plugin never received.
+func TestManagementPageDrawsTheRemainingBarFromTheComputedFraction(t *testing.T) {
+	page := managementPageHTML
+	if !strings.Contains(page, "balance.remaining_fraction") {
+		t.Error("the bar must be drawn from the remaining_fraction the plugin already computed")
+	}
+	// The width assignment is the one place the fraction becomes pixels; pin it
+	// so the bar cannot regress to a page-side derivation.
+	if !strings.Contains(page, "fraction * 100") {
+		t.Error("the bar width must come from the precomputed fraction, scaled once")
+	}
+	if !strings.Contains(page, "fill.style.width = percent") {
+		t.Error("the bar's width must be set from the fraction-derived percent")
+	}
+	if !strings.Contains(page, "if (fraction === null || fraction === undefined) { return null; }") {
+		t.Error("a bucket without a readable fraction must render no bar rather than a guessed one")
+	}
+	// The thresholds read on the remaining side; a near-empty bar is the danger.
+	for _, want := range []string{`" danger"`, `" warn"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the bar is missing the %s severity class", want)
+		}
+	}
+}
+
+// TestManagementPageHasNoAutoRefresh pins the no-timer contract (#20). A
+// periodic re-fetch blanks the page under a reading operator and replays a
+// revoked key; every fetch must have an operator behind it. The snapshot cache
+// is the replacement: it paints instantly on open and is revalidated once.
+func TestManagementPageHasNoAutoRefresh(t *testing.T) {
+	page := managementPageHTML
+	for _, forbidden := range []string{"setInterval(", "setTimeout(loadState"} {
+		if strings.Contains(page, forbidden) {
+			t.Errorf("the page auto-refreshes through %q; every fetch must be operator-initiated", forbidden)
+		}
+	}
+	// The manual entry points must exist so removing the timer did not remove
+	// the ability to refresh at all.
+	for _, want := range []string{`"reload-state"`, `"batch-refresh"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing the %s manual refresh control", want)
+		}
+	}
+	// The snapshot cache with its saved_at stamp: instant paint plus an honest
+	// age label, so stale data is never mistaken for a fresh reading.
+	for _, want := range []string{"zcode_state_cache", "saved_at", "已显示上次缓存的状态"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing the snapshot-cache contract: %q", want)
+		}
+	}
+	// Cached paint is optimistic only: actions stay locked until a fresh
+	// authenticated response revalidates the accounts.
+	if !strings.Contains(page, "statusVerified") || !strings.Contains(page, "setCardButtonsDisabled(accountsBox, !statusVerified)") {
+		t.Error("cached cards must disable actions until a fresh state response revalidates them")
+	}
+}
+
+// TestManagementPageOffersAKeyResetEntry pins the key re-entry contract (#20).
+// A saved key used to hide its own replacement behind a tiny secondary button;
+// the collapsed panel must carry an explicit, worded re-entry control, and
+// saving must immediately verify the key against the live state so a typo is
+// caught by the 401 path instead of silently stored.
+func TestManagementPageOffersAKeyResetEntry(t *testing.T) {
+	page := managementPageHTML
+	if !strings.Contains(page, "🔑 管理密钥已保存，点击可重新设定") {
+		t.Error("the collapsed key panel must carry an explicit re-entry control with wording")
+	}
+	if !strings.Contains(page, `keyShow.addEventListener("click"`) {
+		t.Error("the re-entry control must expand the key panel")
+	}
+	// The key never persists beyond localStorage, and the panel still collapses
+	// through the same showKeyPanel path used on first save.
+	if !strings.Contains(page, "showKeyPanel(true)") {
+		t.Error("saving a key must collapse the panel through showKeyPanel")
 	}
 }
 
