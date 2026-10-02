@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -125,6 +126,25 @@ func balanceRow(name string, total, used, remaining any) string {
 		panic(err)
 	}
 	return string(raw)
+}
+
+// float64Ptr is the explicit-number shorthand the quota tests compare against.
+// A bucket field the upstream omitted must stay nil, so assertions need to say
+// "unknown" rather than let a zero stand for it.
+func float64Ptr(value float64) *float64 {
+	return &value
+}
+
+// floatPtrEqual compares two optional numbers by value, treating two unknowns
+// as equal — the distinction these tests assert on is read-vs-unread. It is
+// shared across the package because asserting "the plugin read exactly this
+// number" otherwise gets hand-rolled per test, and a hand-rolled comparison is
+// where a silent tolerance typo hides.
+func floatPtrEqual(got, want *float64) bool {
+	if got == nil || want == nil {
+		return got == want
+	}
+	return math.Abs(*got-*want) < 1e-9
 }
 
 // addFakeAccount registers one plugin account with the fake store so the
@@ -1115,6 +1135,248 @@ func TestParseQuotaBalancesReadsCapabilities(t *testing.T) {
 	}
 }
 
+// oneTimeBalanceRow is the bucket shape captured from a Start Plan account on
+// 2026-10-02: a one_time entitlement whose bucket resets at the day's end. The
+// numbers and semantics are verbatim, because the two periodic readings —
+// this reset at the day's end, and one that also states how often it recurs —
+// must not collapse into the same line.
+const oneTimeBalanceRow = `{"bucket_id":"bucket_2105787069353938944","plan_id":"zcode-v3-start-plan-trust-1002",` +
+	`"entitlement_id":"zcode-v3-start-plan-trust-1002","show_name":"GLM-5.3-Flash","meter":"model_usage",` +
+	`"unit_type":"token","capabilities":["model:glm-5.3-flash"],"priority":110,"total_units":100000000,` +
+	`"used_units":40465883,"remaining_units":59534117,"available_units":59534117,` +
+	`"period_start":1790893735,"period_end":1790956800,"expires_at":1790956800}`
+
+// TestParseQuotaBalancesReadsBucketSemantics covers the entitlement fields the
+// balance rows carry: what a bucket meters, in what unit, how often it recurs,
+// and what it was granted. Without them a page can print how many units are
+// left but cannot say what the unit is or when the bucket comes back.
+func TestParseQuotaBalancesReadsBucketSemantics(t *testing.T) {
+	body := planBalanceBody(`[{"name":"ZCode Trust Build","status":"active"}]`, oneTimeBalanceRow)
+	balances, compatible := parseQuotaBalances([]byte(body))
+	if !compatible || len(balances) != 1 {
+		t.Fatalf("balances = %d compatible = %v, want one parsed bucket", len(balances), compatible)
+	}
+	row := balances[0]
+	if row.Meter != "model_usage" || row.UnitType != "token" {
+		t.Fatalf("bucket = meter %q unit %q, want model_usage/token", row.Meter, row.UnitType)
+	}
+	if row.Period != "" {
+		t.Fatalf("period = %q; the balance row states no period of its own", row.Period)
+	}
+	if row.GrantUnits != nil || *row.Total != 100000000 {
+		t.Fatalf("grant = %v; a row without entitlements carries no granted amount", row.GrantUnits)
+	}
+	if row.PeriodStart == nil || *row.PeriodStart != 1790893735 {
+		t.Fatalf("period start = %v, want 1790893735", row.PeriodStart)
+	}
+	if row.PeriodEnd == nil || *row.PeriodEnd != 1790956800 {
+		t.Fatalf("period end = %v, want 1790956800", row.PeriodEnd)
+	}
+}
+
+// TestParseQuotaBalancesFoldsEntitlementSemantics covers the same fields read
+// from where the upstream actually states a period: the plan's entitlements.
+// The bucket inherits them through its entitlement_id, so "how often does this
+// come back" is an answer even on a row that omits it.
+func TestParseQuotaBalancesFoldsEntitlementSemantics(t *testing.T) {
+	plans := `[{"user_plan_id":"upl_1","plan_id":"zcode-v3-start-plan-trust-1002","name":"ZCode Trust Build","status":"active",` +
+		`"entitlements":[{"entitlement_id":"zcode-v3-start-plan-trust-1002","show_name":"GLM-5.3-Flash","meter":"model_usage",` +
+		`"unit_type":"token","capabilities":["model:glm-5.3-flash"],"grant_units":100000000,"period":"one_time"}]}]`
+	body := planBalanceBody(plans, oneTimeBalanceRow)
+	parsed, compatible := parseQuotaPlans([]byte(body), time.Now())
+	if !compatible || len(parsed) != 1 || len(parsed[0].Entitlements) != 1 {
+		t.Fatalf("plans = %+v compatible = %v, want one plan with one grant", parsed, compatible)
+	}
+	balances, compatible := parseQuotaBalancesWithPlans([]byte(body), parsed)
+	if !compatible || len(balances) != 1 {
+		t.Fatalf("balances = %d compatible = %v, want one parsed bucket", len(balances), compatible)
+	}
+	if balances[0].Period != "one_time" {
+		t.Fatalf("period = %q, want the entitlement's one_time", balances[0].Period)
+	}
+	if balances[0].GrantUnits == nil || *balances[0].GrantUnits != 100000000 {
+		t.Fatalf("grant = %v, want the entitlement's 100000000", balances[0].GrantUnits)
+	}
+	// The row's own meter and unit outrank the grant's: the grant states what
+	// was given, the bucket states what it may spend now.
+	if balances[0].Meter != "model_usage" || balances[0].UnitType != "token" {
+		t.Fatalf("bucket = meter %q unit %q", balances[0].Meter, balances[0].UnitType)
+	}
+}
+
+// TestParseQuotaBalancesKeepsUnknownSemanticsUnknown covers the three readings
+// every new field must have: stated, absent, and drifted. Only a drifted
+// numeric marks the row malformed, and a drifted textual field is dropped
+// rather than guessed at.
+func TestParseQuotaBalancesKeepsUnknownSemanticsUnknown(t *testing.T) {
+	cases := []struct {
+		name        string
+		row         string
+		meter       string
+		period      string
+		grant       *float64
+		periodStart *float64
+		malformed   bool
+	}{
+		{
+			name:        "every field stated",
+			row:         `{"show_name":"GLM","meter":"model_usage","unit_type":"token","period":"daily","grant_units":100,"period_start":5}`,
+			meter:       "model_usage",
+			period:      "daily",
+			grant:       float64Ptr(100),
+			periodStart: float64Ptr(5),
+		},
+		{
+			name: "every field absent stays unknown",
+			row:  `{"show_name":"GLM","remaining_units":1}`,
+		},
+		{
+			name:      "drifted grant is malformed and unread",
+			row:       `{"show_name":"GLM","grant_units":"100","meter":"model_usage","period":"daily"}`,
+			meter:     "model_usage",
+			period:    "daily",
+			malformed: true,
+		},
+		{
+			name:      "drifted period start is malformed and unread",
+			row:       `{"show_name":"GLM","period_start":"5","meter":"model_usage"}`,
+			meter:     "model_usage",
+			malformed: true,
+		},
+		{
+			name:        "drifted meter is dropped, not guessed",
+			row:         `{"show_name":"GLM","meter":5,"period_start":5}`,
+			periodStart: float64Ptr(5),
+			malformed:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row, ok := parseQuotaBalanceRow(json.RawMessage(tc.row))
+			if !ok {
+				t.Fatal("an object row is always readable")
+			}
+			if row.Meter != tc.meter || row.Period != tc.period {
+				t.Fatalf("row = meter %q period %q, want %q / %q", row.Meter, row.Period, tc.meter, tc.period)
+			}
+			if !floatPtrEqual(row.GrantUnits, tc.grant) {
+				t.Fatalf("grant = %v, want %v", row.GrantUnits, tc.grant)
+			}
+			if !floatPtrEqual(row.PeriodStart, tc.periodStart) {
+				t.Fatalf("period start = %v, want %v", row.PeriodStart, tc.periodStart)
+			}
+			if row.Malformed != tc.malformed {
+				t.Fatalf("malformed = %v, want %v", row.Malformed, tc.malformed)
+			}
+		})
+	}
+}
+
+// TestBalanceRemainingFractionIsOneReading covers the single fraction both the
+// host group and the management view render. It is the remaining share of the
+// bucket, clamped into [0,1]: a bucket that reports more remaining than its
+// total is a statement the page must not turn into a 100+%-wide bar.
+func TestBalanceRemainingFractionIsOneReading(t *testing.T) {
+	cases := []struct {
+		name    string
+		balance quotaBalance
+		want    float64
+		has     bool
+	}{
+		{
+			name:    "the captured bucket",
+			balance: quotaBalance{Remaining: float64Ptr(59534117), Total: float64Ptr(100000000)},
+			want:    0.59534117,
+			has:     true,
+		},
+		{
+			name:    "an empty bucket reads as zero, not as unknown",
+			balance: quotaBalance{Remaining: float64Ptr(0), Total: float64Ptr(100)},
+			want:    0,
+			has:     true,
+		},
+		{
+			name:    "over-reported remaining clamps to a full bucket",
+			balance: quotaBalance{Remaining: float64Ptr(150), Total: float64Ptr(100)},
+			want:    1,
+			has:     true,
+		},
+		{
+			name:    "no total leaves the fraction unknown",
+			balance: quotaBalance{Remaining: float64Ptr(60)},
+		},
+		{
+			name:    "a zero total cannot divide",
+			balance: quotaBalance{Remaining: float64Ptr(0), Total: float64Ptr(0)},
+		},
+		{
+			name:    "an unknown remaining is not a zero fraction",
+			balance: quotaBalance{Total: float64Ptr(100)},
+		},
+		{
+			name: "a drifted row is not a fraction",
+			balance: quotaBalance{Remaining: float64Ptr(60), Total: float64Ptr(100),
+				Malformed: true},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, has := balanceRemainingFraction(tc.balance)
+			if has != tc.has {
+				t.Fatalf("has = %v, want %v", has, tc.has)
+			}
+			if has && math.Abs(got-tc.want) > 1e-9 {
+				t.Fatalf("fraction = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBalanceDisplayNameUsesTheUpstreamsOwnSemantics covers the label of a
+// bucket the upstream did not name. The literal "model" it used to fall back to
+// carried no information at all and appeared in the page as "model:59534117";
+// the meter's own reading is what the upstream would call it.
+func TestBalanceDisplayNameUsesTheUpstreamsOwnSemantics(t *testing.T) {
+	cases := []struct {
+		name    string
+		balance quotaBalance
+		want    string
+	}{
+		{
+			name:    "the upstream's own display name wins",
+			balance: quotaBalance{Name: "GLM-5.3-Flash", Meter: "model_usage", UnitType: "token"},
+			want:    "GLM-5.3-Flash",
+		},
+		{
+			name:    "an unnamed model bucket reads as its meter and unit",
+			balance: quotaBalance{Meter: "model_usage", UnitType: "token"},
+			want:    "model_usage(token)",
+		},
+		{
+			name:    "an unnamed bucket with one meter reads as the meter",
+			balance: quotaBalance{Meter: "model_usage"},
+			want:    "model_usage",
+		},
+		{
+			name:    "an unnamed non-model bucket keeps its unit",
+			balance: quotaBalance{Meter: "tool_calls", UnitType: "count"},
+			want:    "tool_calls(count)",
+		},
+		{
+			name:    "a bucket the upstream described nothing about stays blank",
+			balance: quotaBalance{},
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := balanceDisplayName(tc.balance); got != tc.want {
+				t.Fatalf("name = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestBalanceModelIDsFallsBackToRowName covers the row that declares no
 // capability but names a model: the upstream reads it the same way.
 func TestBalanceModelIDsFallsBackToRowName(t *testing.T) {
@@ -1128,6 +1390,12 @@ func TestBalanceModelIDsFallsBackToRowName(t *testing.T) {
 	// Capabilities that are not model declarations must not become model ids.
 	if got := balanceModelIDs(quotaBalance{Name: "Pro", Capabilities: []string{"realtime"}}); strings.Join(got, ",") != "Pro" {
 		t.Fatalf("ids = %v, want the row name when no model capability exists", got)
+	}
+	// A row the upstream named nothing about stays empty: the literal "model"
+	// the parser used to invent here was neither a model nor a label, and it
+	// reached the page as the model id of every capability-less bucket.
+	if got := balanceModelIDs(quotaBalance{Meter: "model_usage", UnitType: "token"}); len(got) != 0 {
+		t.Fatalf("ids = %v, want none from a bucket that declared no model", got)
 	}
 }
 
@@ -1182,8 +1450,6 @@ func TestPlanModelIDsReadsTheCachedBalance(t *testing.T) {
 		}
 	}
 }
-
-func float64Ptr(v float64) *float64 { return &v }
 
 // TestObservationRendersTheEntitlementTriState pins the P7 requirement that the
 // page can tell "has quota" from "no plan" from "the plugin could not tell".

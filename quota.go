@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -53,6 +54,30 @@ type quotaBalance struct {
 	Used      *float64
 	Remaining *float64
 	ExpiresAt string
+	// Meter and UnitType are the upstream's own reading of what this bucket
+	// counts. They are the only thing that makes a bare unit count legible:
+	// 59534117 means model tokens, tool calls, or nothing at all depending on
+	// the meter, and a row the upstream named nothing about stays blank rather
+	// than being called "model".
+	Meter    string
+	UnitType string
+	// EntitlementID names the grant this bucket spends, which is how a bucket
+	// inherits the period and granted amount its own row does not repeat.
+	EntitlementID string
+	// Period is the bucket's recurrence, as the upstream spells it. The
+	// balance rows of the observed response state no period of their own, so
+	// this is folded in from the entitlement that granted the bucket; the
+	// one_time and recurring shapes are read differently on the management
+	// page, so an unread period stays unknown.
+	Period string
+	// GrantUnits is the amount the entitlement granted, when it stated one. It
+	// is not the bucket total: a bucket's own total_units is what it may spend
+	// now, and the two differ whenever the grant is larger than one window.
+	GrantUnits *float64
+	// PeriodStart and PeriodEnd are the window the current numbers belong to.
+	// A recurring bucket restarts at PeriodEnd; a one-time grant does not.
+	PeriodStart *float64
+	PeriodEnd   *float64
 	// Capabilities are the upstream's own declarations of what this balance
 	// covers. Entries shaped "model:<id>" are the authoritative dynamic model
 	// source for the identity, so they are read here rather than by a second
@@ -253,7 +278,7 @@ func fetchQuotaEvidence(ctx context.Context, jwt string, appVersion string, devi
 		return evidence
 	}
 
-	balances, compatible := parseQuotaBalances(body)
+	balances, compatible := parseQuotaBalancesWithPlans(body, plans)
 	evidence.Balances = balances
 	if !compatible {
 		evidence.SchemaCompatible = false
@@ -287,6 +312,26 @@ type quotaPlan struct {
 	Status string
 	// EndsAt is the term end in epoch seconds, when the upstream states one.
 	EndsAt *float64
+	// Entitlements are the grants the plan issued. They are kept because they
+	// are where the upstream states a bucket's period and granted amount —
+	// the balance rows the grants turned into carry the numbers but not the
+	// semantics.
+	Entitlements []quotaEntitlement
+}
+
+// quotaEntitlement is one grant inside a plan. The balance rows that spend it
+// name it by entitlement_id, which is what lets a bucket inherit the semantics
+// its own row does not repeat.
+type quotaEntitlement struct {
+	EntitlementID string
+	// ShowName and Meter are alternative readings of the same thing; the
+	// bucket resolves its own label, so only the meter and unit matter here.
+	Meter    string
+	UnitType string
+	Period   string
+	// GrantUnits is what the entitlement granted. It stays unknown when the
+	// upstream states no amount, which is not the same as granting zero.
+	GrantUnits *float64
 }
 
 // Plan statuses. Only an explicit "active" is a live plan: the upstream states
@@ -337,10 +382,49 @@ func parseQuotaPlans(body []byte, now time.Time) ([]quotaPlan, bool) {
 		plan.Name, _ = optionalString(fields["name"])
 		plan.Status, _ = optionalString(fields["status"])
 		plan.EndsAt, _, _ = optionalNumber(fields["ends_at"])
+		plan.Entitlements = parseQuotaEntitlements(fields["entitlements"])
 		plan.Status = planStatusFor(plan, parsed.Data.ServerTime, now)
 		plans = append(plans, plan)
 	}
 	return plans, true
+}
+
+// maxQuotaEntitlementRows caps the grants read from one plan, so a drifted
+// upstream cannot make one plan unbounded.
+const maxQuotaEntitlementRows = 32
+
+// parseQuotaEntitlements reads a plan's grants. A missing or null list is an
+// empty one — a plan can be in force without spelling its grants — and a field
+// that drifted away from an array of objects is dropped rather than
+// invalidating the plan row, because the plan's own status is what decides
+// whether the account has an entitlement at all.
+func parseQuotaEntitlements(raw json.RawMessage) []quotaEntitlement {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" || trimmed[0] != '[' {
+		return nil
+	}
+	var rows []json.RawMessage
+	if err := json.Unmarshal(trimmed, &rows); err != nil {
+		return nil
+	}
+	if len(rows) > maxQuotaEntitlementRows {
+		rows = rows[:maxQuotaEntitlementRows]
+	}
+	entitlements := make([]quotaEntitlement, 0, len(rows))
+	for _, row := range rows {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(bytes.TrimSpace(row), &fields); err != nil {
+			continue
+		}
+		entitlement := quotaEntitlement{}
+		entitlement.EntitlementID, _ = optionalString(fields["entitlement_id"])
+		entitlement.Meter, _ = optionalString(fields["meter"])
+		entitlement.UnitType, _ = optionalString(fields["unit_type"])
+		entitlement.Period, _ = optionalString(fields["period"])
+		entitlement.GrantUnits, _, _ = optionalNumber(fields["grant_units"])
+		entitlements = append(entitlements, entitlement)
+	}
+	return entitlements
 }
 
 // planStatusFor resolves a plan's effective status, and is the only place that
@@ -398,6 +482,15 @@ func planNameFor(plans []quotaPlan) string {
 // malformed instead of invalidating the envelope, so one drifted field cannot
 // hide the evidence of the rows that still parse.
 func parseQuotaBalances(body []byte) ([]quotaBalance, bool) {
+	return parseQuotaBalancesWithPlans(body, nil)
+}
+
+// parseQuotaBalancesWithPlans reads the balance rows and folds in the
+// semantics each row's granting entitlement stated. The observed response
+// repeats the meter and unit on the row but states the period and the granted
+// amount only on the entitlement, so a row read on its own cannot answer "how
+// often does this come back".
+func parseQuotaBalancesWithPlans(body []byte, plans []quotaPlan) ([]quotaBalance, bool) {
 	var parsed struct {
 		Data struct {
 			Balances json.RawMessage `json:"balances"`
@@ -417,15 +510,61 @@ func parseQuotaBalances(body []byte) ([]quotaBalance, bool) {
 	if len(rows) > maxQuotaBalanceRows {
 		rows = rows[:maxQuotaBalanceRows]
 	}
+	grants := entitlementIndex(plans)
 	balances := make([]quotaBalance, 0, len(rows))
 	for _, row := range rows {
 		balance, ok := parseQuotaBalanceRow(row)
 		if !ok {
 			return nil, false
 		}
+		balance.inheritEntitlement(grants)
 		balances = append(balances, balance)
 	}
 	return balances, true
+}
+
+// entitlementIndex collects every plan's grants under the id the balance rows
+// name them by. An id stated by two plans keeps the first: the upstream orders
+// its rows by priority, and a duplicated id is not a second bucket.
+func entitlementIndex(plans []quotaPlan) map[string]quotaEntitlement {
+	index := map[string]quotaEntitlement{}
+	for _, plan := range plans {
+		for _, entitlement := range plan.Entitlements {
+			id := strings.TrimSpace(entitlement.EntitlementID)
+			if id == "" {
+				continue
+			}
+			if _, exists := index[id]; !exists {
+				index[id] = entitlement
+			}
+		}
+	}
+	return index
+}
+
+// inheritEntitlement fills the fields a balance row left unread from the grant
+// that produced it. A row's own reading always wins: the grant states what was
+// given, the bucket states what is left of it.
+func (b *quotaBalance) inheritEntitlement(grants map[string]quotaEntitlement) {
+	if len(grants) == 0 {
+		return
+	}
+	grant, ok := grants[strings.TrimSpace(b.EntitlementID)]
+	if !ok {
+		return
+	}
+	if b.Meter == "" {
+		b.Meter = grant.Meter
+	}
+	if b.UnitType == "" {
+		b.UnitType = grant.UnitType
+	}
+	if b.Period == "" {
+		b.Period = grant.Period
+	}
+	if b.GrantUnits == nil {
+		b.GrantUnits = grant.GrantUnits
+	}
 }
 
 // parseQuotaBalanceRow decodes one balance row. ok is false only when the row
@@ -435,12 +574,21 @@ func parseQuotaBalanceRow(row json.RawMessage) (quotaBalance, bool) {
 	if err := json.Unmarshal(bytes.TrimSpace(row), &fields); err != nil {
 		return quotaBalance{}, false
 	}
-	balance := quotaBalance{Name: "model"}
+	balance := quotaBalance{}
 	if name, ok := optionalString(fields["show_name"]); ok && name != "" {
 		balance.Name = name
 	} else if name, ok := optionalString(fields["model"]); ok && name != "" {
 		balance.Name = name
 	}
+	balance.EntitlementID, _ = optionalString(fields["entitlement_id"])
+	// A textual field that drifted is dropped rather than guessed at, and the
+	// row still stands: it describes a real bucket, and only its label or unit
+	// is unreadable. That is why these do not mark the row the way a drifted
+	// number does — the numbers are what a drifted row would leave the page
+	// nothing to show.
+	balance.Meter, _ = optionalString(fields["meter"])
+	balance.UnitType, _ = optionalString(fields["unit_type"])
+	balance.Period, _ = optionalString(fields["period"])
 	balance.ExpiresAt = quotaExpiryText(fields["expires_at"])
 	if capabilities, ok := parseQuotaCapabilities(fields["capabilities"]); ok {
 		balance.Capabilities = capabilities
@@ -450,19 +598,68 @@ func parseQuotaBalanceRow(row json.RawMessage) (quotaBalance, bool) {
 	// A numeric field that is present but not a number leaves the pointer
 	// nil while marking the row malformed: the drift is visible as schema
 	// evidence, never as a silent zero.
-	balance.Total, _, _ = optionalNumber(fields["total_units"])
-	if balance.Total == nil && fields["total_units"] != nil {
-		balance.Malformed = true
-	}
-	balance.Used, _, _ = optionalNumber(fields["used_units"])
-	if balance.Used == nil && fields["used_units"] != nil {
-		balance.Malformed = true
-	}
-	balance.Remaining, _, _ = optionalNumber(fields["remaining_units"])
-	if balance.Remaining == nil && fields["remaining_units"] != nil {
-		balance.Malformed = true
+	for _, field := range []struct {
+		key  string
+		slot **float64
+	}{
+		{"total_units", &balance.Total},
+		{"used_units", &balance.Used},
+		{"remaining_units", &balance.Remaining},
+		{"grant_units", &balance.GrantUnits},
+		{"period_start", &balance.PeriodStart},
+		{"period_end", &balance.PeriodEnd},
+	} {
+		value, _, _ := optionalNumber(fields[field.key])
+		*field.slot = value
+		if value == nil && fields[field.key] != nil {
+			balance.Malformed = true
+		}
 	}
 	return balance, true
+}
+
+// balanceDisplayName renders one bucket's label from the upstream's own
+// semantics. A bucket that names itself is shown by that name; one that does
+// not is shown by what it meters and in what unit, which is strictly more
+// information than the literal "model" this used to invent — that literal was
+// neither a model nor a unit and reached the page as the label of every
+// capability-less bucket. A bucket the upstream described nothing about has no
+// label to render, and stays blank rather than being given a placeholder that
+// reads like one.
+func balanceDisplayName(balance quotaBalance) string {
+	if name := strings.TrimSpace(balance.Name); name != "" {
+		return name
+	}
+	meter := strings.TrimSpace(balance.Meter)
+	unit := strings.TrimSpace(balance.UnitType)
+	switch {
+	case meter != "" && unit != "":
+		return meter + "(" + unit + ")"
+	case meter != "":
+		return meter
+	case unit != "":
+		return unit
+	default:
+		return ""
+	}
+}
+
+// balanceRemainingFraction is the one reading of "how much is left": the
+// bucket's remaining share of its own total, clamped into [0,1]. Both the host
+// group and the management page render this value, so the page cannot disagree
+// with the host about how much is left.
+//
+// The fraction is unknown, not zero, whenever either end is missing or the row
+// drifted: a share of nothing says nothing about how much remains, and a
+// drifted row is not evidence about its numbers at all.
+func balanceRemainingFraction(balance quotaBalance) (float64, bool) {
+	if balance.Malformed || balance.Remaining == nil || balance.Total == nil {
+		return 0, false
+	}
+	if *balance.Total <= 0 {
+		return 0, false
+	}
+	return math.Max(0, math.Min(1, *balance.Remaining / *balance.Total)), true
 }
 
 // quotaExpiryText renders a bucket's reset instant as the host's ResetTime
@@ -581,7 +778,11 @@ func balanceModelIDs(balance quotaBalance) []string {
 	}
 	if len(ids) == 0 {
 		// A balance whose meter is a model is how the plan advertises that
-		// model even without an explicit capability entry.
+		// model even without an explicit capability entry — but only when the
+		// upstream named it. A bucket labelled by its meter and unit instead
+		// ("model_usage(token)") carries no model: it is the plan's billing
+		// shape, not a model id, and admitting it would put a non-model into
+		// the dynamic catalog.
 		if name := strings.TrimSpace(balance.Name); name != "" {
 			ids = append(ids, canonicalizeGLMModelID(name))
 		}
@@ -659,31 +860,33 @@ func (e *quotaEvidence) renderView() {
 		if balance.Malformed {
 			continue
 		}
+		name := balanceDisplayName(balance)
 		if value := balance.Remaining; value != nil {
 			e.Summary = append(e.Summary, pluginapi.QuotaMetric{
-				Key:    "remaining:" + balance.Name,
-				Label:  balance.Name + " remaining",
+				Key:    "remaining:" + name,
+				Label:  name + " remaining",
 				Value:  *value,
 				Format: "number",
 			})
 		}
 		if value := balance.Used; value != nil {
 			e.Summary = append(e.Summary, pluginapi.QuotaMetric{
-				Key:    "used:" + balance.Name,
-				Label:  balance.Name + " used",
+				Key:    "used:" + name,
+				Label:  name + " used",
 				Value:  *value,
 				Format: "number",
 			})
 		}
 		// A bucket needs both ends of the window; a remaining value without a
 		// total would render as a misleading fraction, so it stays in the
-		// flat metrics only.
-		if balance.Remaining != nil && balance.Total != nil && *balance.Total > 0 {
+		// flat metrics only. The fraction itself comes from the one reading the
+		// management page also renders, so the two surfaces cannot disagree.
+		if fraction, ok := balanceRemainingFraction(balance); ok {
 			e.Groups = append(e.Groups, pluginapi.QuotaGroup{
-				DisplayName: balance.Name,
+				DisplayName: name,
 				Buckets: []pluginapi.QuotaBucket{{
-					Window:            balance.Name,
-					RemainingFraction: *balance.Remaining / *balance.Total,
+					Window:            name,
+					RemainingFraction: fraction,
 					ResetTime:         balance.ExpiresAt,
 				}},
 			})

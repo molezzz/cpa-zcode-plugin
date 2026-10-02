@@ -330,6 +330,28 @@ type quotaBalanceView struct {
 	Used      *float64 `json:"used,omitempty"`
 	Remaining *float64 `json:"remaining,omitempty"`
 	ExpiresAt string   `json:"expires_at,omitempty"`
+	// RemainingFraction is the bucket's remaining share of its own total,
+	// computed once on the Go side so the page renders the same number the host
+	// quota group does instead of dividing again. Absent whenever either end is
+	// unread, so the page shows "未知" rather than a fraction of nothing.
+	RemainingFraction *float64 `json:"remaining_fraction,omitempty"`
+	// Meter and UnitType are what the bucket counts and in what unit. They are
+	// the difference between "59534117 left" and "59534117 model tokens left",
+	// and both stay absent when the upstream stated neither.
+	Meter    string `json:"meter,omitempty"`
+	UnitType string `json:"unit_type,omitempty"`
+	// Period is the bucket's recurrence as the upstream spells it, folded in
+	// from the granting entitlement. Absent means the plugin could not read it,
+	// which the page renders as unknown rather than as a non-recurring bucket.
+	Period string `json:"period,omitempty"`
+	// Grant is the amount the entitlement granted, which is not the bucket
+	// total: a bucket whose grant spans several windows may spend less at once
+	// than it was granted.
+	Grant *float64 `json:"grant,omitempty"`
+	// PeriodStart and PeriodEnd bound the window the numbers belong to. A
+	// recurring bucket restarts at PeriodEnd; a one-time grant does not.
+	PeriodStart *float64 `json:"period_start,omitempty"`
+	PeriodEnd   *float64 `json:"period_end,omitempty"`
 	// Malformed marks a row whose numeric fields drifted from the observed
 	// schema. It stays visible with its unknown values instead of vanishing,
 	// so the page shows the drift rather than silently hiding a balance.
@@ -469,15 +491,33 @@ func quotaViewFor(observation quotaObservation) *quotaView {
 	}
 	for _, balance := range observation.Balances {
 		view.Balances = append(view.Balances, quotaBalanceView{
-			Name:      balance.Name,
-			Total:     balance.Total,
-			Used:      balance.Used,
-			Remaining: balance.Remaining,
-			ExpiresAt: balance.ExpiresAt,
-			Malformed: balance.Malformed,
+			Name:              balanceDisplayName(balance),
+			Total:             balance.Total,
+			Used:              balance.Used,
+			Remaining:         balance.Remaining,
+			ExpiresAt:         balance.ExpiresAt,
+			RemainingFraction: quotaFractionPointer(balance),
+			Meter:             balance.Meter,
+			UnitType:          balance.UnitType,
+			Period:            balance.Period,
+			Grant:             balance.GrantUnits,
+			PeriodStart:       balance.PeriodStart,
+			PeriodEnd:         balance.PeriodEnd,
+			Malformed:         balance.Malformed,
 		})
 	}
 	return view
+}
+
+// quotaFractionPointer adapts the shared remaining-share reading to the JSON
+// document's absent-means-unknown convention: an unreadable share is no key at
+// all, never a zero the page would render as an empty bucket.
+func quotaFractionPointer(balance quotaBalance) *float64 {
+	fraction, ok := balanceRemainingFraction(balance)
+	if !ok {
+		return nil
+	}
+	return &fraction
 }
 
 // managementActionRequest is the fixed contract of the action route.

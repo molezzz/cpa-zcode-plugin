@@ -418,13 +418,108 @@ const managementPageHTML = `<!DOCTYPE html>
   // ("unknown"). Collapsing the last two into one "unknown" is what made the
   // earlier empty billing answer look like a missing subscription.
   var QUOTA_STATES = {
-    ok: ["有套餐且有余额", "pill-ok"],
+    ok: ["有套餐且有额度", "pill-ok"],
     exhausted: ["套餐额度耗尽", "pill-bad"],
     no_plan: ["该账号没有 Coding Plan", "pill-warn"],
     plan_expired: ["套餐已到期", "pill-bad"],
     unknown: ["未知(上游返回无法解析)", "pill-warn"],
     unavailable: ["不可用(凭证被拒绝)", "pill-bad"]
   };
+
+  // An unreadable number is not a zero. Every optional field the upstream may
+  // omit renders through this one helper, so a missing value reads as "未知"
+  // rather than as a measurement the plugin never received.
+  function unknownNumber(value) {
+    return value === null || value === undefined ? "未知" : value.toLocaleString();
+  }
+
+  // Bucket recurrence as the page reads it. A one_time grant does not come
+  // back, so showing it a reset time would tell an operator to wait for
+  // something that will never arrive; a recurring window comes back on its own
+  // and the reset time is what decides whether to switch accounts now. An
+  // unread period is neither of those, and says so.
+  //
+  // The map is a translation, not a whitelist: an upstream spelling this page
+  // does not know still renders as itself, because it is a real statement
+  // about the bucket and hiding it behind "未知" would be worse than showing an
+  // operator a term they have not seen before.
+  var PERIOD_READINGS = {
+    one_time: "一次性额度",
+    daily: "每日额度",
+    weekly: "每周额度",
+    monthly: "每月额度"
+  };
+  var ONE_TIME_PERIOD = "one_time";
+
+  function periodReading(period) {
+    if (!period) { return "周期未知"; }
+    return PERIOD_READINGS[period] || period;
+  }
+
+  // bucketInstant labels the upstream's expires_at by what that instant means
+  // for this bucket. It is one instant and one reading: a one_time grant lapses
+  // at it and never refills, so "到期" is the whole truth; a recurring window
+  // refills at it, so "重置" is. An unread period proves neither, and the
+  // instant is reported unlabelled rather than guessed into one of the two.
+  function bucketInstant(balance) {
+    if (!balance.period) { return whenReading(balance.expires_at); }
+    return (balance.period === ONE_TIME_PERIOD ? "到期 " : "") + whenReading(balance.expires_at) +
+      (balance.period === ONE_TIME_PERIOD ? "" : " 重置");
+  }
+
+  // An instant is formatted adaptively, matching the official client's rule: a
+  // moment later today is actionable by its clock time alone, and one on
+  // another day by its date alone. Printing the raw RFC3339 string would make an
+  // operator do the timezone and comparison themselves. An instant in another
+  // year keeps its year, because "1/1" read next to today's date is ambiguous
+  // rather than merely terse.
+  function whenReading(instant) {
+    var when = new Date(instant);
+    if (isNaN(when.getTime())) { return "时间未知"; }
+    var now = new Date();
+    var sameDay = when.getFullYear() === now.getFullYear() &&
+      when.getMonth() === now.getMonth() && when.getDate() === now.getDate();
+    if (sameDay) { return "今日 " + when.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }); }
+    var sameYear = when.getFullYear() === now.getFullYear();
+    return when.toLocaleDateString("zh-CN", sameYear
+      ? { month: "numeric", day: "numeric" }
+      : { year: "numeric", month: "numeric", day: "numeric" });
+  }
+
+  // quotaBucket renders one evidence line per bucket. The order is what an
+  // operator acts on: how much is left in share first (the fraction is
+  // computed by the plugin so this page cannot disagree with the host about
+  // it), then whether waiting is an option at all, then the raw counts — which
+  // are what the share was derived from and what an operator checks the
+  // upstream against.
+  function quotaBucket(balance) {
+    var lines = [];
+    var fraction = balance.remaining_fraction;
+    var share = fraction === null || fraction === undefined
+      ? "剩余比例未知"
+      : "剩余 " + (fraction * 100).toFixed(1) + "%";
+    lines.push((balance.name || "未命名额度") + (balance.malformed ? "(字段漂移)" : "") + " " + share);
+    var unit = balance.unit_type ? " " + balance.unit_type : "";
+    lines.push(unknownNumber(balance.remaining) + " / " + unknownNumber(balance.total) + unit);
+    // The upstream always states expires_at, but what it means depends on the
+    // period: the same instant is a refill for a recurring window and a lapse
+    // for a one_time grant.
+    if (balance.expires_at) {
+      lines.push(periodReading(balance.period) + "，" + bucketInstant(balance));
+    } else {
+      lines.push(periodReading(balance.period));
+    }
+    if (balance.meter) { lines.push("计量 " + balance.meter); }
+    // The granted amount is not the bucket total: it is what the entitlement
+    // handed over, and the gap between the two is how much of the grant this
+    // window may spend. It is shown only when it differs, because for a bucket
+    // sized to its own grant it repeats the total one line above.
+    if (balance.grant !== null && balance.grant !== undefined &&
+        balance.grant !== balance.total) {
+      lines.push("授予 " + unknownNumber(balance.grant) + unit);
+    }
+    return lines;
+  }
 
   function quotaCell(quota) {
     var td = el("td");
@@ -436,9 +531,7 @@ const managementPageHTML = `<!DOCTYPE html>
     if (quota.reason) { lines.push(quota.reason); }
     if (quota.checked_at) { lines.push("查询于 " + quota.checked_at); }
     (quota.balances || []).forEach(function (balance) {
-      var remaining = balance.remaining === null || balance.remaining === undefined ? "未知" : balance.remaining;
-      var total = balance.total === null || balance.total === undefined ? "未知" : balance.total;
-      lines.push(balance.name + (balance.malformed ? "(字段漂移)" : "") + ":" + remaining + " / " + total);
+      lines.push.apply(lines, quotaBucket(balance));
     });
     return appendStack(td, statusSpan(known[0], known[1]), lines);
   }

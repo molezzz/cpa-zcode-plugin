@@ -434,6 +434,129 @@ func TestManagementPageCarriesOnlyAnUnauthenticatedShellContract(t *testing.T) {
 	}
 }
 
+// TestManagementPageTellsOneTimeBucketsFromRecurringOnes pins the acceptance
+// requirement that the captured one_time bucket and a recurring window are two
+// distinguishable readings. The trap is showing both a "重置" time: on a
+// one_time grant the instant is when the grant lapses and nothing ever refills,
+// so a reset time there sends an operator to wait for a refill that cannot
+// come. The page therefore labels the same instant "到期" on a one-time grant
+// and "重置" only on a recurring one.
+func TestManagementPageTellsOneTimeBucketsFromRecurringOnes(t *testing.T) {
+	page := managementPageHTML
+	script := page
+	if start := strings.Index(page, "<script>"); start >= 0 {
+		if end := strings.LastIndex(page, "</script>"); end > start {
+			script = page[start:end]
+		}
+	}
+
+	// The one_time spelling is isolated in a named constant rather than matched
+	// inline, because the label and the instant wording both read it.
+	if !strings.Contains(script, `var ONE_TIME_PERIOD = "one_time";`) {
+		t.Error("the one_time period spelling must be a named constant; the label and the instant wording both read it")
+	}
+	// The instant's meaning is decided by the period, and only by it: an
+	// unread period must not be read as recurring, and a one_time grant must
+	// not be told to wait for a refill.
+	if !strings.Contains(script, "balance.period === ONE_TIME_PERIOD") {
+		t.Error("what expires_at means must be decided by the bucket's period")
+	}
+	// An unread period reports the instant unlabelled rather than guessing it
+	// into either reading.
+	if !strings.Contains(script, "if (!balance.period) { return whenReading(balance.expires_at); }") {
+		t.Error("an unread period must leave the instant's meaning unlabelled")
+	}
+	// Both words must exist: rendering either one for both shapes would satisfy
+	// neither, and rendering neither would leave the instant unlabelled.
+	for _, want := range []string{"重置", "到期"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the page is missing the %q wording", want)
+		}
+	}
+
+	// The five-hour window is the shape the official client spends most of its
+	// quota surface on, and the page must read any non-one_time period as
+	// recurring without needing a table entry for it.
+	if !strings.Contains(script, "PERIOD_READINGS[period] || period") {
+		t.Error("an upstream period spelling the page has no translation for must still render as itself")
+	}
+}
+
+// TestManagementPageRendersQuotaAsActionableEvidence pins the reading the quota
+// column is required to give an operator. The page used to print one line of
+// "name:59534117 / 100000000", which forces a mental division to answer "how
+// much is left" and says nothing about when the bucket returns, whether it
+// returns at all, or what the unit is. These are the source-level contracts
+// that make the four facts visible; a plain unit count with none of them would
+// still render a table that looks finished.
+func TestManagementPageRendersQuotaAsActionableEvidence(t *testing.T) {
+	page := managementPageHTML
+
+	// The remaining share comes precomputed from the Go side. A page that
+	// divides again can disagree with the host quota group about the same
+	// bucket, and "the two surfaces tell different stories" is exactly the
+	// confusion this reading exists to remove. Both operands are checked
+	// because reordering defeats a single spelling: "remaining / total" and
+	// "remaining * 100 / total" are the same mistake.
+	for _, forbidden := range []string{"balance.remaining /", "balance.remaining/", "/ balance.total",
+		"/balance.total"} {
+		if strings.Contains(page, forbidden) {
+			t.Errorf("the page divides remaining by total itself (%q); the fraction is computed on the Go side", forbidden)
+		}
+	}
+	if !strings.Contains(page, "balance.remaining_fraction") {
+		t.Error("the page must render the remaining_fraction the plugin already computed")
+	}
+
+	// Thousands separators: a raw 100000000 is precisely the mental arithmetic
+	// the column exists to remove.
+	if !strings.Contains(page, "toLocaleString()") {
+		t.Error("unit counts must be grouped with a thousands separator")
+	}
+
+	// The instant is adaptive, matching the official client's semantics: today
+	// shows only HH:mm (the clock is what makes it actionable), another day
+	// shows the date (the day is what makes it actionable). The upstream's
+	// expires_at was always in the payload and was never rendered at all.
+	if !strings.Contains(page, "balance.expires_at") {
+		t.Error("the page must render the bucket's expiry instant; expires_at was parsed but never shown")
+	}
+	if !strings.Contains(page, "toLocaleTimeString") && !strings.Contains(page, "toLocaleDateString") {
+		t.Error("the instant must be formatted, not printed as a raw RFC3339 string")
+	}
+
+	// The one_time and recurring readings are different questions: "when does
+	// this come back" for a recurring window, "this is a one-off grant" for a
+	// one_time bucket. Rendering them identically would make an operator wait
+	// for a reset that will never arrive, and an unread period must stay a
+	// third reading rather than defaulting to either.
+	for _, want := range []string{"one_time", "周期未知"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing the period reading %q", want)
+		}
+	}
+
+	// Unknown stays unknown. Every optional numeric renders through one helper
+	// so a missing field becomes "未知" instead of 0.
+	if !strings.Contains(page, "unknownNumber") {
+		t.Error("unread optional numbers must go through one unknown-aware helper")
+	}
+
+	// No currency semantics anywhere: this upstream meters model tokens and
+	// tool calls, never money, so a currency symbol would assert a fact the
+	// evidence does not contain. Each entry is checked where it would appear —
+	// as a rendered prefix or suffix next to a number — rather than as a bare
+	// word, because a comment naming what the page refuses is not a use of it.
+	for _, forbidden := range []string{"¥", "$", "￥"} {
+		if strings.Contains(page, forbidden) {
+			t.Errorf("the page uses the currency symbol %q; the upstream meters tokens, not money", forbidden)
+		}
+	}
+	if strings.Contains(page, "余额") {
+		t.Error("the page uses the wording 余额, which reads as money; this upstream meters tokens")
+	}
+}
+
 func TestManagementHandleServesPageAndUnknownRoutes(t *testing.T) {
 	request, err := json.Marshal(managementHandleRPC{Method: http.MethodGet, Path: "/v0/management/zcode/page"})
 	if err != nil {
@@ -1041,6 +1164,114 @@ func TestQuotaViewKeepsMalformedBalanceRowsVisible(t *testing.T) {
 	}
 	if drifted["remaining"] != nil || drifted["total"] != nil {
 		t.Fatalf("drifted row = %v, want no coerced numbers", drifted)
+	}
+}
+
+// TestQuotaViewCarriesTheBucketEvidence pins what one refreshed bucket reaches
+// the page as. expires_at was already parsed and serialized but never read by
+// the page, and the semantics fields were dropped at the parser, so a bucket
+// could print a raw unit count while everything that makes it actionable — how
+// much is left in share, when it comes back, what it meters, how often — was
+// invisible.
+func TestQuotaViewCarriesTheBucketEvidence(t *testing.T) {
+	fixture := newManagementFixture(t)
+	fixture.accountDoc(t, "auth-bucket", "zcode-bucket-user", "active", "key-material-bucket")
+	// The grant lives on the plan's entitlement and the bucket inherits it, so
+	// the fixture carries both — which is the only shape in which "how often
+	// does this come back" and "what was it granted" are answerable at all.
+	fixture.billBody = planBalanceBody(
+		`[{"name":"ZCode Trust Build","status":"active","entitlements":[`+
+			`{"entitlement_id":"zcode-v3-start-plan-trust-1002","show_name":"GLM-5.3-Flash",`+
+			`"meter":"model_usage","unit_type":"token","grant_units":100000000,"period":"one_time"}]}]`,
+		oneTimeBalanceRow)
+
+	status, data := fixture.callAction(t, actionRefreshQuota, "auth-bucket")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body %v, want 200", status, data)
+	}
+	quota := data["quota"].(map[string]any)
+	balances, _ := quota["balances"].([]any)
+	if len(balances) != 1 {
+		t.Fatalf("balances = %v, want the one refreshed bucket", balances)
+	}
+	bucket := balances[0].(map[string]any)
+
+	if bucket["name"] != "GLM-5.3-Flash" {
+		t.Fatalf("bucket name = %v, want the upstream's own display name", bucket["name"])
+	}
+	// The fraction is computed once, on the Go side, from the same reading the
+	// host group renders: the page must never divide again.
+	if !floatPtrEqual(balanceFloat(t, bucket, "remaining_fraction"), float64Ptr(0.59534117)) {
+		t.Fatalf("remaining_fraction = %v, want 0.59534117", bucket["remaining_fraction"])
+	}
+	if bucket["expires_at"] == nil || bucket["expires_at"] == "" {
+		t.Fatal("the bucket reset time is missing; the page has no way to say when it returns")
+	}
+	for _, want := range []struct {
+		key   string
+		value float64
+	}{
+		{"grant", 100000000},
+		{"period_start", 1790893735},
+		{"period_end", 1790956800},
+	} {
+		if !floatPtrEqual(balanceFloat(t, bucket, want.key), float64Ptr(want.value)) {
+			t.Errorf("bucket[%q] = %v, want %v", want.key, bucket[want.key], want.value)
+		}
+	}
+	for key, want := range map[string]string{
+		"meter":     "model_usage",
+		"unit_type": "token",
+		"period":    "one_time",
+	} {
+		if bucket[key] != want {
+			t.Errorf("bucket[%q] = %v, want %v", key, bucket[key], want)
+		}
+	}
+}
+
+// balanceFloat reads one numeric field out of a decoded bucket view, failing
+// the test when the field is absent. It exists so every "the plugin read
+// exactly this number" assertion in the management tests compares the same
+// way instead of each hand-rolling a tolerance.
+func balanceFloat(t *testing.T, bucket map[string]any, key string) *float64 {
+	t.Helper()
+	value, present := bucket[key]
+	if !present {
+		t.Fatalf("bucket has no %q field; the page cannot render what the plugin never sent", key)
+	}
+	number, ok := value.(float64)
+	if !ok {
+		t.Fatalf("bucket[%q] = %v (%T), want a JSON number", key, value, value)
+	}
+	return &number
+}
+
+// TestQuotaViewRendersUnknownEvidenceAsAbsent pins the other half of the
+// unknown-is-not-zero rule at the JSON boundary: a field the upstream omitted
+// has no key at all, so the page renders "未知" rather than a number that reads
+// as a measurement.
+func TestQuotaViewRendersUnknownEvidenceAsAbsent(t *testing.T) {
+	fixture := newManagementFixture(t)
+	fixture.accountDoc(t, "auth-unknown", "zcode-unknown-user", "active", "key-material-unknown")
+	fixture.billBody = balanceBody(`{"remaining_units":42}`)
+
+	status, data := fixture.callAction(t, actionRefreshQuota, "auth-unknown")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body %v, want 200", status, data)
+	}
+	quota := data["quota"].(map[string]any)
+	bucket := quota["balances"].([]any)[0].(map[string]any)
+	for _, key := range []string{"total", "used", "remaining_fraction", "grant", "period",
+		"period_start", "period_end", "expires_at", "meter", "unit_type"} {
+		if value, present := bucket[key]; present && value != nil && value != "" {
+			t.Errorf("bucket[%q] = %v, want the field absent for an unstated value", key, value)
+		}
+	}
+	// The bucket described no meter either, so it has no name to render rather
+	// than the placeholder the parser used to invent.
+	if bucket["name"] != "" {
+		t.Fatalf("bucket name = %v, want blank for a bucket the upstream did not name", bucket["name"])
 	}
 }
 
