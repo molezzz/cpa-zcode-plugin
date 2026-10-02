@@ -113,6 +113,19 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
   自动化冒烟的覆盖面:CI 在 Ubuntu 原生执行加载/注册冒烟;release 工作流在 linux/amd64 与 darwin/arm64 原生冒烟。windows/amd64 与 darwin/amd64 产物未做自动化加载冒烟,依赖本项的人工宿主加载验证。
 - [ ] 按 `docs/install.md` 第 4 节完成一次升级与一次回滚演练。
 
+### 1.11 流式跨格式入口(#17,证据等级:**宿主源码 + 线上日志已确认,已修复**)
+
+宿主对 claude 格式插件的流消费有两条互斥路径:同格式(如 `/v1/messages`)原样上 wire,跨格式(如 `/v1/responses` → openai-response、`/v1/chat/completions` → openai)逐 chunk 交给 SDK 响应翻译器,而 claude→目标格式一类翻译器**只接受单个 `data:` 前缀行**、其余整块丢弃。插件每帧一个 chunk 时前导 `event:` 行使整帧被丢,宿主判 `empty_stream: upstream stream closed before first payload`,而插件侧诊断仍显示 `frames=N output_started=true`——两者并存即本项的判别特征。
+
+修复(#17,31479dd):插件经 `sseFrameChunks`(upstream.go)把每帧拆成逐行 chunk(`event:` 行单发,`data:` 行携带帧尾空行),拼接逐字节等于原帧。验证项:
+
+- [ ] `/v1/messages` 流式输出与 1.5 一致(逐字节不变,由单测拼接断言守卫)。
+- [ ] `/v1/responses` 与 `/v1/chat/completions` 最小流式请求返回**完整**目标格式事件链(含终端事件与 usage),而非 `empty_stream`。
+- [ ] 插件诊断中 `frames=N output_started=true` 与宿主出现 `empty_stream` **不同现**(该并存即复发信号,先查插件 chunk 形态,不要先查上游)。
+- [ ] 宿主日志中该 provider 的 `empty_stream` 计数在部署后归零。
+
+排查环境记录(非插件责任但会伪装成插件故障):宿主按模型轮换起始 provider,同一模型被多个 provider 认领时,落到慢 provider 的请求表现为 30s+ 挂死(499/200 交替)且插件完全不被调用;本机 `glm-5.3-flash` 同时被 zcode 与 openai-compat provider 认领即为此形态。判别方法:请求是否出现在插件 `[zcode-plugin] attempt` 诊断行中。
+
 ### 1.10 请求身份与归因差分抓包(#15 后续,证据等级:**抓包已完成,结论已回填**)
 
 2026-10-02 已完成抓包(会话 `20261002-194452_2344fd`,官方 Windows 客户端 3.14.4,同账号,

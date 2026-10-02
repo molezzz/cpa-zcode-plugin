@@ -8,6 +8,8 @@
 
 CPA/CLIProxyAPI 与 Provider 插件之间的稳定 ABI 和回调契约。插件不针对某个具体宿主版本锁定或声明兼容范围；只有该协议实际发生不兼容变更时，才更新适配层。
 
+流式输出在宿主侧有两种消费形态，插件必须同时满足两者（issue #17）：调用方格式与插件输出格式**相同时**，chunk 被原样写上 wire，因此 chunk 拼接必须逐字节等于上游 SSE 帧；格式**不同时**（如 `/v1/responses`、`/v1/chat/completions` 走 openai 系），每个 chunk 交给 SDK 响应翻译器，而 claude→目标格式的翻译器只接受**单个 `data:` 前缀行**，其余整块丢弃。宿主不对插件暴露调用方的退出格式，所以插件不能像宿主内置 executor 那样按出口格式二选一，只能发射同时合法的形态：逐行 chunk（`event:` 行单发，`data:` 行携带帧尾空行）。一个 chunk 装一整帧会同时违反翻译路径（整帧被丢，宿主报 `empty_stream`，而插件侧诊断仍显示"已发 N 帧"）并破坏 verbatim 路径的事件边界。
+
 ## ZCode 凭证
 
 通过 Z.AI OAuth 登录获得并由插件持有的上游身份材料。当前已知形式包括 Coding Plan JWT、登录时发放的 OAuth access token，以及由该 access token 兑换得到的 Z.AI 业务 token 和可由业务 token 创建的 Z.AI API Key；它们属于同一个上游身份的不同凭证形式，而不是靠字符串格式猜测的"账号类型"。
