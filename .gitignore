@@ -13,3 +13,6 @@ docs/ZCode/
 dist/
 # go build ./... 在模块根目录留下的二进制
 cpa-zcode-plugin
+
+# ZCode 会话产物（计划、临时状态），不纳入版本管理
+.zcode/
