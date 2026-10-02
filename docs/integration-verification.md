@@ -21,7 +21,7 @@
 - **本地 mock 可验证**:结论由 httptest 模拟上游与插件闭环得出,如 405+3012 映射为调用方 400、不迁移凭证状态、不跨计费域回退。
 - **需授权真实环境抓包**:结论必须来自隔离身份上官方客户端与插件同一场景的差分抓包,如 Start Plan JWT 的最终 wire 认证形态(是否同时携带 `Authorization: Bearer` 与 `x-api-key`)、设备/会话归因字段、官方 `/ultra-zai` 网关的实际计费域。抓包门槛未通过前,官方网关 adapter 不启用,相关 wire 细节不写成默认协议承诺。
 
-禁止把第三类写成第一类:上游没有在源码或抓包中解释过的成因(包括把 `3012` 等同于"缺官方挑战材料"或验证码),一律不得写入代码注释、错误文案或文档。
+禁止把第三类写成第一类:上游没有在源码或抓包中解释过的成因(包括把 `3012` 等同于"缺官方挑战材料"或验证码),一律不得写入代码注释、错误文案或文档。`3012` 的成因已于 2026-10-02 经授权抓包加差分实验取证(见 1.10 结论),属第一类+第二类证据,其门控是请求体 `system` 的官方前缀指纹,与任何头级差异无关。
 
 ### 1.1 OAuth 登录(宿主原生入口)
 
@@ -74,7 +74,8 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
 - [ ] 若验证阻塞在隔离环境中无法复现,记录"未能复现",并改用模拟上游测试的结论作为依据(见 `credential_state_test.go` 与 `error_codes_test.go` 的分类矩阵)。
 - [ ] 上游返回 `{"code":3012}` 时(通常以 HTTP 405 承载)观察(证据等级:**本地 mock 可验证** + 需抓包补全成因):
   - 调用方收到的状态码**不是** 405(405 会让调用方误判为"方法不允许"),而是 400;
-  - JWT 状态**不**变为 `invalid`/`exhausted`,API Key 状态也**不**变——`3012` 在官方遥测归因中是请求级 `invalid_request`,成因未被官方源码或抓包证实,不是凭证失效;
+  - JWT 状态**不**变为 `invalid`/`exhausted`,API Key 状态也**不**变——`3012` 在官方遥测归因中是请求级 `invalid_request`,不是凭证失效;
+  - 成因(证据等级:**已取证**,2026-10-02 抓包+差分):网关完整性预检,门控是 `system` 数组以官方 system prompt 前两块打头;注入开关关闭或指纹收紧时仍会出现;
   - 请求**不**回退到受管 API Key:两条路径的计费/权益域不同,请求级拒绝不得因"可重试"就静默跨域消耗 API Key 余额(带 captcha/verify 证据的 403 回退不受影响);
   - 错误消息包含上游自己的 `msg` 与业务码,而不是一句 `upstream rejected the request (http 405)`;
   - 开启 `debug` 后,日志按请求记录 route、计费域、凭证种类、上游状态、业务码、有界 `msg`、`logid` 与回退决策;日志中不出现 token、API Key、Cookie、prompt、原始请求/响应 body、设备 ID 或会话 ID(`X-Session-Id` 的值自请求身份稳定后与 `X-Device-Mid` 一样只打印脱敏标记,仅 request/trace/query 归因 ID 打印值)。
@@ -112,7 +113,33 @@ OAuth 登录返回的 `data.zai.access_token` **不是**任何 `api.z.ai` 业务
   自动化冒烟的覆盖面:CI 在 Ubuntu 原生执行加载/注册冒烟;release 工作流在 linux/amd64 与 darwin/arm64 原生冒烟。windows/amd64 与 darwin/amd64 产物未做自动化加载冒烟,依赖本项的人工宿主加载验证。
 - [ ] 按 `docs/install.md` 第 4 节完成一次升级与一次回滚演练。
 
-### 1.10 请求身份与归因差分抓包(#15 后续,证据等级:**需授权真实环境抓包**)
+### 1.10 请求身份与归因差分抓包(#15 后续,证据等级:**抓包已完成,结论已回填**)
+
+2026-10-02 已完成抓包(会话 `20261002-194452_2344fd`,官方 Windows 客户端 3.14.4,同账号,
+经本机 mitmproxy 中继)与 26 组单变量差分实验(插件 JWT 直连上游,矩阵随 issue #16 归档)。
+结论:
+
+- **3012 门控 = 请求体 `system` 数组以官方 ZCode system prompt 前两块打头**(CLI 前缀句
+  "You are ZCode, an interactive coding agent" + 完整 agent 身份段;独立块、按序、不可合并
+  /替换;调用方内容只能后置;`cache_control` 无关;无 system/单块/乱序/合并/调用方前插均为
+  3012)。**所有头级差异经单变量排除**:`x-api-key` 双头、UA 的 ai-sdk 后缀、`X-Device-Mid`
+  缺失、Referer 斜杠、归因头语义——官方头集逐字节重放(含官方自己的 JWT)从脚本客户端发出
+  仍是 3012;插件现行头 + 官方 system 块 = 200。
+- 官方 `metadata.user_id` 确为字符串化 JSON,`device_id`/`account_uuid`/`session_id` 与
+  #15 注入形态一致;官方 `x-session-id` 与 body `session_id` 同值、会话内稳定;官方同时携带
+  `x-api-key` 与 `Authorization: Bearer`(同值)——以上为抓包证实的形态事实,但均**不是**
+  3012 的门控。
+- 维护者决策(issue #16,2026-10-02):插件自动注入官方 system 前缀
+  (`inject_official_system_prefix`,默认开;实现 `system_prefix.go`)。注入文本取自实测
+  通过的官方请求(块 2 为抓包 preview 前缀,实验证明足以过门控)。
+- 残余观察项(不影响 3012,抓包时顺手记录):官方每轮对话发 `session-type: main` 与
+  `other` 交替的多请求;官方 Messages 请求不带 `X-Device-Mid` 头(billing 端点才带);
+  `x-query-id` 为 UUIDv7 形态。这些差异对插件行为无已知影响,若未来指纹收紧可回来复核。
+
+以下原始清单保留为方法论记录(当时"不得在抓包前写成协议承诺"的纪律对 #14/#15 全程有效):
+
+用现有 openai_reg mitmproxy 链路,在隔离身份上分别抓官方 CLI 与本插件同一场景的
+`POST /api/v1/zcode-plan/anthropic/v1/messages` 出站请求,逐头逐 body 比对以下项目。
 
 用现有 openai_reg mitmproxy 链路,在隔离身份上分别抓官方 CLI 与本插件同一场景的
 `POST /api/v1/zcode-plan/anthropic/v1/messages` 出站请求,逐头逐 body 比对以下项目。比对

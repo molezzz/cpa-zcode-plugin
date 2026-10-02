@@ -21,6 +21,13 @@ type Config struct {
 	// sanitized headers, duration, and classified outcome, and each quota
 	// refresh logs its verdict evidence. Default off.
 	Debug *bool `yaml:"debug"`
+	// InjectOfficialSystemPrefix controls the request-body integrity prefix
+	// (system_prefix.go): the official ZCode system prompt's leading blocks
+	// are prepended to the caller's system content so the Coding Plan gateway
+	// admits the request. Unset defaults to true — without it the gateway
+	// rejects every Messages request with 3012, so only an operator who has
+	// decided against the injection for their deployment turns it off.
+	InjectOfficialSystemPrefix *bool `yaml:"inject_official_system_prefix"`
 
 	Product        ProductConfig        `yaml:"product"`
 	Client         ClientConfig         `yaml:"client"`
@@ -90,6 +97,13 @@ func (c ModelDiscoveryConfig) IsEnabled() bool {
 // to false, because the lines are for troubleshooting, not for steady state.
 func (c Config) IsDebugEnabled() bool {
 	return c.Debug != nil && *c.Debug
+}
+
+// IsInjectOfficialSystemPrefixEnabled reports whether the request-body
+// integrity prefix is injected; unset defaults to true, because a request
+// without it is rejected by the gateway's client-integrity precheck (3012).
+func (c Config) IsInjectOfficialSystemPrefixEnabled() bool {
+	return c.InjectOfficialSystemPrefix == nil || *c.InjectOfficialSystemPrefix
 }
 
 const (

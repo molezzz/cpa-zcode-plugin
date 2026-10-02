@@ -105,7 +105,7 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 	// header come from one resolution and can never describe two devices.
 	doc := currentAuthDocument(authIndex, req.StorageJSON)
 	identity := requestIdentityFor(authIndex, doc)
-	payload, model, envErr := prepareUpstreamPayload(req.Payload, req.Model, cfg.Models, identity)
+	payload, model, envErr := prepareUpstreamPayload(req.Payload, req.Model, cfg.Models, identity, cfg.IsInjectOfficialSystemPrefixEnabled())
 	if envErr != nil {
 		diagf("request tag=%s mode=aggregate rejected: payload could not be prepared", tag)
 		return envErr, nil
@@ -234,7 +234,7 @@ func handleExecutorExecuteStream(request []byte) ([]byte, error) {
 	// identity, shared by the payload metadata and the profile headers.
 	doc := currentAuthDocument(authIndex, req.StorageJSON)
 	identity := requestIdentityFor(authIndex, doc)
-	payload, model, envErr := prepareUpstreamPayload(req.Payload, req.Model, cfg.Models, identity)
+	payload, model, envErr := prepareUpstreamPayload(req.Payload, req.Model, cfg.Models, identity, cfg.IsInjectOfficialSystemPrefixEnabled())
 	if envErr != nil {
 		diagf("request tag=%s mode=stream rejected: payload could not be prepared", tag)
 		return envErr, nil
@@ -296,11 +296,14 @@ func decodeExecutorRequest(request []byte) (executorRequestRPC, []byte) {
 }
 
 // prepareUpstreamPayload normalizes the payload's model id, forces upstream
-// streaming, and injects the request-body identity: both streaming and
-// non-streaming callers consume the same upstream SSE pump, and the official
-// client writes its identity into every Anthropic request body. The failure
-// envelope carries the sanitized reason.
-func prepareUpstreamPayload(payload []byte, model string, catalog []string, identity requestIdentity) ([]byte, string, []byte) {
+// streaming, injects the request-body identity, and applies the official
+// system prefix: both streaming and non-streaming callers consume the same
+// upstream SSE pump, the official client writes its identity into every
+// Anthropic request body, and the gateway's integrity precheck admits only
+// requests whose system leads with the official ZCode system prompt blocks
+// (system_prefix.go, issue #16). The failure envelope carries the sanitized
+// reason.
+func prepareUpstreamPayload(payload []byte, model string, catalog []string, identity requestIdentity, injectSystemPrefix bool) ([]byte, string, []byte) {
 	trimmed := bytes.TrimSpace(payload)
 	if len(trimmed) == 0 {
 		return nil, "", errorEnvelope("invalid_request", "request payload is empty", http.StatusBadRequest)
@@ -320,6 +323,9 @@ func prepareUpstreamPayload(payload []byte, model string, catalog []string, iden
 	}
 	body["stream"] = true
 	applyRequestMetadata(body, identity)
+	if injectSystemPrefix {
+		injectOfficialSystemPrefix(body)
+	}
 	out, err := json.Marshal(body)
 	if err != nil {
 		return nil, "", errorEnvelope("invalid_request", "request payload could not be encoded", http.StatusBadRequest)

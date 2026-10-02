@@ -51,7 +51,7 @@ func TestUpstreamPayloadCarriesTheRequestBodyIdentity(t *testing.T) {
 		DeviceID:  deviceID,
 		SessionID: requestSessionID("auth-1"),
 	}
-	payload, _, envErr := prepareUpstreamPayload(testRequestPayload(), "GLM-5.2", nil, identity)
+	payload, _, envErr := prepareUpstreamPayload(testRequestPayload(), "GLM-5.2", nil, identity, true)
 	if envErr != nil {
 		t.Fatalf("prepareUpstreamPayload rejected the request: %s", envErr)
 	}
@@ -79,7 +79,7 @@ func TestRequestBodyIdentitySharesOneDeviceIdentityWithTheHeader(t *testing.T) {
 	doc := []byte(`{"zcode":{"identity_id":"zcode-user-1","jwt":{"token":"t","status":"active"},"device_mid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}}`)
 	identity := requestIdentityFor("auth-index-1", doc)
 
-	payload, _, envErr := prepareUpstreamPayload(testRequestPayload(), "GLM-5.2", nil, identity)
+	payload, _, envErr := prepareUpstreamPayload(testRequestPayload(), "GLM-5.2", nil, identity, true)
 	if envErr != nil {
 		t.Fatalf("prepareUpstreamPayload rejected the request: %s", envErr)
 	}
@@ -103,14 +103,14 @@ func TestRequestBodyIdentitySharesOneDeviceIdentityWithTheHeader(t *testing.T) {
 func TestRequestBodyIdentityIsStablePerSessionAndDistinctAcrossSessions(t *testing.T) {
 	const deviceID = "11111111-2222-4333-8444-555555555555"
 	first, _, envErr := prepareUpstreamPayload(testRequestPayload(), "GLM-5.2", nil,
-		requestIdentity{DeviceID: deviceID, SessionID: requestSessionID("auth-1")})
+		requestIdentity{DeviceID: deviceID, SessionID: requestSessionID("auth-1")}, true)
 	if envErr != nil {
 		t.Fatalf("prepareUpstreamPayload rejected the request: %s", envErr)
 	}
 	second, _, _ := prepareUpstreamPayload(testRequestPayload(), "GLM-5.2", nil,
-		requestIdentity{DeviceID: deviceID, SessionID: requestSessionID("auth-1")})
+		requestIdentity{DeviceID: deviceID, SessionID: requestSessionID("auth-1")}, true)
 	other, _, _ := prepareUpstreamPayload(testRequestPayload(), "GLM-5.2", nil,
-		requestIdentity{DeviceID: deviceID, SessionID: requestSessionID("auth-2")})
+		requestIdentity{DeviceID: deviceID, SessionID: requestSessionID("auth-2")}, true)
 
 	firstID, _ := metadataUserIDOf(t, parseUpstreamPayload(t, first))
 	secondID, _ := metadataUserIDOf(t, parseUpstreamPayload(t, second))
@@ -131,7 +131,7 @@ func TestRequestBodyIdentityIsStablePerSessionAndDistinctAcrossSessions(t *testi
 func TestRequestBodyIdentityIsOmittedWithoutADeviceIdentity(t *testing.T) {
 	// With no device id there is nothing honest to present: the whole field is
 	// omitted rather than sending an empty or guessed identity.
-	payload, _, envErr := prepareUpstreamPayload(testRequestPayload(), "GLM-5.2", nil, requestIdentity{})
+	payload, _, envErr := prepareUpstreamPayload(testRequestPayload(), "GLM-5.2", nil, requestIdentity{}, true)
 	if envErr != nil {
 		t.Fatalf("prepareUpstreamPayload rejected the request: %s", envErr)
 	}
@@ -142,7 +142,7 @@ func TestRequestBodyIdentityIsOmittedWithoutADeviceIdentity(t *testing.T) {
 
 func TestSessionIDIsOmittedWithoutSessionContext(t *testing.T) {
 	payload, _, envErr := prepareUpstreamPayload(testRequestPayload(), "GLM-5.2", nil,
-		requestIdentity{DeviceID: "11111111-2222-4333-8444-555555555555"})
+		requestIdentity{DeviceID: "11111111-2222-4333-8444-555555555555"}, true)
 	if envErr != nil {
 		t.Fatalf("prepareUpstreamPayload rejected the request: %s", envErr)
 	}
@@ -165,7 +165,7 @@ func TestCallerRequestBodyIdentityIsReplacedByThePluginDeclaredOne(t *testing.T)
 	payload, _, envErr := prepareUpstreamPayload(
 		[]byte(`{"model":"glm-5.2","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"metadata":{"user_id":"user_caller_identity","conversation":"c-1"}}`),
 		"GLM-5.2", nil,
-		requestIdentity{DeviceID: "11111111-2222-4333-8444-555555555555", SessionID: "session-derived"})
+		requestIdentity{DeviceID: "11111111-2222-4333-8444-555555555555", SessionID: "session-derived"}, true)
 	if envErr != nil {
 		t.Fatalf("prepareUpstreamPayload rejected the request: %s", envErr)
 	}
@@ -186,7 +186,7 @@ func TestMalformedCallerMetadataIsReplacedByThePluginIdentity(t *testing.T) {
 	payload, _, envErr := prepareUpstreamPayload(
 		[]byte(`{"model":"glm-5.2","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"metadata":"garbage"}`),
 		"GLM-5.2", nil,
-		requestIdentity{DeviceID: "11111111-2222-4333-8444-555555555555"})
+		requestIdentity{DeviceID: "11111111-2222-4333-8444-555555555555"}, true)
 	if envErr != nil {
 		t.Fatalf("prepareUpstreamPayload rejected the request: %s", envErr)
 	}
