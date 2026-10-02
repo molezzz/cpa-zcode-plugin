@@ -504,7 +504,9 @@ func TestExecutorExecuteStreamDoesNotSpliceAfterOutput(t *testing.T) {
 		t.Fatal("stream was never closed")
 	}
 	emits := rec.emitted()
-	if len(emits) != 1 || !strings.Contains(string(emits[0]), "partial") {
+	// The forwarder emits per-line chunks (sseFrameChunks); only the primary's
+	// partial output may have been forwarded, byte-identical when concatenated.
+	if got := strings.Join(emitStrings(emits), ""); got != partialStream {
 		t.Fatalf("forwarded frames = %v, want only the primary's partial output", emitStrings(emits))
 	}
 	closes := rec.closed()

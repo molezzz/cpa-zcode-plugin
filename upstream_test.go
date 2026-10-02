@@ -529,3 +529,79 @@ func TestPumpUpstream3012OnAnotherCarrierKeepsTheRealStatus(t *testing.T) {
 		t.Fatalf("failure = %+v, want a rejection with the upstream's own 400", failure)
 	}
 }
+
+// TestSSEFrameChunksReassembleByteIdentically pins the contract that lets one
+// emission serve both host consumers: the chunks sseFrameChunks produces must
+// concatenate back to the exact frame bytes, and the data line must arrive as
+// its own "data:"-prefixed chunk, because the host's cross-format response
+// translators read exactly one data line per chunk and drop the rest.
+func TestSSEFrameChunksReassembleByteIdentically(t *testing.T) {
+	cases := []struct {
+		name  string
+		frame string
+	}{
+		{"lf frame", "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"},
+		{"crlf frame", "event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n"},
+		{"eof partial without terminator", "event: message_stop\ndata: {\"type\":\"message_stop\"}"},
+		{"comment line", ": keepalive\ndata: {\"type\":\"ping\"}\n\n"},
+		{"multiple data lines", "data: {\"a\":1}\ndata: {\"b\":2}\n\n"},
+		{"data only", "data: {\"type\":\"ping\"}\n\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			chunks := sseFrameChunks([]byte(tc.frame))
+			if len(chunks) == 0 {
+				t.Fatal("no chunks produced")
+			}
+			if got := string(bytes.Join(chunks, nil)); got != tc.frame {
+				t.Fatalf("chunks reassemble to %q, want the original frame %q", got, tc.frame)
+			}
+			dataChunks := 0
+			for _, chunk := range chunks {
+				if bytes.HasPrefix(chunk, []byte("data:")) {
+					dataChunks++
+				}
+			}
+			wantData := 0
+			for _, line := range strings.Split(tc.frame, "\n") {
+				if strings.HasPrefix(line, "data:") {
+					wantData++
+				}
+			}
+			if dataChunks != wantData {
+				t.Fatalf("data-prefixed chunks = %d, want %d (chunks: %q)", dataChunks, wantData, chunks)
+			}
+		})
+	}
+}
+
+// TestSSEFrameChunksLeadsWithDataLineForTranslators checks the exact chunk
+// shapes the host contract needs: the event line is its own chunk, and the
+// data line carries the frame's blank separator so the verbatim path keeps
+// its event boundaries.
+func TestSSEFrameChunksLeadsWithDataLineForTranslators(t *testing.T) {
+	chunks := sseFrameChunks([]byte("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"))
+	if len(chunks) != 2 {
+		t.Fatalf("chunks = %q, want one event-line chunk and one data-line chunk", chunks)
+	}
+	if got := string(chunks[0]); got != "event: message_start\n" {
+		t.Fatalf("event chunk = %q", got)
+	}
+	if got := string(chunks[1]); got != "data: {\"type\":\"message_start\"}\n\n" {
+		t.Fatalf("data chunk = %q, want the data line plus the blank separator", got)
+	}
+
+	// A frame that ends at EOF without the blank separator must not gain one.
+	partial := sseFrameChunks([]byte("data: {\"type\":\"message_stop\"}"))
+	if len(partial) != 1 || string(partial[0]) != "data: {\"type\":\"message_stop\"}" {
+		t.Fatalf("partial chunks = %q, want the bare data line", partial)
+	}
+}
+
+func TestSSEFrameChunksEmptyFrameYieldsNothing(t *testing.T) {
+	for _, frame := range []string{"", "\n", "\r\n\r\n", "  \n\n"} {
+		if chunks := sseFrameChunks([]byte(frame)); len(chunks) != 0 {
+			t.Fatalf("sseFrameChunks(%q) = %q, want no chunks", frame, chunks)
+		}
+	}
+}

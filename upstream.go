@@ -99,6 +99,57 @@ func isBlankSSELine(line []byte) bool {
 	}
 }
 
+// sseFrameChunks splits one upstream SSE frame into the per-line chunks the
+// host's executor adapter consumes, reassembling byte-identically when the
+// chunks are concatenated.
+//
+// The host consumes a Claude-format executor's stream in two shapes. The
+// cross-format path hands every chunk to a response translator that accepts
+// only a single "data:"-prefixed line per chunk and silently drops anything
+// else, while the same-format path writes chunks to Claude clients verbatim,
+// where the concatenated bytes must stay valid SSE with event boundaries. One
+// whole frame per chunk satisfies neither: the translator drops the frame on
+// its leading "event:" line (every chunk is lost, which the host reports as an
+// empty stream), and bare data lines would strip the boundaries from the
+// verbatim path. Splitting per line, with the frame's blank separator attached
+// to its last content line, satisfies both: the translator sees one
+// "data:"-prefixed chunk per event and drops the "event:" line chunk by
+// design, and the verbatim path concatenates back to the exact upstream bytes.
+func sseFrameChunks(frame []byte) [][]byte {
+	var chunks [][]byte
+	last := -1 // index of the most recent non-blank chunk
+	start := 0
+	for i := 0; i < len(frame); i++ {
+		if frame[i] != '\n' {
+			continue
+		}
+		line := frame[start : i+1]
+		start = i + 1
+		if len(bytes.TrimSpace(line)) == 0 {
+			// A blank line closes the frame's event, so it rides on the
+			// content chunk before it. A blank line without preceding
+			// content is dropped: the frame reader never opens a frame
+			// with one, and a lone newline is not a chunk the host needs.
+			if last >= 0 {
+				chunks[last] = append(chunks[last], line...)
+			}
+			continue
+		}
+		chunks = append(chunks, append([]byte(nil), line...))
+		last = len(chunks) - 1
+	}
+	if rest := frame[start:]; len(rest) > 0 && len(bytes.TrimSpace(rest)) > 0 {
+		// An EOF-partial final line without a terminator is still forwarded
+		// verbatim so the host sees the frame's tail exactly as it arrived.
+		chunks = append(chunks, append([]byte(nil), rest...))
+		last = len(chunks) - 1
+	}
+	if last < 0 {
+		return nil
+	}
+	return chunks
+}
+
 // parseSSEFrame extracts the event name and joined data payload of one SSE
 // frame. ok is false for frames without data (comments and keepalives), which
 // carry nothing to aggregate.

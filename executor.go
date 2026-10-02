@@ -870,10 +870,15 @@ func (f *streamForwarder) Forward(ctx context.Context, frame []byte) error {
 	if err := frameFailure(frame); err != nil {
 		return err
 	}
-	if err := f.sink.Emit(ctx, f.streamID, frame); err != nil {
-		return hostStreamError{err: err}
+	// Each upstream frame is emitted as the per-line chunks the host consumes
+	// (sseFrameChunks): a whole frame per chunk is dropped whole by the host's
+	// cross-format response translators, which read one "data:" line per chunk.
+	for _, chunk := range sseFrameChunks(frame) {
+		if err := f.sink.Emit(ctx, f.streamID, chunk); err != nil {
+			return hostStreamError{err: err}
+		}
+		f.started = true
 	}
-	f.started = true
 	return nil
 }
 
