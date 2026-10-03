@@ -1453,3 +1453,137 @@ func accountDocWithJWT(t *testing.T, jwt, status, accessToken string) []byte {
 	}
 	return raw
 }
+
+// TestQuotaViewForGroupsBucketsByPlanAxis covers the management plane's read of
+// one quota refresh: the buckets carry the axis they belong to, and the page
+// receives the groups in the order the upstream listed their buckets.
+//
+// The distinction it exists to protect is the one an operator cannot see in a
+// flat list: a Start Plan allowance and a general Coding Plan allowance are
+// different billing axes, and reporting both as "GLM 18% left" would leave no
+// way to tell which one to act on.
+func TestQuotaViewForGroupsBucketsByPlanAxis(t *testing.T) {
+	now := time.Now()
+	plans := []quotaPlan{
+		{
+			Name:       "ZCode V3 Start Plan",
+			PlanID:     "zcode-v3-start-plan-trust-1003",
+			UserPlanID: "upl_1",
+			Status:     planStatusActive,
+		},
+		{Name: "GLM Coding Plan", PlanID: "zcode-v3-coding-plan", Status: planStatusActive},
+	}
+	observation := observationFor(quotaEvidence{
+		Verdict: verdictAvailable,
+		Plans:   plans,
+		Plan:    "ZCode V3 Start Plan",
+		Balances: []quotaBalance{
+			{Name: "GLM Coding", PlanID: "zcode-v3-coding-plan", Total: float64Ptr(100), Remaining: float64Ptr(20)},
+			{Name: "GLM-5.3-Flash", PlanID: "zcode-v3-start-plan-trust-1003", UserPlanID: "upl_1", Total: float64Ptr(200), Remaining: float64Ptr(150)},
+		},
+	}, now)
+
+	view := quotaViewFor(observation)
+	if len(view.PlanGroups) != 2 {
+		t.Fatalf("plan groups = %d, want 2; two billing axes must not render as one", len(view.PlanGroups))
+	}
+	if view.PlanGroups[0].Label != "GLM Coding Plan" || view.PlanGroups[0].Kind != planGroupCodingPlan {
+		t.Fatalf("first group = %+v; the upstream listed a coding-plan bucket first", view.PlanGroups[0])
+	}
+	if view.PlanGroups[1].Label != "ZCode V3 Start Plan" || view.PlanGroups[1].Kind != planGroupStartPlan {
+		t.Fatalf("second group = %+v, want the Start Plan axis", view.PlanGroups[1])
+	}
+	// Each bucket points at the axis it belongs to by position, so a renderer
+	// can group without re-deriving ownership from the plan list — and without
+	// merging two plans that happen to share a display name.
+	byName := map[string]quotaBalanceView{}
+	for _, bucket := range view.Balances {
+		byName[bucket.Name] = bucket
+	}
+	coding, startPlan := byName["GLM Coding"], byName["GLM-5.3-Flash"]
+	if coding.GroupIndex == nil || *coding.GroupIndex != 0 {
+		t.Fatalf("coding bucket group index = %v, want 0", coding.GroupIndex)
+	}
+	if startPlan.GroupIndex == nil || *startPlan.GroupIndex != 1 {
+		t.Fatalf("start plan bucket group index = %v, want 1", startPlan.GroupIndex)
+	}
+	// The remaining share is still the one reading both surfaces render, and
+	// grouping must not have moved it.
+	if coding.RemainingFraction == nil || *coding.RemainingFraction != 0.2 {
+		t.Fatalf("coding fraction = %v, want 0.2", coding.RemainingFraction)
+	}
+	if startPlan.RemainingFraction == nil || *startPlan.RemainingFraction != 0.75 {
+		t.Fatalf("start plan fraction = %v, want 0.75", startPlan.RemainingFraction)
+	}
+}
+
+// TestQuotaViewForLeavesOrphanBucketsUnassigned covers the bucket no plan
+// claims. It still renders — the numbers are real — but under its own axis
+// label, never under a plan the upstream did not name as its owner.
+func TestQuotaViewForLeavesOrphanBucketsUnassigned(t *testing.T) {
+	observation := observationFor(quotaEvidence{
+		Verdict: verdictAvailable,
+		Plans:   []quotaPlan{{Name: "GLM Coding Plan", PlanID: "zcode-v3-coding-plan", Status: planStatusActive}},
+		Balances: []quotaBalance{
+			{Name: "GLM Coding", PlanID: "zcode-v3-coding-plan", Total: float64Ptr(100), Remaining: float64Ptr(50)},
+			{Name: "GLM-5.3-Flash", PlanID: "zcode-v3-start-plan-trust-1003", Total: float64Ptr(200), Remaining: float64Ptr(150)},
+		},
+	}, time.Now())
+
+	view := quotaViewFor(observation)
+	if len(view.PlanGroups) != 2 {
+		t.Fatalf("plan groups = %d, want the coding group plus one orphan group", len(view.PlanGroups))
+	}
+	if view.PlanGroups[1].Kind != planGroupUnassigned {
+		t.Fatalf("orphan group kind = %q, want %q", view.PlanGroups[1].Kind, planGroupUnassigned)
+	}
+	if view.PlanGroups[1].Label != "zcode-v3-start-plan-trust-1003" {
+		t.Fatalf("orphan group label = %q, want the key the bucket itself stated", view.PlanGroups[1].Label)
+	}
+	if view.Balances[1].GroupIndex == nil || *view.Balances[1].GroupIndex != 1 {
+		t.Fatalf("orphan bucket group index = %v, want the orphan group", view.Balances[1].GroupIndex)
+	}
+}
+
+// TestManagementPageSeparatesQuotaByPlanAxis pins the page's read of the two
+// billing axes. A Start Plan allowance and a general Coding Plan allowance are
+// different things to act on, and rendering them as one flat run of buckets
+// leaves "GLM 18% left" with no way to tell which plan is about to run out —
+// the exact confusion the grouping on the Go side removes.
+//
+// The page must therefore read the group labels the plugin already resolved
+// and must not re-derive ownership from the buckets themselves: that match is
+// where the instance id versus the product id distinction lives, and a second
+// implementation of it in the page could disagree with the host's.
+func TestManagementPageSeparatesQuotaByPlanAxis(t *testing.T) {
+	page := managementPageHTML
+	if !strings.Contains(page, "plan_groups") {
+		t.Error("the page must render the plan groups the plugin resolved")
+	}
+	// The buckets join their axis by the index the plugin resolved, not by its
+	// label: two plans may share a display name, and a label join would merge two
+	// separate allowances into one heading.
+	if !strings.Contains(page, "balance.group_index === index") {
+		t.Error("the page must place each bucket under its axis by the index the plugin resolved")
+	}
+	if strings.Contains(page, "balance.plan") {
+		t.Error("the page must not rejoin buckets to axes by label; labels are not unique")
+	}
+	// The three kinds must each render a distinct heading. An operator reading
+	// "unassigned" against "Start Plan" is being told something actionable;
+	// collapsing both into one heading would discard that.
+	for _, kind := range []string{planGroupStartPlan, planGroupCodingPlan, planGroupUnassigned} {
+		if !strings.Contains(page, kind) {
+			t.Errorf("the page has no reading for the %q axis", kind)
+		}
+	}
+	// The Start Plan allowance and the general allowance are the whole point,
+	// so their two headings must both be present and must not be the same
+	// string.
+	if !strings.Contains(page, "Start Plan 额度") {
+		t.Error("the page must name the Start Plan axis distinctly from the general one")
+	}
+	if !strings.Contains(page, "通用额度") {
+		t.Error("the page must name the general Coding Plan axis")
+	}
+}

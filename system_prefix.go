@@ -26,6 +26,23 @@ import "strings"
 // The injected blocks carry no cache_control: the capture shows the official
 // client sets it, but the verification proved it irrelevant (test V2 = 200), and
 // omitting it keeps the caller's own cache breakpoints untouched.
+//
+// KNOWN COUNTEREXAMPLE (2026-10-03, issue #21/#22). The evidence above covers
+// the official client's *agent* request shape only, and it is not the whole
+// gate. The same capture also holds the official client's *title-generation*
+// request — 1410 bytes, answered 200 — whose system array is a single
+// title-gen prompt with neither official block, and which carries
+// "thinking":{"type":"enabled"} and "output_config":{"effort":"low"} instead.
+// A bare probe in the same session (same dual auth, same UA suffix, same
+// session id, same attribution headers) was answered 3012. So the official
+// blocks are one sufficient way to pass the precheck, not the only one, and
+// the necessary-and-sufficient condition set is still open.
+//
+// This injection is therefore NOT changed on the strength of that observation:
+// it was verified effective against the agent shape, and replacing a verified
+// behavior with an unverified hypothesis would trade a known-good default for a
+// guess. The differential matrix that pins the real condition belongs to #22.
+// When it lands, this comment and prepareUpstreamPayload move together.
 
 // officialSystemPrefixBlock1 is the official client's CLI prefix section
 // (sections/cli-prefix.ts CLI_PREFIX_PROMPT).

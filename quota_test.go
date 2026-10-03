@@ -1609,3 +1609,317 @@ func TestQuotaBalancePathIsIndependentOfMessagesRouteDecisions(t *testing.T) {
 		t.Fatalf("balance url was rewritten to %q; billing paths must stay direct", rewritten)
 	}
 }
+
+// TestParseQuotaReadsPlanOwnershipKeys covers the two keys the upstream uses
+// to say which plan a bucket spends. Both are read here because grouping is the
+// only reason they exist: a bucket with neither can only be reported as
+// unassigned, and a bucket whose keys were dropped could never be told apart
+// from one at all.
+func TestParseQuotaReadsPlanOwnershipKeys(t *testing.T) {
+	plans, compatible := parseQuotaPlans([]byte(realBalancePayload), time.Now())
+	if !compatible || len(plans) != 1 {
+		t.Fatalf("plans = %+v compatible = %v, want one plan", plans, compatible)
+	}
+	if plans[0].PlanID != "zcode-v3-start-plan-0817" {
+		t.Fatalf("plan id = %q, want zcode-v3-start-plan-0817", plans[0].PlanID)
+	}
+	if plans[0].UserPlanID != "upl_2105534823644946432" {
+		t.Fatalf("plan user id = %q, want upl_2105534823644946432", plans[0].UserPlanID)
+	}
+
+	balances, compatible := parseQuotaBalances([]byte(realBalancePayload))
+	if !compatible || len(balances) != 2 {
+		t.Fatalf("balances = %d compatible = %v, want two buckets", len(balances), compatible)
+	}
+	for _, bucket := range balances {
+		if bucket.PlanID != "zcode-v3-start-plan-0817" || bucket.UserPlanID != "upl_2105534823644946432" {
+			t.Fatalf("bucket %q ownership = %q/%q", bucket.Name, bucket.UserPlanID, bucket.PlanID)
+		}
+	}
+}
+
+// TestIsStartPlanPlan covers how a plan is recognized as a Start Plan rather
+// than a general Coding Plan. The upstream's own reading is a substring match
+// on the id or the name, in either the hyphenated or the spaced spelling —
+// matching on the exact id alone would read a live Start Plan as a Coding Plan
+// and merge its quota into the wrong axis.
+func TestIsStartPlanPlan(t *testing.T) {
+	cases := []struct {
+		name string
+		plan quotaPlan
+		want bool
+	}{
+		{name: "hyphenated plan id", plan: quotaPlan{PlanID: "zcode-v3-start-plan-trust-1003"}, want: true},
+		{name: "spaced display name", plan: quotaPlan{Name: "ZCode V3 Start Plan"}, want: true},
+		{name: "hyphenated display name", plan: quotaPlan{Name: "Start-Plan"}, want: true},
+		{name: "coding plan id", plan: quotaPlan{PlanID: "zcode-v3-coding-plan", Name: "GLM Coding Plan"}, want: false},
+		{name: "plan stating neither", plan: quotaPlan{}, want: false},
+		{name: "plan naming only its user id", plan: quotaPlan{UserPlanID: "upl_1"}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isStartPlanPlan(tc.plan); got != tc.want {
+				t.Fatalf("isStartPlanPlan(%+v) = %v, want %v", tc.plan, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGroupBalancesByPlanPrefersTheUserPlanID covers the ownership rule the
+// upstream itself applies: a bucket and a plan that both state a user plan id
+// are matched on that id, not on the shared product id. One product sold twice
+// produces two plans sharing a plan_id, so matching on plan_id alone would put
+// both instances' buckets into whichever plan was read first.
+func TestGroupBalancesByPlanPrefersTheUserPlanID(t *testing.T) {
+	plans := []quotaPlan{
+		{Name: "Start Plan A", PlanID: "zcode-v3-start-plan", UserPlanID: "upl_a", Status: planStatusActive},
+		{Name: "Start Plan B", PlanID: "zcode-v3-start-plan", UserPlanID: "upl_b", Status: planStatusActive},
+	}
+	balances := []quotaBalance{
+		{Name: "GLM-5.3-Flash", PlanID: "zcode-v3-start-plan", UserPlanID: "upl_a"},
+		{Name: "GLM-5.3", PlanID: "zcode-v3-start-plan", UserPlanID: "upl_b"},
+	}
+	groups := groupBalancesByPlan(plans, balances)
+	if len(groups) != 2 {
+		t.Fatalf("groups = %d, want 2; one product sold twice is two quota axes", len(groups))
+	}
+	for _, group := range groups {
+		if len(group.Balances) != 1 {
+			t.Fatalf("group %q holds %d buckets, want 1", group.Label, len(group.Balances))
+		}
+	}
+	if groups[0].Label != "Start Plan A" || groups[0].Kind != planGroupStartPlan {
+		t.Fatalf("first group = %+v, want Start Plan A as a start_plan group", groups[0])
+	}
+	if groups[1].Balances[0].Name != "GLM-5.3" {
+		t.Fatalf("second group holds %q, want the upl_b bucket", groups[1].Balances[0].Name)
+	}
+}
+
+// TestGroupBalancesByPlanFallsBackToTheProductID covers the fallback half of
+// the ownership rule: a bucket that states no user plan id is matched on the
+// product id, which is the only key the two rows share.
+func TestGroupBalancesByPlanFallsBackToTheProductID(t *testing.T) {
+	plans := []quotaPlan{{Name: "GLM Coding Plan", PlanID: "zcode-v3-coding-plan", Status: planStatusActive}}
+	balances := []quotaBalance{{Name: "GLM", PlanID: "zcode-v3-coding-plan"}}
+	groups := groupBalancesByPlan(plans, balances)
+	if len(groups) != 1 {
+		t.Fatalf("groups = %d, want 1", len(groups))
+	}
+	if groups[0].Label != "GLM Coding Plan" || groups[0].Kind != planGroupCodingPlan {
+		t.Fatalf("group = %+v, want the Coding Plan group", groups[0])
+	}
+}
+
+// TestGroupBalancesByPlanKeepsOrphansUnassigned covers the bucket whose plan
+// the upstream did not describe. It gets a group of its own rather than being
+// folded into the plan that happens to be present: putting a Start Plan bucket
+// inside a Coding Plan group would report the wrong billing axis, which is the
+// mistake this grouping exists to prevent.
+func TestGroupBalancesByPlanKeepsOrphansUnassigned(t *testing.T) {
+	plans := []quotaPlan{{Name: "GLM Coding Plan", PlanID: "zcode-v3-coding-plan", Status: planStatusActive}}
+	balances := []quotaBalance{
+		{Name: "GLM", PlanID: "zcode-v3-coding-plan"},
+		{Name: "GLM-5.3-Flash", PlanID: "zcode-v3-start-plan-trust-1003"},
+	}
+	groups := groupBalancesByPlan(plans, balances)
+	if len(groups) != 2 {
+		t.Fatalf("groups = %d, want the coding group plus one orphan group", len(groups))
+	}
+	if groups[1].Kind != planGroupUnassigned {
+		t.Fatalf("orphan group kind = %q, want %q", groups[1].Kind, planGroupUnassigned)
+	}
+	if groups[1].Label != "zcode-v3-start-plan-trust-1003" {
+		t.Fatalf("orphan group label = %q, want the bucket's own plan id", groups[1].Label)
+	}
+	if len(groups[0].Balances) != 1 || groups[0].Balances[0].Name != "GLM" {
+		t.Fatalf("coding group = %+v, want only its own bucket", groups[0].Balances)
+	}
+}
+
+// TestGroupBalancesByPlanOrdersByUpstreamBalanceOrder covers the reading order:
+// a page renders groups in the order the upstream listed their buckets, so a
+// reader sees the same sequence the response states.
+func TestGroupBalancesByPlanOrdersByUpstreamBalanceOrder(t *testing.T) {
+	plans := []quotaPlan{
+		{Name: "ZCode V3 Start Plan", PlanID: "zcode-v3-start-plan-1003", UserPlanID: "upl_1", Status: planStatusActive},
+		{Name: "GLM Coding Plan", PlanID: "zcode-v3-coding-plan", Status: planStatusActive},
+	}
+	balances := []quotaBalance{
+		{Name: "coding", PlanID: "zcode-v3-coding-plan"},
+		{Name: "flash", PlanID: "zcode-v3-start-plan-1003", UserPlanID: "upl_1"},
+	}
+	groups := groupBalancesByPlan(plans, balances)
+	if len(groups) != 2 {
+		t.Fatalf("groups = %d, want 2", len(groups))
+	}
+	if groups[0].Label != "GLM Coding Plan" {
+		t.Fatalf("first group = %q; the first bucket upstream belongs to the coding plan", groups[0].Label)
+	}
+	if groups[1].Kind != planGroupStartPlan {
+		t.Fatalf("second group kind = %q, want %q", groups[1].Kind, planGroupStartPlan)
+	}
+}
+
+// TestPlanGroupKindNeverGuessesAnUnreadableIdentity covers the classification
+// of a plan the plugin cannot read. Every plan the upstream names is a Start
+// Plan or a general Coding Plan, so a plan stating neither an id nor a name
+// cannot be placed on either axis: reading it as the general one would render
+// an unreadable Start Plan under "通用额度", which is the exact mislabeling the
+// grouping exists to prevent.
+func TestPlanGroupKindNeverGuessesAnUnreadableIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		plan quotaPlan
+		want string
+	}{
+		{name: "named start plan", plan: quotaPlan{PlanID: "zcode-v3-start-plan-trust-1003"}, want: planGroupStartPlan},
+		{name: "named coding plan", plan: quotaPlan{PlanID: "zcode-v3-coding-plan"}, want: planGroupCodingPlan},
+		{name: "coding plan named only by its display name", plan: quotaPlan{Name: "GLM Coding Plan"}, want: planGroupCodingPlan},
+		{name: "identity unreadable stays unproven", plan: quotaPlan{UserPlanID: "upl_1"}, want: planGroupUnassigned},
+		{name: "no identity at all stays unproven", plan: quotaPlan{}, want: planGroupUnassigned},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planGroupKind(tc.plan); got != tc.want {
+				t.Fatalf("planGroupKind(%+v) = %q, want %q", tc.plan, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGroupBalancesByPlanKeepsPlansSharingALabelApart covers the case a
+// label-keyed join would silently merge: two live plans that display
+// identically — both carrying the same display name — while drawing different
+// allowances. Groups are identified positionally precisely so that this stays
+// two headings.
+func TestGroupBalancesByPlanKeepsPlansSharingALabelApart(t *testing.T) {
+	plans := []quotaPlan{
+		{Name: "Start Plan", PlanID: "zcode-v3-start-plan", UserPlanID: "upl_a", Status: planStatusActive},
+		{Name: "Start Plan", PlanID: "zcode-v3-start-plan", UserPlanID: "upl_b", Status: planStatusActive},
+	}
+	balances := []quotaBalance{
+		{Name: "GLM-5.3-Flash", PlanID: "zcode-v3-start-plan", UserPlanID: "upl_a"},
+		{Name: "GLM-5.3", PlanID: "zcode-v3-start-plan", UserPlanID: "upl_b"},
+	}
+	groups, axis := placeBucketsByPlan(plans, balances)
+	if len(groups) != 2 {
+		t.Fatalf("groups = %d, want 2; two instances of one product are two axes", len(groups))
+	}
+	// Both groups carry the same label, which is exactly why the join the page
+	// performs must be positional rather than by name.
+	if groups[0].Label != groups[1].Label {
+		t.Fatalf("labels = %q/%q; the fixture is only meaningful when they collide", groups[0].Label, groups[1].Label)
+	}
+	if axis[0] != 0 || axis[1] != 1 {
+		t.Fatalf("axis = %v, want [0 1] so the page can join positionally", axis)
+	}
+	for i, group := range groups {
+		if len(group.Balances) != 1 || group.Balances[0].Name != balances[i].Name {
+			t.Fatalf("group %d holds %+v, want only bucket %d", i, group.Balances, i)
+		}
+	}
+}
+
+// TestPlaceBucketsByPlanReportsAPositionalAxis pins the join the management
+// page depends on: the axis is a group index, not a label, so a caller that
+// rejoins buckets to groups cannot merge two plans that share a name.
+func TestPlaceBucketsByPlanReportsAPositionalAxis(t *testing.T) {
+	plans := []quotaPlan{
+		{Name: "GLM Coding Plan", PlanID: "zcode-v3-coding-plan", Status: planStatusActive},
+		{Name: "ZCode V3 Start Plan", PlanID: "zcode-v3-start-plan-1003", UserPlanID: "upl_1", Status: planStatusActive},
+	}
+	balances := []quotaBalance{
+		{Name: "flash", PlanID: "zcode-v3-start-plan-1003", UserPlanID: "upl_1"},
+		{Name: "orphan", PlanID: "zcode-v3-start-plan-trust-1003"},
+		{Name: "coding", PlanID: "zcode-v3-coding-plan"},
+	}
+	groups, axis := placeBucketsByPlan(plans, balances)
+	if len(groups) != 3 {
+		t.Fatalf("groups = %d, want 3", len(groups))
+	}
+	for i, want := range []int{0, 1, 2} {
+		if axis[i] != want {
+			t.Fatalf("bucket %q axis = %d, want %d", balances[i].Name, axis[i], want)
+		}
+	}
+	if groups[1].Kind != planGroupUnassigned {
+		t.Fatalf("orphan group kind = %q, want %q", groups[1].Kind, planGroupUnassigned)
+	}
+}
+
+// TestRenderViewGroupsQuotaByPlan covers the host-facing view: the response
+// carries one group per plan, each named for the plan it belongs to, and the
+// remaining share each bucket reports is the same number before and after
+// grouping — the grouping is a presentation change and must not move a
+// measurement.
+func TestRenderViewGroupsQuotaByPlan(t *testing.T) {
+	fixture := newQuotaFixture(t)
+	fixture.balanceBody = realBalancePayload
+	evidence := fetchQuotaEvidence(context.Background(), "jwt-token-value", "3.14.4", testDeviceID, time.Now())
+
+	if len(evidence.Groups) != 1 {
+		t.Fatalf("groups = %d, want 1 group for a single-plan response", len(evidence.Groups))
+	}
+	group := evidence.Groups[0]
+	if group.DisplayName != "ZCode Start Plan" {
+		t.Fatalf("group name = %q, want the plan's own name", group.DisplayName)
+	}
+	if len(group.Buckets) != 2 {
+		t.Fatalf("buckets = %d, want both buckets under the plan", len(group.Buckets))
+	}
+	for i, name := range []string{"GLM-5.3", "GLM-5.3-Flash"} {
+		if group.Buckets[i].Window != name {
+			t.Fatalf("bucket %d = %q, want %q", i, group.Buckets[i].Window, name)
+		}
+		if full := 1.0; group.Buckets[i].RemainingFraction != full {
+			t.Fatalf("bucket %q fraction = %v, want %v", name, group.Buckets[i].RemainingFraction, full)
+		}
+	}
+	// A group with no readable share is not rendered at all: a fraction of
+	// nothing would be a measurement the upstream never made.
+	floored := quotaEvidence{Balances: []quotaBalance{{Name: "drifted", Malformed: true, Total: float64Ptr(10), Remaining: float64Ptr(5)}}}
+	floored.renderView()
+	if len(floored.Groups) != 0 {
+		t.Fatalf("malformed bucket produced %d groups, want none", len(floored.Groups))
+	}
+}
+
+// TestRenderViewKeepsOrphanBucketsOffOtherPlansInTheHostView covers the host
+// surface's half of the axis separation. The management page groups its buckets
+// explicitly, but the host only receives a flat group list, so a bucket that
+// belongs to no described plan must still reach it under a group of its own —
+// the numbers are real and the flat summary already carries them, but rendering
+// them under someone else's heading would name the wrong billing axis.
+func TestRenderViewKeepsOrphanBucketsOffOtherPlansInTheHostView(t *testing.T) {
+	evidence := quotaEvidence{
+		Plans: []quotaPlan{
+			{Name: "GLM Coding Plan", PlanID: "zcode-v3-coding-plan", Status: planStatusActive},
+			{Name: "ZCode V3 Start Plan", PlanID: "zcode-v3-start-plan-1003", UserPlanID: "upl_1", Status: planStatusActive},
+		},
+		Balances: []quotaBalance{
+			{Name: "GLM Coding", PlanID: "zcode-v3-coding-plan", Total: float64Ptr(100), Remaining: float64Ptr(20)},
+			{Name: "GLM-5.3-Flash", PlanID: "zcode-v3-start-plan-1003", UserPlanID: "upl_1", Total: float64Ptr(200), Remaining: float64Ptr(150)},
+			{Name: "unclaimed", PlanID: "zcode-v3-start-plan-trust-1003", Total: float64Ptr(50), Remaining: float64Ptr(50)},
+		},
+	}
+	evidence.renderView()
+
+	if len(evidence.Groups) != 3 {
+		t.Fatalf("groups = %d, want one per billing axis; an unclaimed bucket must not be folded into a plan", len(evidence.Groups))
+	}
+	names := []string{"GLM Coding Plan", "ZCode V3 Start Plan", "zcode-v3-start-plan-trust-1003"}
+	for i, want := range names {
+		if evidence.Groups[i].DisplayName != want {
+			t.Fatalf("group %d = %q, want %q", i, evidence.Groups[i].DisplayName, want)
+		}
+		if len(evidence.Groups[i].Buckets) != 1 {
+			t.Fatalf("group %q holds %d buckets, want exactly its own", want, len(evidence.Groups[i].Buckets))
+		}
+	}
+	// Every bucket is also in the flat summary, so a group dropped for an
+	// unread fraction never costs the host the numbers themselves.
+	if len(evidence.Summary) != 3 {
+		t.Fatalf("summary = %d metrics, want one remaining reading per bucket", len(evidence.Summary))
+	}
+}

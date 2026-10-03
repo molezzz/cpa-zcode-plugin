@@ -64,6 +64,15 @@ type quotaBalance struct {
 	// EntitlementID names the grant this bucket spends, which is how a bucket
 	// inherits the period and granted amount its own row does not repeat.
 	EntitlementID string
+	// PlanID and UserPlanID say which plan this bucket draws from. The bucket's
+	// billing axis is this pair, not the bucket: one product sold twice yields
+	// two plans sharing a PlanID, so UserPlanID is what tells their buckets
+	// apart. Both are kept because they are the only keys a bucket's owning
+	// plan row can be matched on, and a bucket the plugin cannot place is
+	// reported on its own rather than folded into a plan that may be a
+	// different billing axis.
+	PlanID     string
+	UserPlanID string
 	// Period is the bucket's recurrence, as the upstream spells it. The
 	// balance rows of the observed response state no period of their own, so
 	// this is folded in from the entitlement that granted the bucket; the
@@ -306,6 +315,13 @@ func quotaTransportReason(err error, status int) string {
 // evidence rather than being collapsed into a display string.
 type quotaPlan struct {
 	Name string
+	// PlanID and UserPlanID are the two keys a balance row names its owner by.
+	// PlanID is the product, UserPlanID the individual subscription instance:
+	// one product sold twice shares a PlanID and differs by UserPlanID, so the
+	// user plan id is what makes two live instances distinguishable and the
+	// product id is only the fallback for a row that states no instance.
+	PlanID     string
+	UserPlanID string
 	// Status is the plan's effective status after the term-end check, so it is
 	// one of planStatusActive, planStatusExpired, or planStatusUnknown for every
 	// plan the upstream described.
@@ -380,6 +396,8 @@ func parseQuotaPlans(body []byte, now time.Time) ([]quotaPlan, bool) {
 		}
 		plan := quotaPlan{}
 		plan.Name, _ = optionalString(fields["name"])
+		plan.PlanID, _ = optionalString(fields["plan_id"])
+		plan.UserPlanID, _ = optionalString(fields["user_plan_id"])
 		plan.Status, _ = optionalString(fields["status"])
 		plan.EndsAt, _, _ = optionalNumber(fields["ends_at"])
 		plan.Entitlements = parseQuotaEntitlements(fields["entitlements"])
@@ -581,6 +599,8 @@ func parseQuotaBalanceRow(row json.RawMessage) (quotaBalance, bool) {
 		balance.Name = name
 	}
 	balance.EntitlementID, _ = optionalString(fields["entitlement_id"])
+	balance.PlanID, _ = optionalString(fields["plan_id"])
+	balance.UserPlanID, _ = optionalString(fields["user_plan_id"])
 	// A textual field that drifted is dropped rather than guessed at, and the
 	// row still stands: it describes a real bucket, and only its label or unit
 	// is unreadable. That is why these do not mark the row the way a drifted
@@ -849,9 +869,200 @@ func balanceVerdict(balances []quotaBalance, plans []quotaPlan) (quotaVerdict, s
 	}
 }
 
+// Start Plan identity markers. The upstream spells the plan in its id
+// ("zcode-v3-start-plan-1003") and in its display name ("ZCode V3 Start
+// Plan"), so either surface can carry the identity and both spellings of the
+// separator occur. This mirrors the official client's own reading
+// (docs/ZCode packages/services/src/model-provider/
+// codingPlanProviderAvailability.ts isZaiStartPlanIdentity): Start Plan and the
+// general Coding Plan are separate billing axes, and recognizing only the exact
+// id would read a live Start Plan as a Coding Plan and merge the two.
+const (
+	startPlanIdentityMarker = "start-plan"
+	startPlanNameMarker     = "start plan"
+)
+
+// isStartPlanPlan reports whether a plan is a Start Plan rather than the
+// general Coding Plan. A plan stating neither an id nor a name is not claimed
+// either way: the caller decides what an unreadable identity means, and only
+// the id and the name are evidence here.
+func isStartPlanPlan(plan quotaPlan) bool {
+	for _, value := range []string{plan.PlanID, plan.Name} {
+		if lowered := strings.ToLower(strings.TrimSpace(value)); lowered != "" &&
+			(strings.Contains(lowered, startPlanIdentityMarker) || strings.Contains(lowered, startPlanNameMarker)) {
+			return true
+		}
+	}
+	return false
+}
+
+// Plan group kinds. They name the billing axis a bucket's numbers belong to, so
+// an operator can tell a Start Plan allowance from a general Coding Plan
+// allowance without reading either plan's details.
+const (
+	planGroupStartPlan  = "start_plan"
+	planGroupCodingPlan = "coding_plan"
+	planGroupUnassigned = "unassigned"
+)
+
+// quotaGroup is one billing axis's buckets: the plan they belong to, and every
+// bucket that plan's own reading said was available. Grouping exists because a
+// flat bucket list cannot tell two plans' allowances apart, and an operator
+// cannot act on "18%" without knowing which of them is about to run out.
+//
+// A group is identified by its position, never by its label: two plans can
+// share a display name — an unnamed plan falls back to the key that identifies
+// it, and nothing stops two rows from sharing one — so a label-keyed join would
+// merge two separate allowances into a single heading.
+type quotaGroup struct {
+	// Label is the group's display name: the plan's own name where it has one,
+	// otherwise the key the group's buckets were matched on. It names the axis
+	// for a reader; it does not identify it.
+	Label string
+	// Kind is the billing axis the group belongs to.
+	Kind string
+	// Balances are the group's buckets in the order the upstream listed them.
+	Balances []quotaBalance
+}
+
+// groupBalancesByPlan places every bucket under the plan that granted it, and
+// is the short form callers that only need the grouping use.
+func groupBalancesByPlan(plans []quotaPlan, balances []quotaBalance) []quotaGroup {
+	groups, _ := placeBucketsByPlan(plans, balances)
+	return groups
+}
+
+// placeBucketsByPlan groups the buckets by the plan that granted them, and
+// reports each bucket's group index alongside.
+//
+// Ownership follows the upstream's own rule, evaluated per bucket-and-plan
+// pair rather than through an index: when both rows state a user plan id they
+// are compared on it, and otherwise they are compared on the product id. That
+// asymmetry is what keeps two live instances of one product apart — both
+// instances share a product id, so a comparison on it alone would put their
+// buckets under whichever plan was read first, merging two separate
+// allowances into one number.
+//
+// A bucket no plan claims is never folded into the plans that are present: its
+// owning plan may simply have been omitted from the response, and attaching its
+// numbers to a different plan would report the wrong billing axis. It forms
+// its own group, named by the key the upstream did give it.
+//
+// The per-bucket result is a group index rather than a label because labels are
+// not unique: two plans may share a display name, and a caller that rejoined
+// buckets to groups by label would merge them. The index is positional and
+// unambiguous.
+func placeBucketsByPlan(plans []quotaPlan, balances []quotaBalance) ([]quotaGroup, []int) {
+	groups := []quotaGroup{}
+	// matched is keyed by plan position, so two plans sharing a display name
+	// stay separate groups. Orphans are keyed under their own plan key and
+	// never collide with one.
+	matched := make([]int, len(plans))
+	for i := range matched {
+		matched[i] = -1
+	}
+	orphans := map[string]int{}
+	axis := make([]int, len(balances))
+	for i, balance := range balances {
+		at := -1
+		for j, plan := range plans {
+			if !planGrantsBucket(plan, balance) {
+				continue
+			}
+			if matched[j] >= 0 {
+				at = matched[j]
+				break
+			}
+			groups = append(groups, quotaGroup{
+				Label: planGroupLabel(plan),
+				Kind:  planGroupKind(plan),
+			})
+			matched[j], at = len(groups)-1, len(groups)-1
+			break
+		}
+		if at < 0 {
+			key := unassignedGroupKey(balance)
+			existing, seen := orphans[key]
+			if !seen {
+				groups = append(groups, quotaGroup{Label: key, Kind: planGroupUnassigned})
+				existing = len(groups) - 1
+				orphans[key] = existing
+			}
+			at = existing
+		}
+		axis[i] = at
+		groups[at].Balances = append(groups[at].Balances, balance)
+	}
+	return groups, axis
+}
+
+// planGrantsBucket reports whether a plan is the one a bucket's numbers come
+// from, by the upstream's own comparison: the instance id when both rows state
+// one, the product id otherwise.
+func planGrantsBucket(plan quotaPlan, balance quotaBalance) bool {
+	userPlanID, bucketUserPlanID := strings.TrimSpace(plan.UserPlanID), strings.TrimSpace(balance.UserPlanID)
+	if userPlanID != "" && bucketUserPlanID != "" {
+		return userPlanID == bucketUserPlanID
+	}
+	planID := strings.TrimSpace(plan.PlanID)
+	return planID != "" && planID == strings.TrimSpace(balance.PlanID)
+}
+
+// planGroupKind names the billing axis a plan's group belongs to.
+//
+// A plan whose identity the plugin could read is classified by that identity.
+// A plan that states neither an id nor a name has no identity to classify, so
+// it is left unassigned rather than assumed to be the general Coding Plan:
+// reading an unreadable plan as the coding axis is precisely the mislabeling
+// this grouping exists to prevent, and the official client treats the same
+// unreadable case as unproven rather than as one axis or the other.
+func planGroupKind(plan quotaPlan) string {
+	switch {
+	case isStartPlanPlan(plan):
+		return planGroupStartPlan
+	case strings.TrimSpace(plan.PlanID) != "" || strings.TrimSpace(plan.Name) != "":
+		return planGroupCodingPlan
+	default:
+		return planGroupUnassigned
+	}
+}
+
+// planGroupLabel renders the display name of a plan's group: the plan's own
+// name where it states one, and the key that identifies it otherwise. An
+// unnamed plan is still a real axis, so it is named by its id rather than
+// dropped or given a placeholder.
+func planGroupLabel(plan quotaPlan) string {
+	if name := strings.TrimSpace(plan.Name); name != "" {
+		return name
+	}
+	if userPlanID := strings.TrimSpace(plan.UserPlanID); userPlanID != "" {
+		return userPlanID
+	}
+	return strings.TrimSpace(plan.PlanID)
+}
+
+// unassignedGroupKey names the group of a bucket no plan claimed, by the key
+// the bucket itself stated. Buckets that stated no key at all share one group,
+// which is honest: the plugin cannot tell them apart, and inventing a split
+// would suggest a distinction the evidence does not carry.
+func unassignedGroupKey(balance quotaBalance) string {
+	for _, key := range []string{balance.PlanID, balance.UserPlanID} {
+		if trimmed := strings.TrimSpace(key); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 // renderView renders the normalized host/management view of the evidence into
 // its Subscription, Summary, and Groups fields. Only explicit numbers are
 // rendered; nothing defaults to zero.
+//
+// Groups are per billing axis rather than per bucket: the summary stays flat
+// because a host metric list is unordered, but a group's display name is what
+// tells an operator which plan the numbers under it belong to. A bucket whose
+// remaining share is unreadable stays in the summary alone rather than opening
+// a group around a measurement the upstream never made.
 func (e *quotaEvidence) renderView() {
 	if e.Plan != "" {
 		e.Subscription = &pluginapi.QuotaSubscription{Plan: e.Plan}
@@ -877,19 +1088,28 @@ func (e *quotaEvidence) renderView() {
 				Format: "number",
 			})
 		}
-		// A bucket needs both ends of the window; a remaining value without a
-		// total would render as a misleading fraction, so it stays in the
-		// flat metrics only. The fraction itself comes from the one reading the
-		// management page also renders, so the two surfaces cannot disagree.
-		if fraction, ok := balanceRemainingFraction(balance); ok {
-			e.Groups = append(e.Groups, pluginapi.QuotaGroup{
-				DisplayName: name,
-				Buckets: []pluginapi.QuotaBucket{{
-					Window:            name,
-					RemainingFraction: fraction,
-					ResetTime:         balance.ExpiresAt,
-				}},
+	}
+	for _, group := range groupBalancesByPlan(e.Plans, e.Balances) {
+		rendered := pluginapi.QuotaGroup{DisplayName: group.Label}
+		for _, balance := range group.Balances {
+			// A bucket needs both ends of the window; a remaining value without
+			// a total would render as a misleading fraction, so it stays in the
+			// flat metrics only. The fraction itself comes from the one reading
+			// the management page also renders, so the two surfaces cannot
+			// disagree about the same bucket.
+			fraction, ok := balanceRemainingFraction(balance)
+			if !ok {
+				continue
+			}
+			name := balanceDisplayName(balance)
+			rendered.Buckets = append(rendered.Buckets, pluginapi.QuotaBucket{
+				Window:            name,
+				RemainingFraction: fraction,
+				ResetTime:         balance.ExpiresAt,
 			})
+		}
+		if len(rendered.Buckets) > 0 {
+			e.Groups = append(e.Groups, rendered)
 		}
 	}
 }
@@ -984,7 +1204,12 @@ type quotaObservation struct {
 	// PlanCount is how many plan rows the upstream reported, so the page can
 	// tell an account with no plan from a plan it could not name.
 	PlanCount int
-	Balances  []quotaBalance
+	// Plans are the rows themselves, kept because a bucket's billing axis is
+	// only knowable by matching it against the plan that granted it — a flat
+	// bucket list cannot tell a Start Plan allowance from a Coding Plan one,
+	// and the page never receives the response to re-derive the match.
+	Plans    []quotaPlan
+	Balances []quotaBalance
 }
 
 // observationFor derives the management view of one refresh's outcome.
@@ -993,6 +1218,7 @@ func observationFor(evidence quotaEvidence, checkedAt time.Time) quotaObservatio
 		CheckedAt: checkedAt,
 		Plan:      evidence.Plan,
 		PlanCount: len(evidence.Plans),
+		Plans:     evidence.Plans,
 		Balances:  evidence.Balances,
 	}
 	switch {

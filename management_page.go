@@ -166,6 +166,16 @@ const managementPageHTML = `<!DOCTYPE html>
   .bar-fill.danger { background: var(--bad); }
   .bucket-lines { margin-top: 4px; font-size: 12px; color: var(--text-muted); line-height: 1.55; }
 
+  /* Quota axes: one section per billing plan. A Start Plan allowance and a
+     general Coding Plan allowance are different things to act on, so they get
+     their own headings instead of one flat run of buckets where "18% left"
+     names no plan. */
+  .quota-axis { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--border); }
+  .quota-axis:first-child { border-top: 0; padding-top: 0; margin-top: 8px; }
+  .axis-head { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+  .axis-head .axis-kind { color: var(--text); }
+  .axis-head .axis-plan { color: var(--text-muted); overflow-wrap: anywhere; }
+
   dl.facts {
     display: grid; grid-template-columns: max-content minmax(0, 1fr);
     gap: 4px 12px; margin: 12px 0 0; font-size: 12.5px;
@@ -595,11 +605,12 @@ const managementPageHTML = `<!DOCTYPE html>
     return wrap;
   }
 
-  // quotaCard renders the quota slot of one account card: one bar plus its
-  // evidence lines per bucket. The four readings an operator must tell apart —
-  // a plan with quota, an account the upstream positively reports as having no
-  // plan, a lapsed plan, and a reading the plugin could not make — stay
-  // distinct as pills before any bucket is drawn.
+  // quotaCard renders the quota slot of one account card: the entitlement
+  // verdict, then one section per billing axis with its buckets. The four
+  // readings an operator must tell apart — a plan with quota, an account the
+  // upstream positively reports as having no plan, a lapsed plan, and a reading
+  // the plugin could not make — stay distinct as pills before any bucket is
+  // drawn.
   var QUOTA_STATES = {
     ok: ["有套餐且有额度", "pill-ok"],
     exhausted: ["套餐额度耗尽", "pill-bad"],
@@ -608,6 +619,48 @@ const managementPageHTML = `<!DOCTYPE html>
     unknown: ["未知(上游返回无法解析)", "pill-warn"],
     unavailable: ["不可用(凭证被拒绝)", "pill-bad"]
   };
+
+  // The three axes a bucket can belong to, in the operator's terms. Start Plan
+  // and the general Coding Plan are separate allowances on the same account,
+  // and an unassigned bucket is one the upstream did not tie to a plan it
+  // described — said plainly, because silently folding it into either plan
+  // would report the wrong billing axis.
+  //
+  // The map is a translation, not a whitelist: a kind this page has not seen
+  // renders as its own identifier rather than being hidden, because it is still
+  // a real statement about which axis the numbers are on.
+  var QUOTA_AXIS_KINDS = {
+    start_plan: "Start Plan 额度",
+    coding_plan: "通用额度",
+    unassigned: "未归属套餐额度"
+  };
+
+  function axisReading(kind) {
+    return QUOTA_AXIS_KINDS[kind] || kind;
+  }
+
+  // quotaAxis renders one billing axis: a heading naming the axis in the
+  // operator's terms plus the plan's own label, then that axis's buckets. The
+  // group labels come from the plugin because that is where ownership was
+  // resolved — the instance-id versus product-id match lives there, and a
+  // second copy of it here could disagree with the host's own quota groups.
+  function quotaAxis(group, balances) {
+    var section = el("div", "quota-axis");
+    var head = el("div", "axis-head");
+    head.appendChild(text(el("span", "axis-kind"), axisReading(group.kind)));
+    if (group.label) { head.appendChild(text(el("span", "axis-plan"), group.label)); }
+    section.appendChild(head);
+    balances.forEach(function (balance) {
+      var bar = quotaBar(balance);
+      if (bar) { section.appendChild(bar); }
+      var block = el("div", "bucket-lines");
+      quotaBucket(balance).forEach(function (line) {
+        block.appendChild(text(el("div"), line));
+      });
+      section.appendChild(block);
+    });
+    return section;
+  }
 
   function quotaCard(quota) {
     var box = el("div");
@@ -622,15 +675,25 @@ const managementPageHTML = `<!DOCTYPE html>
     if (quota.reason) { lines.push(quota.reason); }
     if (quota.checked_at) { lines.push("查询于 " + quota.checked_at); }
     appendStack(box, statusSpan(known[0], known[1]), lines);
-    (quota.balances || []).forEach(function (balance) {
-      var bar = quotaBar(balance);
-      if (bar) { box.appendChild(bar); }
-      var bucketLines = quotaBucket(balance);
-      var block = el("div", "bucket-lines");
-      bucketLines.forEach(function (line) {
-        block.appendChild(text(el("div"), line));
-      });
-      box.appendChild(block);
+
+    var balances = quota.balances || [];
+    var groups = quota.plan_groups || [];
+    if (!groups.length) {
+      // No axis resolved — a response with buckets but no readable plan, or a
+      // pre-grouping snapshot cached before a reload. The buckets are still
+      // real numbers, so they render under one unnamed axis rather than
+      // disappearing.
+      if (balances.length) { box.appendChild(quotaAxis({ kind: "", label: "" }, balances)); }
+      return box;
+    }
+    // Buckets join their axis by index, which the plugin resolved from the
+    // plan each one names. Joining by label instead would merge two plans that
+    // happen to share a display name, and re-deriving ownership here would
+    // duplicate the rule that distinguishes two instances of one product.
+    groups.forEach(function (group, index) {
+      box.appendChild(quotaAxis(group, balances.filter(function (balance) {
+        return balance.group_index === index;
+      })));
     });
     return box;
   }

@@ -442,7 +442,7 @@ func TestModelsForAuthStaticOnlyWhenNotLoggedIn(t *testing.T) {
 		"without credential": []byte(`{"other":"host-owned"}`),
 	} {
 		models := modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow())
-		if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo" {
+		if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo" {
 			t.Fatalf("%s: ids = %q, want the static base", name, got)
 		}
 	}
@@ -459,7 +459,7 @@ func TestModelsForAuthDiscoveryDisabledKeepsStatic(t *testing.T) {
 
 	doc := catalogDoc("identity-1", testJWT, jwtStatusActive, testAPIKeyMaterial, apiKeyStatusActive)
 	models := modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow())
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo" {
 		t.Fatalf("ids = %q, want the static base", got)
 	}
 	if total := up.callsFor(planModelsPath) + up.callsFor(zaiModelsPath); total != 0 {
@@ -474,7 +474,7 @@ func TestModelsForAuthSupplementsStaticOnSuccess(t *testing.T) {
 	doc := catalogDoc("identity-1", testJWT, jwtStatusActive, testAPIKeyMaterial, apiKeyStatusActive)
 
 	models := modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow())
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo,GLM-4.7" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7" {
 		t.Fatalf("ids = %q, want the static base plus the discovered supplement", got)
 	}
 	for _, model := range models {
@@ -488,7 +488,7 @@ func TestModelsForAuthSupplementsStaticOnSuccess(t *testing.T) {
 
 	// Inside the success TTL the cached answer serves without new calls.
 	models = modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow().Add(time.Minute))
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo,GLM-4.7" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7" {
 		t.Fatalf("cached ids = %q", got)
 	}
 	if total := up.callsFor(planModelsPath) + up.callsFor(zaiModelsPath); total != 2 {
@@ -497,7 +497,7 @@ func TestModelsForAuthSupplementsStaticOnSuccess(t *testing.T) {
 
 	// After the TTL both environments discover again.
 	models = modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow().Add(2*time.Hour))
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo,GLM-4.7" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7" {
 		t.Fatalf("refreshed ids = %q", got)
 	}
 	if total := up.callsFor(planModelsPath) + up.callsFor(zaiModelsPath); total != 4 {
@@ -512,7 +512,7 @@ func TestModelsForAuthFailureKeepsStaticAndCoolsDown(t *testing.T) {
 	doc := catalogDoc("identity-1", testJWT, jwtStatusActive, testAPIKeyMaterial, apiKeyStatusActive)
 
 	models := modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow())
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo" {
 		t.Fatalf("ids = %q, want the static base after failed discovery", got)
 	}
 	if total := up.callsFor(planModelsPath) + up.callsFor(zaiModelsPath); total != 2 {
@@ -521,7 +521,7 @@ func TestModelsForAuthFailureKeepsStaticAndCoolsDown(t *testing.T) {
 
 	// Inside the failure cooldown no environment is retried.
 	models = modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow().Add(time.Minute))
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo" {
 		t.Fatalf("cooled ids = %q, want the static base", got)
 	}
 	if total := up.callsFor(planModelsPath) + up.callsFor(zaiModelsPath); total != 2 {
@@ -545,7 +545,7 @@ func TestModelsForAuthInvalidResponseIsNotCachedAsSuccess(t *testing.T) {
 	doc := catalogDoc("identity-1", testJWT, jwtStatusActive, testAPIKeyMaterial, apiKeyStatusActive)
 
 	models := modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow())
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo,GLM-4.7" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7" {
 		t.Fatalf("ids = %q, want the healthy environment's supplement", got)
 	}
 	if calls := up.callsFor(zaiModelsPath); calls != 1 {
@@ -555,7 +555,7 @@ func TestModelsForAuthInvalidResponseIsNotCachedAsSuccess(t *testing.T) {
 	// The failed environment cools down instead of caching its failure as a
 	// success; the healthy one keeps serving its cached ids.
 	models = modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow().Add(time.Minute))
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo,GLM-4.7" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7" {
 		t.Fatalf("ids = %q, want the cached supplement to survive the other's failure", got)
 	}
 	if calls := up.callsFor(zaiModelsPath); calls != 1 {
@@ -565,7 +565,7 @@ func TestModelsForAuthInvalidResponseIsNotCachedAsSuccess(t *testing.T) {
 	// After the cooldown the failed environment retries against the upstream
 	// rather than promoting its failure to a cached answer.
 	models = modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow().Add(6*time.Minute))
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo,GLM-4.7" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7" {
 		t.Fatalf("ids = %q, want the still-healthy cached supplement", got)
 	}
 	if calls := up.callsFor(zaiModelsPath); calls != 2 {
@@ -584,7 +584,7 @@ func TestModelsForAuthIdentitiesDiscoverIndependently(t *testing.T) {
 	second := catalogDoc("identity-2", testJWT, jwtStatusActive, "", "")
 
 	modelsForAuth(context.Background(), cfg, catalog, "zcode-a.json", first, fixedNow())
-	if got := strings.Join(modelIDs(modelsForAuth(context.Background(), cfg, catalog, "zcode-b.json", second, fixedNow())), ","); got != "GLM-5.2,GLM-5-Turbo,GLM-4.7" {
+	if got := strings.Join(modelIDs(modelsForAuth(context.Background(), cfg, catalog, "zcode-b.json", second, fixedNow())), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7" {
 		t.Fatalf("the second identity inherited the first's catalog: %q", got)
 	}
 	if total := up.callsFor(planModelsPath); total != 2 {
@@ -601,7 +601,7 @@ func TestModelsForAuthUnusableCredentialSkipsItsEnvironment(t *testing.T) {
 	doc := catalogDoc("identity-1", testJWT, jwtStatusInvalid, testAPIKeyMaterial, apiKeyStatusActive)
 
 	models := modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow())
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo,GLM-4.7" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7" {
 		t.Fatalf("ids = %q, want the key environment's supplement", got)
 	}
 	if calls := up.callsFor(planModelsPath); calls != 0 {
@@ -619,7 +619,7 @@ func TestModelsForAuthLegacyDocumentWithoutIdentityStillCachesPerAuth(t *testing
 	doc := []byte(`{"zcode":{"jwt":{"token":"` + testJWT + `","status":"active"}}}`)
 
 	models := modelsForAuth(context.Background(), cfg, catalog, "zcode-abc.json", doc, fixedNow())
-	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.2,GLM-5-Turbo,GLM-4.7" {
+	if got := strings.Join(modelIDs(models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7" {
 		t.Fatalf("ids = %q, want the discovered supplement", got)
 	}
 	// The same document again is served from the auth-index-scoped cache.
@@ -657,7 +657,7 @@ func TestHandleModelForAuthReturnsUnion(t *testing.T) {
 	if response.Provider != pluginID {
 		t.Fatalf("provider = %q, want %q", response.Provider, pluginID)
 	}
-	if got := strings.Join(modelIDs(response.Models), ","); got != "GLM-5.2,GLM-5-Turbo,GLM-4.7" {
+	if got := strings.Join(modelIDs(response.Models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo,GLM-4.7" {
 		t.Fatalf("ids = %q, want the union catalog", got)
 	}
 	if total := up.callsFor(planModelsPath) + up.callsFor(zaiModelsPath); total != 2 {
@@ -678,7 +678,7 @@ func TestHandleModelForAuthSurvivesUndecodableRequest(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatalf("decode model response: %v", err)
 	}
-	if got := strings.Join(modelIDs(response.Models), ","); got != "GLM-5.2,GLM-5-Turbo" {
+	if got := strings.Join(modelIDs(response.Models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo" {
 		t.Fatalf("ids = %q, want the static base", got)
 	}
 }
@@ -693,7 +693,7 @@ func TestModelStaticStaysStatic(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatalf("decode model response: %v", err)
 	}
-	if got := strings.Join(modelIDs(response.Models), ","); got != "GLM-5.2,GLM-5-Turbo" {
+	if got := strings.Join(modelIDs(response.Models), ","); got != "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo" {
 		t.Fatalf("ids = %q, want the static base only", got)
 	}
 	if total := up.callsFor(planModelsPath) + up.callsFor(zaiModelsPath); total != 0 {

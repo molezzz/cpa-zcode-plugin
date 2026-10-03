@@ -322,14 +322,37 @@ type quotaView struct {
 	Plan      string             `json:"plan,omitempty"`
 	PlanCount int                `json:"plan_count"`
 	Balances  []quotaBalanceView `json:"balances,omitempty"`
+	// PlanGroups are the billing axes the buckets fall into, in the order the
+	// upstream listed their buckets. The page renders one section per group so
+	// a Start Plan allowance and a general Coding Plan allowance are never read
+	// as one number; each bucket's own `plan` field names the group it belongs
+	// to, so the page never re-derives ownership.
+	PlanGroups []quotaPlanGroupView `json:"plan_groups,omitempty"`
+}
+
+// quotaPlanGroupView names one billing axis on the page: its display label and
+// the kind of plan it is. The kind lets the page put the axis in the operator's
+// terms — a Start Plan allowance and a general Coding Plan allowance are
+// different things to act on — without the page knowing how ownership was
+// resolved.
+type quotaPlanGroupView struct {
+	Label string `json:"label,omitempty"`
+	Kind  string `json:"kind"`
 }
 
 type quotaBalanceView struct {
-	Name      string   `json:"name"`
-	Total     *float64 `json:"total,omitempty"`
-	Used      *float64 `json:"used,omitempty"`
-	Remaining *float64 `json:"remaining,omitempty"`
-	ExpiresAt string   `json:"expires_at,omitempty"`
+	Name string `json:"name"`
+	// GroupIndex is the position of the billing axis this bucket's numbers come
+	// from, matching an entry of PlanGroups. It is positional rather than a
+	// label because two plans may share a display name, and rejoining buckets
+	// to axes by name would silently merge two separate allowances. Absent only
+	// when PlanGroups is empty, which is the same signal the page reads to
+	// decide it has no axes to render.
+	GroupIndex *int     `json:"group_index,omitempty"`
+	Total      *float64 `json:"total,omitempty"`
+	Used       *float64 `json:"used,omitempty"`
+	Remaining  *float64 `json:"remaining,omitempty"`
+	ExpiresAt  string   `json:"expires_at,omitempty"`
 	// RemainingFraction is the bucket's remaining share of its own total,
 	// computed once on the Go side so the page renders the same number the host
 	// quota group does instead of dividing again. Absent whenever either end is
@@ -480,7 +503,10 @@ func boolField(section map[string]any, key string) bool {
 	return value
 }
 
-// quotaViewFor renders a cached observation for the account view.
+// quotaViewFor renders a cached observation for the account view. The buckets
+// keep the order the upstream listed them and each names the axis it belongs
+// to, so the page can group them without re-deriving ownership from a plan
+// list it never receives.
 func quotaViewFor(observation quotaObservation) *quotaView {
 	view := &quotaView{
 		State:     observation.State,
@@ -489,9 +515,11 @@ func quotaViewFor(observation quotaObservation) *quotaView {
 		Plan:      observation.Plan,
 		PlanCount: observation.PlanCount,
 	}
-	for _, balance := range observation.Balances {
+	groups, axis := placeBucketsByPlan(observation.Plans, observation.Balances)
+	for i, balance := range observation.Balances {
 		view.Balances = append(view.Balances, quotaBalanceView{
 			Name:              balanceDisplayName(balance),
+			GroupIndex:        &axis[i],
 			Total:             balance.Total,
 			Used:              balance.Used,
 			Remaining:         balance.Remaining,
@@ -504,6 +532,12 @@ func quotaViewFor(observation quotaObservation) *quotaView {
 			PeriodStart:       balance.PeriodStart,
 			PeriodEnd:         balance.PeriodEnd,
 			Malformed:         balance.Malformed,
+		})
+	}
+	for _, group := range groups {
+		view.PlanGroups = append(view.PlanGroups, quotaPlanGroupView{
+			Label: group.Label,
+			Kind:  group.Kind,
 		})
 	}
 	return view

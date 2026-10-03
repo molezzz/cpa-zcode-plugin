@@ -146,9 +146,17 @@ func defaultConfig() Config {
 	return Config{
 		Enabled:  boolPtr(true),
 		Priority: defaultPriority,
-		Models:   []string{"GLM-5.2", "GLM-5-Turbo"},
-		Product:  ProductConfig{AppVersion: defaultAppVersion},
-		Client:   normalizedClientConfig(ClientConfig{}),
+		// The static catalog is the floor the host falls back to whenever the
+		// dynamic one is unusable — unlogged in, a discovery failure inside its
+		// cooldown, or an identity the plugin cannot key a cache under — so it
+		// carries the models the Coding Plan and the Start Plan are known to pay
+		// for. The list mirrors the official client's Start Plan provider, which
+		// declares exactly these three (docs/ZCode config/provider/
+		// zcode-builtin.json); discovery through the balance endpoint's
+		// capabilities may add to it, never narrow it.
+		Models:  []string{"GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"},
+		Product: ProductConfig{AppVersion: defaultAppVersion},
+		Client:  normalizedClientConfig(ClientConfig{}),
 		ModelDiscovery: ModelDiscoveryConfig{
 			Enabled:                boolPtr(true),
 			SuccessTTLSeconds:      defaultSuccessTTLSeconds,
