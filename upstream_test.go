@@ -17,7 +17,7 @@ import (
 // testProfile builds an immutable profile aimed at an httptest server.
 func testProfile(t *testing.T, serverURL string, mutate func(*ResolvedProfile)) ResolvedProfile {
 	t.Helper()
-	plan := executionPlan(testAuthDoc("jwt-token-1", jwtStatusActive), testConfig(), "GLM-5.2", nil, requestIdentity{}, time.Now())
+	plan := executionPlan(testAuthDoc("jwt-token-1", jwtStatusActive), testConfig(), "GLM-5.2", nil, requestIdentity{}, time.Now(), nil)
 	if plan.Failure != nil {
 		t.Fatalf("executionPlan: %+v", plan.Failure)
 	}

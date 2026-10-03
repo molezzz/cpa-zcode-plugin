@@ -141,6 +141,26 @@ func diagBalanceSummary(balances []quotaBalance) string {
 	return strings.Join(parts, " ")
 }
 
+// diagModelAllowance renders the per-model standing of one snapshot, so a
+// scheduling decision can be read back against the numbers it was made from.
+//
+// Only what decides eligibility is printed: the model ids the upstream itself
+// declared, and whether an allowance is funded, empty, or unknown. Bucket totals
+// and window closes stay out — those are already in the balance summary, and this
+// line's job is to answer "why was or wasn't this credential scheduled".
+func diagModelAllowance(snapshot StartPlanSnapshot) string {
+	models := snapshotModelKeys(snapshot)
+	parts := make([]string, 0, len(models))
+	for _, model := range models {
+		part := model + "=" + snapshot.modelAllowance(model).String()
+		if reset, ok := snapshot.earliestRefill(model); ok {
+			part += "(reset=" + reset + ")"
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, " ")
+}
+
 // diagPlanSummary renders the plan rows one quota refresh saw, with the
 // effective status the term-end check settled — the fact that decides whether
 // the plugin reads the account as entitled at all.

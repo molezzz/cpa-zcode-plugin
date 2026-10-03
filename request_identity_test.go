@@ -88,7 +88,7 @@ func TestRequestBodyIdentitySharesOneDeviceIdentityWithTheHeader(t *testing.T) {
 		t.Fatal("payload carries no metadata.user_id")
 	}
 
-	plan := executionPlan(doc, normalizeConfig(defaultConfig()), "GLM-5.2", nil, identity, time.Now())
+	plan := executionPlan(doc, normalizeConfig(defaultConfig()), "GLM-5.2", nil, identity, time.Now(), nil)
 	if len(plan.Attempts) == 0 {
 		t.Fatal("no credential attempt was planned")
 	}

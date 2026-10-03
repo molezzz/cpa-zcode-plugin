@@ -121,7 +121,7 @@ func TestMessagesAndBalanceShareOneDeviceIdentity(t *testing.T) {
 		t.Fatalf("deviceIdentity = %q, want the recorded id", recorded)
 	}
 
-	plan := executionPlan(doc, normalizeConfig(defaultConfig()), "GLM-5.2", nil, requestIdentity{DeviceID: recorded}, time.Now())
+	plan := executionPlan(doc, normalizeConfig(defaultConfig()), "GLM-5.2", nil, requestIdentity{DeviceID: recorded}, time.Now(), nil)
 	if len(plan.Attempts) == 0 {
 		t.Fatal("no credential attempt was planned")
 	}

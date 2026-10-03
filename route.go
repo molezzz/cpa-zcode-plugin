@@ -212,9 +212,35 @@ func gatewayRequestHeaders(headers http.Header) http.Header {
 //
 // The allow-list is closed: a failure class must be named here before it may
 // ever cross a billing domain.
+//
+// A cross-record attempt is additionally confined to that same allow-list. Two
+// auth records of one account are two accounts' worth of entitlement as far as
+// the upstream is concerned, so presenting the second one spends its allowance
+// for a request the first refused. The reason has to be the same narrow class a
+// billing-domain crossing requires — a verdict about the credential or its
+// availability — because that is the only kind of failure another credential can
+// cure. A request-level verdict is not: one account's malformed or refused
+// request is not made acceptable by another account's allowance, and replaying it
+// would spend an entitlement to obtain the same answer.
 func fallbackAllowed(failed ResolvedProfile, failure *upstreamFailure, next ResolvedProfile) bool {
 	if failure == nil || !failure.RetryableBeforeOutput {
 		return false
+	}
+	// Presenting another account's entitlement spends that account's allowance on
+	// a request this one already refused, so a cross-record attempt is confined to
+	// the same closed allow-list a billing-domain crossing requires — and it gets
+	// no same-domain shortcut, because every Start Plan record shares one billing
+	// domain and the shortcut would otherwise permit anything retryable to cross
+	// accounts. Only a verdict about the credential can be cured by a different
+	// credential: a request-level rejection is about the request, and one account's
+	// refused or malformed request is not made acceptable by another's allowance.
+	if failed.Record != next.Record {
+		switch failure.Class {
+		case failureVerificationBlocked, failureInvalid, failureExhausted, failurePlanExpired, failureCooldown:
+			return true
+		default:
+			return false
+		}
 	}
 	if failed.Route.BillingDomain == next.Route.BillingDomain {
 		return true

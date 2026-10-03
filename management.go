@@ -275,7 +275,50 @@ type accountView struct {
 	APIKey     *apiKeyView `json:"api_key,omitempty"`
 	OAuth      *oauthView  `json:"oauth,omitempty"`
 	Quota      *quotaView  `json:"quota,omitempty"`
-	ReadError  string      `json:"read_error,omitempty"`
+	// Plan is the record's Start Plan reading: which products it holds and, per
+	// model, whether an allowance is funded, spent, or unknown. It is the section
+	// that makes a wrong-account login and an exhausted plan tell themselves
+	// apart, which the JWT status alone cannot do — both read "not serving".
+	Plan *planSnapshotView `json:"plan,omitempty"`
+	// Login carries the account identity the upstream stated for this login, as a
+	// digest. It is what correlates a record with the account a user believes they
+	// authorized, without the page ever holding the account's own identifier.
+	Login     *loginView `json:"login,omitempty"`
+	ReadError string     `json:"read_error,omitempty"`
+}
+
+// planSnapshotView is one record's persisted Start Plan reading.
+type planSnapshotView struct {
+	CheckedAt string `json:"checked_at,omitempty"`
+	// Readable is false when the last refresh could not interpret the billing
+	// answer. The page shows that rather than an empty plan list, because "could
+	// not read" and "read: nothing there" call for different operator actions.
+	Readable bool     `json:"readable"`
+	PlanIDs  []string `json:"plan_ids,omitempty"`
+	// Instances references the individual subscription instances as a product id
+	// plus a digest, so two plans of one product stay distinguishable.
+	Instances []string `json:"plan_instances,omitempty"`
+	// LastPriority says this record's plan is configured to be scheduled only when
+	// nothing else can serve a request. It is shown on the page because a
+	// surprising scheduling decision is otherwise invisible.
+	LastPriority bool                          `json:"last_priority,omitempty"`
+	Models       map[string]modelAllowanceView `json:"models,omitempty"`
+}
+
+type modelAllowanceView struct {
+	Allowance string `json:"allowance"`
+	ResetAt   string `json:"reset_at,omitempty"`
+	Buckets   int    `json:"buckets"`
+	Funded    int    `json:"funded_buckets,omitempty"`
+}
+
+// loginView is the account identity one login produced.
+type loginView struct {
+	// UserIDHash is a domain-separated digest of the upstream account id. The raw
+	// id is never stored, so the page can show that two records belong to different
+	// accounts without either record carrying the account's own identifier.
+	UserIDHash string `json:"user_id_hash,omitempty"`
+	CheckedAt  string `json:"checked_at,omitempty"`
 }
 
 type jwtView struct {
@@ -405,6 +448,8 @@ func (s managementService) accountView(ctx context.Context, entry pluginapi.Host
 	view.JWT = namespace.JWT
 	view.APIKey = namespace.APIKey
 	view.OAuth = namespace.OAuth
+	view.Plan = planViewFor(readPlanSnapshotSection(doc))
+	view.Login = loginViewFor(doc)
 	if namespace.IdentityID != "" {
 		if observation, ok := activeQuotaCache.get(namespace.IdentityID); ok {
 			view.Quota = quotaViewFor(observation)
@@ -494,6 +539,57 @@ func readAccountNamespace(doc []byte) (accountNamespace, error) {
 		}
 	}
 	return namespace, nil
+}
+
+// planViewFor renders a persisted Start Plan reading for the page. It copies the
+// section as stored rather than re-deriving anything: the page must not present
+// a second opinion of the entitlement, only the one the plugin actually
+// scheduled from.
+func planViewFor(section planSnapshotSection) *planSnapshotView {
+	if section.CheckedAt == "" && len(section.PlanIDs) == 0 && len(section.Models) == 0 {
+		// A record with no snapshot at all has never been read, which is not the
+		// same as having been read as empty. The page says so instead of showing a
+		// plan list of nothing.
+		return nil
+	}
+	view := &planSnapshotView{
+		CheckedAt:    section.CheckedAt,
+		Readable:     section.Readable,
+		PlanIDs:      section.PlanIDs,
+		Instances:    section.Instances,
+		LastPriority: section.LastTried,
+	}
+	if len(section.Models) > 0 {
+		view.Models = make(map[string]modelAllowanceView, len(section.Models))
+		for model, line := range section.Models {
+			view.Models[model] = modelAllowanceView{
+				Allowance: line.Allowance,
+				ResetAt:   line.ResetAt,
+				Buckets:   line.BucketCount,
+				Funded:    line.FundedCount,
+			}
+		}
+	}
+	return view
+}
+
+// loginViewFor renders the account identity one login produced. A record with no
+// login section predates this and is rendered as absent rather than as an empty
+// digest, which would read as though an account id had been recorded and lost.
+func loginViewFor(doc []byte) *loginView {
+	var root struct {
+		Zcode struct {
+			Login map[string]any `json:"login"`
+		} `json:"zcode"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(doc), &root); err != nil || root.Zcode.Login == nil {
+		return nil
+	}
+	hash := stringField(root.Zcode.Login, "user_id_hash")
+	if hash == "" {
+		return nil
+	}
+	return &loginView{UserIDHash: hash, CheckedAt: stringField(root.Zcode.Login, "checked_at")}
 }
 
 // boolField reads a boolean field, tolerating a section that holds another

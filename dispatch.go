@@ -178,6 +178,8 @@ func pluginRegistration() registration {
 				{Name: "oauth", Type: pluginapi.ConfigFieldTypeObject, Description: "Authorization session settings (session_ttl_seconds, managed_key_name_prefix, organization_id, project_id)."},
 				{Name: "upstream", Type: pluginapi.ConfigFieldTypeObject, Description: "Upstream HTTP limits (connect_timeout_seconds, request_timeout_seconds, max_response_bytes)."},
 				{Name: "quota", Type: pluginapi.ConfigFieldTypeObject, Description: "Quota refresh settings (refresh_concurrency)."},
+				{Name: "allowed_start_plan_ids", Type: pluginapi.ConfigFieldTypeArray, Description: "Restrict which Start Plan products a completed OAuth login will accept. Unset accepts every active Start Plan, which is the right default: a plan whose current bucket is empty is still a valid credential that refills."},
+				{Name: "start_plan_credential_pool", Type: pluginapi.ConfigFieldTypeObject, Description: "Cross-credential Start Plan scheduling (enabled, last_priority_plan_ids). Enabled by default so an exhausted plan cannot strand an account that still has another record's allowance; the listed plans are only scheduled once every other Start Plan record is unavailable for the model at hand. Set enabled: false to schedule only the record the host selected."},
 			},
 		},
 		Capabilities: registrationCapabilities{

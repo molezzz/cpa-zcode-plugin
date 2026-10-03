@@ -221,9 +221,12 @@ func runFallbackAttempt(t *testing.T, doc []byte, forwarder *recordingForwarder)
 		Now:        fixedNow,
 	}
 	cfg := normalizeConfig(defaultConfig())
-	plan := executionPlan(doc, cfg, "GLM-5.2", nil, requestIdentity{}, time.Now())
+	plan := executionPlan(doc, cfg, "GLM-5.2", nil, requestIdentity{}, time.Now(), nil)
 	scope.Primary = plan.Primary
-	scope.SkipBlockStatus, scope.SkipBlockRetry = skipBlockConclusion(doc, plan.SkipBlockStatus, fixedNow())
+	if snap, snapErr := readCredentialSnapshot(doc); snapErr == nil {
+		scope.SkipBlockStatus, scope.SkipBlockRetry, scope.SkipBlockModel =
+			skipBlockConclusion(doc, snap, plan.SkipBlockStatus, "", fixedNow())
+	}
 	if plan.Failure != nil {
 		return plan.Failure, nil, recorder
 	}
@@ -377,7 +380,7 @@ func TestUpstreamStreamErrorEventRecordsNoState(t *testing.T) {
 		upstreamScript{frames: completeAnthropicSSE()},
 	)
 	cfg := normalizeConfig(defaultConfig())
-	plan := executionPlan(scope.Document, cfg, "GLM-5.2", nil, requestIdentity{}, time.Now())
+	plan := executionPlan(scope.Document, cfg, "GLM-5.2", nil, requestIdentity{}, time.Now(), nil)
 	if plan.Failure != nil {
 		t.Fatalf("executionPlan: %+v", plan.Failure)
 	}
@@ -665,10 +668,14 @@ func TestDowngradedRequestsDoNotSlideTheRetryWindow(t *testing.T) {
 	doc := withRetryWindow(t, testFallbackDoc(jwtStatusVerificationBlocked, apiKeyStatusActive),
 		blockedAt.Add(verificationRetryWindow))
 
+	snap, err := readCredentialSnapshot(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var first time.Time
 	for _, elapsed := range []time.Duration{time.Minute, 2 * time.Minute, 3 * time.Minute} {
 		now := blockedAt.Add(elapsed)
-		status, retry := skipBlockConclusion(doc, jwtStatusVerificationBlocked, now)
+		status, retry, _ := skipBlockConclusion(doc, snap, jwtStatusVerificationBlocked, "", now)
 		if status != jwtStatusVerificationBlocked {
 			t.Fatalf("status = %q, want the blocked state preserved", status)
 		}
@@ -700,10 +707,14 @@ func TestDowngradedRequestsDoNotSlideTheRetryWindow(t *testing.T) {
 // recognize from stranding an account: an unhandled conclusion is left to the
 // upstream rather than recorded as a permanent one.
 func TestUnknownSkipStatusRecordsNothing(t *testing.T) {
-	status, retry := skipBlockConclusion(testFallbackDoc(jwtStatusActive, apiKeyStatusActive),
-		"a_status_this_build_does_not_know", fixedNow())
-	if status != "" || !retry.IsZero() {
-		t.Fatalf("an unknown precondition recorded %q with window %v, want nothing", status, retry)
+	doc := testFallbackDoc(jwtStatusActive, apiKeyStatusActive)
+	snap, err := readCredentialSnapshot(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, retry, model := skipBlockConclusion(doc, snap, "a_status_this_build_does_not_know", "", fixedNow())
+	if status != "" || !retry.IsZero() || model != "" {
+		t.Fatalf("an unknown precondition recorded %q with window %v and model %q, want nothing", status, retry, model)
 	}
 }
 
@@ -1056,7 +1067,7 @@ func TestBlockedPrimarySkipsUpstreamAndFallsBack(t *testing.T) {
 			// The state that skipped the primary is carried by the plan itself,
 			// so recording it never depends on failure-code spelling.
 			cfg := normalizeConfig(defaultConfig())
-			if skip := executionPlan(doc, cfg, "GLM-5.2", nil, requestIdentity{}, time.Now()).SkipBlockStatus; skip != jwtStatus {
+			if skip := executionPlan(doc, cfg, "GLM-5.2", nil, requestIdentity{}, time.Now(), nil).SkipBlockStatus; skip != jwtStatus {
 				t.Fatalf("skip block status = %q, want %q", skip, jwtStatus)
 			}
 			calls := upstream.calls()
@@ -1133,7 +1144,7 @@ func TestVerificationBlockRetryWindowElapses(t *testing.T) {
 
 	// Inside the window the JWT stays skipped.
 	newScriptedUpstream(t, upstreamScript{frames: completeAnthropicSSE()})
-	plan := executionPlan(withRetry, testConfig(), "GLM-5.2", nil, requestIdentity{}, now)
+	plan := executionPlan(withRetry, testConfig(), "GLM-5.2", nil, requestIdentity{}, now, nil)
 	if plan.Failure != nil {
 		t.Fatalf("the fallback should serve the request, got %+v", plan.Failure)
 	}
@@ -1156,7 +1167,7 @@ func TestVerificationBlockRetryWindowElapses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan = executionPlan(elapsed, testConfig(), "GLM-5.2", nil, requestIdentity{}, now)
+	plan = executionPlan(elapsed, testConfig(), "GLM-5.2", nil, requestIdentity{}, now, nil)
 	if plan.Failure != nil {
 		t.Fatalf("after the retry window the jwt must be primary, got %+v", plan.Failure)
 	}

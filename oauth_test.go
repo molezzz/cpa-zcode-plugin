@@ -102,6 +102,10 @@ type upstreamFixture struct {
 	pollFlowIDs   []string
 	pollResponses []func() (int, string)
 	initStatus    int
+	// balanceBody is the billing answer the login preflight reads. It defaults
+	// to a live Start Plan so a ready poll reaches a stored credential; a test
+	// about the preflight's refusals overrides it.
+	balanceBody string
 	// onPoll, when set, runs inside the upstream poll handler before the
 	// reply is written; it lets tests interleave session state changes with
 	// the plugin's poll handling.
@@ -110,27 +114,52 @@ type upstreamFixture struct {
 
 // newUpstreamFixture redirects oauthUpstreamBase and the auth store to test
 // doubles for the duration of the test. The managed key exchange upstream is
-// redirected as well, so a ready poll exercises the whole login closure.
+// redirected as well, so a ready poll exercises the whole login closure. The
+// billing endpoint is served too: a completed login now reads the candidate
+// credential's Start Plan entitlement before storing it, so a fixture that only
+// answered the OAuth routes would exercise a login that never succeeds.
 func newUpstreamFixture(t *testing.T) *upstreamFixture {
 	t.Helper()
 	resetSessions(t)
-	fixture := &upstreamFixture{t: t, store: &fakeAuthStore{docs: map[string]json.RawMessage{}}}
+	fixture := &upstreamFixture{
+		t:           t,
+		store:       &fakeAuthStore{docs: map[string]json.RawMessage{}},
+		balanceBody: startPlanBalanceBody,
+	}
 	fixture.keys = newKeyExchangeFixture(t)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/oauth/cli/init", fixture.serveInit)
 	mux.HandleFunc("/api/v1/oauth/cli/poll/", fixture.servePoll)
+	mux.HandleFunc("/api/v1/zcode-plan"+billingBalancePath, fixture.serveBalance)
 	fixture.srv = httptest.NewServer(mux)
 	t.Cleanup(fixture.srv.Close)
 
 	originalBase := oauthUpstreamBase
+	originalBilling := zcodePlanBillingBase
 	originalStore := authStoreProvider
 	oauthUpstreamBase = fixture.srv.URL + "/api/v1"
+	zcodePlanBillingBase = fixture.srv.URL + "/api/v1/zcode-plan"
 	authStoreProvider = func() AuthStore { return fixture.store }
 	t.Cleanup(func() {
 		oauthUpstreamBase = originalBase
+		zcodePlanBillingBase = originalBilling
 		authStoreProvider = originalStore
 	})
 	return fixture
+}
+
+// setBalanceBody sets the balance answer the login preflight will read.
+func (f *upstreamFixture) setBalanceBody(body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.balanceBody = body
+}
+
+func (f *upstreamFixture) serveBalance(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	body := f.balanceBody
+	f.mu.Unlock()
+	writeBilling(w, 0, body)
 }
 
 // queuePoll appends one upstream poll reply (status code, JSON body).

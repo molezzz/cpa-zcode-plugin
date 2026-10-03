@@ -124,6 +124,11 @@ type credentialSnapshot struct {
 	APIKeyToken      string
 	APIKeyStatus     string
 	APIKeyRetryAfter string
+	// ModelQuota is the per-model conclusion the JWT section carries: which
+	// models have been found to have every one of their buckets empty, and
+	// until when. It is what lets an empty GLM-5.3 allowance leave
+	// GLM-5.3-Flash schedulable on the very same credential.
+	ModelQuota map[string]string
 }
 
 // readCredentialSnapshot decodes the plugin-owned namespace of an auth
@@ -134,9 +139,10 @@ func readCredentialSnapshot(doc []byte) (credentialSnapshot, error) {
 		Zcode struct {
 			IdentityID string `json:"identity_id"`
 			JWT        struct {
-				Token      string `json:"token"`
-				Status     string `json:"status"`
-				RetryAfter string `json:"retry_after"`
+				Token      string            `json:"token"`
+				Status     string            `json:"status"`
+				RetryAfter string            `json:"retry_after"`
+				ModelQuota map[string]string `json:"model_quota"`
 			} `json:"jwt"`
 			APIKey struct {
 				Material   string `json:"key_material"`
@@ -156,6 +162,7 @@ func readCredentialSnapshot(doc []byte) (credentialSnapshot, error) {
 		APIKeyToken:      strings.TrimSpace(root.Zcode.APIKey.Material),
 		APIKeyStatus:     normalizeStatus(root.Zcode.APIKey.Status),
 		APIKeyRetryAfter: strings.TrimSpace(root.Zcode.APIKey.RetryAfter),
+		ModelQuota:       readModelQuota(root.Zcode.JWT.ModelQuota),
 	}
 	if snap.JWTToken == "" && snap.APIKeyToken == "" {
 		return credentialSnapshot{}, errNoCredential
@@ -167,6 +174,79 @@ func readCredentialSnapshot(doc []byte) (credentialSnapshot, error) {
 // machine compares on.
 func normalizeStatus(status string) string {
 	return strings.ToLower(strings.TrimSpace(status))
+}
+
+// readModelQuota recovers the per-model conclusions of a JWT section, dropping
+// any entry the model key or the value did not fill in: a conclusion with no
+// model names nothing and one with no deadline states no period, and treating
+// either as a fact would skip a model on an empty record.
+func readModelQuota(raw map[string]string) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(raw))
+	for model, until := range raw {
+		if strings.TrimSpace(model) == "" || strings.TrimSpace(until) == "" {
+			continue
+		}
+		out[model] = strings.TrimSpace(until)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// modelQuotaBlocked reports whether the JWT is recorded as unable to serve one
+// model because every bucket that pays for it was empty when it was last read.
+//
+// The recorded deadline is the earliest window close among those buckets, and it
+// is checked rather than trusted: the upstream decides when a bucket refills, so
+// an elapsed deadline means the plugin must let the model back in and let the
+// next request settle it. Skipping on an elapsed deadline would hold a credential
+// out of service for a model whose buckets came back hours ago, which is the same
+// failure this whole change exists to remove.
+func (s credentialSnapshot) modelQuotaBlocked(model string, now time.Time) bool {
+	target := normalizeRequestModel(model, nil)
+	if until, ok := s.ModelQuota[target]; ok {
+		return modelQuotaPending(until, now)
+	}
+	// A caller may spell the model differently from the spelling recorded by the
+	// conclusion that blocked it, so the lookup falls back to a case-insensitive
+	// match rather than to no conclusion at all.
+	for recorded, until := range s.ModelQuota {
+		if strings.EqualFold(recorded, target) {
+			return modelQuotaPending(until, now)
+		}
+	}
+	return false
+}
+
+// modelQuotaPending reports whether a recorded per-model deadline still holds the
+// model out of service. A deadline-less entry holds until a reading observes an
+// allowance, which is the same recovery rule the credential-wide exhausted state
+// uses and the reason no window is invented for one.
+func modelQuotaPending(until string, now time.Time) bool {
+	until = strings.TrimSpace(until)
+	if until == modelQuotaNoDeadline {
+		return true
+	}
+	return retryWindowPending(until, now)
+}
+
+// jwtUsableForModel reports whether the Coding Plan JWT may attempt one model
+// now, which is both the credential-level gate and the per-model one.
+//
+// The credential-level gate is unchanged: a JWT the upstream rejected, whose
+// plan ended, or which is cooling down serves no model. On top of it, a model
+// whose every bucket was empty is out of service until the recorded refill
+// deadline passes, while every other model on the same JWT stays schedulable —
+// that separation is what keeps an exhausted GLM-5.3 from disabling GLM-5.3-Flash.
+func jwtUsableForModel(snap credentialSnapshot, model string, now time.Time) bool {
+	if !jwtUsable(snap.JWTStatus, snap.JWTRetryAfter, now) {
+		return false
+	}
+	return !snap.modelQuotaBlocked(model, now)
 }
 
 // jwtUsable reports whether a recorded JWT state may attempt upstream
@@ -215,6 +295,12 @@ func apiKeyUsable(status, retryAfter string, now time.Time) bool {
 type ResolvedProfile struct {
 	IdentityID     string
 	CredentialKind CredentialKind
+	// Record identifies the host auth record this attempt's conclusions belong to.
+	// It is empty for the record the host selected, so every single-record caller
+	// and every profile built by newProfile is unchanged; a pooled attempt carries
+	// the record it came from, so an exhaustion recorded on one credential lands
+	// on that credential and not on whichever record happened to be selected.
+	Record string
 	// Route is the resolved upstream route this profile sends to: identity,
 	// URL, authentication shape, billing/entitlement domain, and gateway
 	// status. It is the only route description the executor and classifier

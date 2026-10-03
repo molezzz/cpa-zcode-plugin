@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -1138,21 +1139,24 @@ func quotaStateUpdates(evidence quotaEvidence, now time.Time) []recordedState {
 	if failure := evidence.AuthFailure; failure != nil {
 		return []recordedState{conclusionFor(CredentialJWT, failure, now)}
 	}
+	return modelQuotaUpdates(evidence, snapshotFor(evidence, now), now)
+}
+
+// modelQuotaUpdates turns one balance reading into the per-model conclusions it
+// implies.
+//
+// A Start Plan JWT holds an independent bucket for every model, so a reading in
+// which every GLM-5.3 bucket is empty while the GLM-5.3-Flash bucket still has
+// units does not exhaust the credential — it exhausts one model on it. The
+// credential-wide `exhausted` verdict is therefore reported only when no model
+// on the account has any allowance left, and everything else is recorded
+// per model, so the models that can still be served stay schedulable.
+//
+// The two conditions that are about the subscription rather than about an
+// allowance — an elapsed plan term, and a rejection of the credential — are not
+// per model at all and keep their credential-wide conclusions.
+func modelQuotaUpdates(evidence quotaEvidence, snapshot StartPlanSnapshot, now time.Time) []recordedState {
 	switch evidence.Verdict {
-	case verdictExhausted:
-		// The balance reading is explicit zero evidence, but it was gathered
-		// before this write: a credential the Messages endpoint has since
-		// rejected (invalid) must not be silently cleared by the older
-		// reading, because invalid recovers through a credential refresh or a
-		// re-login only. Cooldown, verification-blocked, and active states may
-		// be overwritten — a billing endpoint that authenticated and reported
-		// the balance is the stronger, fresher statement about those.
-		return []recordedState{{
-			Kind:        CredentialJWT,
-			Status:      jwtStatusExhausted,
-			Code:        "quota_exhausted",
-			NotIfStatus: jwtStatusInvalid,
-		}}
 	case verdictExpired:
 		// An elapsed term is a definitive conclusion about the subscription, and
 		// unlike exhaustion it is not restored by reading the balance: the plan
@@ -1166,29 +1170,147 @@ func quotaStateUpdates(evidence quotaEvidence, now time.Time) []recordedState {
 			Code:        "plan_expired",
 			NotIfStatus: jwtStatusInvalid,
 		}}
+	case verdictExhausted:
+		// Every bucket on the account is empty. Which models that covers is
+		// decided per model, so a credential whose only buckets belong to models
+		// the caller does not ask for keeps serving those other models.
+		return exhaustedModelUpdates(snapshot, now)
 	case verdictAvailable:
-		// Explicit positive balance restores an exhausted credential — the
-		// recovery path the exhausted state exists for. The recovery is
-		// guarded on the persisted status so it cannot overwrite a state that
-		// changed while the upstream call ran: an invalid or verification-
-		// blocked credential recovers through a credential refresh or a
-		// re-login, which re-test it against the Messages endpoint. An elapsed
-		// term is restored the same way, because only renewing the plan
-		// changes that conclusion.
-		return []recordedState{{
-			Kind:         CredentialJWT,
-			Status:       jwtStatusActive,
-			Code:         "quota_recovered",
-			OnlyIfStatus: jwtStatusExhausted,
-		}, {
-			Kind:         CredentialJWT,
-			Status:       jwtStatusActive,
-			Code:         "plan_renewed",
-			OnlyIfStatus: jwtStatusPlanExpired,
-		}}
+		return recoveredModelUpdates(snapshot, now)
 	default:
+		// An unknown reading and an account the upstream reports as having no
+		// plan both conclude nothing. One is the plugin admitting it could not
+		// tell; the other is a statement about the absence of a plan rather than
+		// about any allowance. Neither may clear a block, because neither
+		// observed an allowance coming back.
 		return nil
 	}
+}
+
+// exhaustedModelUpdates blocks each model whose every bucket was empty, and
+// marks the whole credential exhausted only when those models cover every model
+// the account actually has a bucket for.
+//
+// A reading whose rows name no model at all cannot be attributed to one, so it
+// falls back to the credential-wide conclusion rather than inventing a model to
+// attach it to. That is the same evidence the previous single-verdict reading
+// had, and reading it per model would only mean guessing which model it was about.
+func exhaustedModelUpdates(snapshot StartPlanSnapshot, now time.Time) []recordedState {
+	credentialWide := recordedState{
+		Kind:        CredentialJWT,
+		Status:      jwtStatusExhausted,
+		Code:        "quota_exhausted",
+		NotIfStatus: jwtStatusInvalid,
+	}
+	models := map[string]struct{}{}
+	for _, bucket := range snapshot.Buckets {
+		for _, model := range bucket.Models {
+			models[model] = struct{}{}
+		}
+	}
+	if len(models) == 0 {
+		return []recordedState{credentialWide}
+	}
+	updates := make([]recordedState, 0, len(models)+1)
+	blocked := 0
+	for _, model := range sortedKeys(models) {
+		if snapshot.modelAllowance(model) != allowanceEmpty {
+			continue
+		}
+		blocked++
+		updates = append(updates, recordedState{
+			Kind:   CredentialJWT,
+			Model:  model,
+			Status: jwtStatusExhausted,
+			Code:   "model_quota_exhausted",
+			// The refill deadline is the bucket's own window close, not a window
+			// this code anchors. Re-anchoring it on every refresh would slide the
+			// deadline forward and hold a model out of service long after its
+			// bucket came back; when the upstream states no window there is no
+			// deadline, and the model is recovered by the next positive reading.
+			RetryAfter: modelRefillDeadline(snapshot, model),
+			// An authentication verdict is stronger than a balance reading, so a
+			// credential the Messages endpoint has since rejected is never moved
+			// to exhausted by an older reading: invalid recovers only through a
+			// credential refresh or a re-login.
+			NotIfStatus: jwtStatusInvalid,
+		})
+	}
+	if blocked > 0 && blocked == len(models) {
+		// Every model the account holds a bucket for is empty, so there is
+		// nothing left for any model and the credential-wide conclusion is the
+		// honest one to record alongside the per-model entries.
+		return append(updates, credentialWide)
+	}
+	return updates
+}
+
+// recoveredModelUpdates clears the per-model conclusions a reading no longer
+// supports, for exactly the models this snapshot reports an allowance for.
+//
+// It also carries the subscription-level recovery: a plan whose term had ended
+// is back in force once a reading shows an allowance again. That one is
+// credential-wide because a renewed term renews every bucket at once, and it is
+// guarded on the persisted status so it cannot overwrite a state that changed
+// while the upstream call ran — an invalid or verification-blocked credential
+// recovers through a credential refresh or a re-login, which re-test it against
+// the Messages endpoint.
+func recoveredModelUpdates(snapshot StartPlanSnapshot, now time.Time) []recordedState {
+	updates := []recordedState{{
+		Kind:         CredentialJWT,
+		Status:       jwtStatusActive,
+		Code:         "quota_recovered",
+		OnlyIfStatus: jwtStatusExhausted,
+	}, {
+		Kind:         CredentialJWT,
+		Status:       jwtStatusActive,
+		Code:         "plan_renewed",
+		OnlyIfStatus: jwtStatusPlanExpired,
+	}}
+	for _, model := range snapshotModelKeys(snapshot) {
+		if snapshot.modelAllowance(model) != allowanceFunded {
+			continue
+		}
+		updates = append(updates, recordedState{
+			Kind:  CredentialJWT,
+			Model: model,
+			// The active status is what removes the entry; a code would pin the
+			// clearing to one failure kind, and the recovery is the same however
+			// the model came back.
+			Status: jwtStatusActive,
+		})
+	}
+	return updates
+}
+
+// modelRefillDeadline reports when one exhausted model's buckets come back, as
+// an instant the state machine can compare against. It is a zero time when the
+// upstream stated no window, which the state machine reads as "no deadline": the
+// model then recovers on the next positive reading instead of being held out
+// until a time nobody knows.
+func modelRefillDeadline(snapshot StartPlanSnapshot, model string) time.Time {
+	reset, ok := snapshot.earliestRefill(model)
+	if !ok {
+		return time.Time{}
+	}
+	deadline, err := time.Parse(time.RFC3339, reset)
+	if err != nil {
+		return time.Time{}
+	}
+	return deadline
+}
+
+// snapshotModelKeys lists every model any bucket in the snapshot pays for, in
+// stable order so a document rendered from two readings of the same data comes
+// out byte-identical.
+func snapshotModelKeys(snapshot StartPlanSnapshot) []string {
+	models := map[string]struct{}{}
+	for _, bucket := range snapshot.Buckets {
+		for _, model := range bucket.Models {
+			models[model] = struct{}{}
+		}
+	}
+	return sortedKeys(models)
 }
 
 // quotaObservation is the management-plane record of the last quota refresh
@@ -1349,9 +1471,13 @@ func runQuotaRefresh(ctx context.Context, store AuthStore, scope quotaRefreshSco
 		scope.DeviceID = deviceIdentity(scope.AuthIndex, scope.Document)
 	}
 	evidence := fetchQuotaEvidence(ctx, scope.JWT, scope.AppVersion, scope.DeviceID, now)
+	snapshot := snapshotFor(evidence, now)
 	diagf("quota auth=%s url=%s verdict=%s reason=%q plan=%q plans=[%s] balances=[%s]",
 		scope.AuthIndex, balanceURL(scope.AppVersion), evidence.Verdict, evidence.Reason,
 		evidence.Plan, diagPlanSummary(evidence.Plans), diagBalanceSummary(evidence.Balances))
+	diagf("plan_snapshot auth=%s identity=%s readable=%v last_priority=%v plans=[%s] models=[%s]",
+		scope.AuthIndex, scope.IdentityID, snapshot.Readable, snapshot.isLastPriority(currentConfig()),
+		strings.Join(snapshot.startPlanIDs(), " "), diagModelAllowance(snapshot))
 	if failure := evidence.AuthFailure; failure != nil {
 		diagf("quota auth=%s auth_failure upstream_status=%d class=%s code=%s msg=%q",
 			scope.AuthIndex, failure.UpstreamStatus, failure.Class, failure.Code, failure.Message)
@@ -1361,10 +1487,54 @@ func runQuotaRefresh(ctx context.Context, store AuthStore, scope quotaRefreshSco
 		IdentityID: scope.IdentityID,
 		Document:   scope.Document,
 	}, quotaStateUpdates(evidence, now)...)
+	// The snapshot is a diagnostic record of one reading, not a credential
+	// conclusion, so it is written on its own path and only when it changed: a
+	// refresh that finds the same numbers must not keep rewriting the host auth
+	// file, and nothing about the snapshot may reach the credential's own state.
+	if writeErr := persistPlanSnapshot(ctx, store, scope, snapshot); writeErr != nil {
+		diagf("plan_snapshot auth=%s persist_error=%q", scope.AuthIndex, writeErr.Error())
+	}
 	if scope.IdentityID != "" {
 		activeQuotaCache.put(scope.IdentityID, observationFor(evidence, now))
 	}
 	return evidence, recordErr
+}
+
+// persistPlanSnapshot records the redacted snapshot on the credential document.
+//
+// It runs under the same per-identity lock and the same read-patch-save shape as
+// the state recorder, because it writes the same document from the same request
+// path: two writes to one record without the lock could interleave and lose one
+// of the two. It deliberately does not go through record(), which drops any
+// conclusion without a credential status — and a snapshot has no status to set.
+func persistPlanSnapshot(ctx context.Context, store AuthStore, scope quotaRefreshScope, snapshot StartPlanSnapshot) error {
+	if !snapshot.Readable {
+		// A reading the plugin could not interpret says nothing about the
+		// credential, so there is nothing to record — and recording the failure
+		// would overwrite the last good snapshot with an empty one, destroying the
+		// very information an operator reads this section for.
+		return nil
+	}
+	ref := credentialRef{AuthIndex: scope.AuthIndex, IdentityID: scope.IdentityID, Document: scope.Document}
+	recorder := credentialStates.forStore(store)
+	section := renderPlanSnapshot(snapshot, currentConfig())
+	unlock := recorder.lockIdentity(ref)
+	defer unlock()
+	document, name, hostNamed, err := recorder.currentDocument(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if !hostNamed {
+		return errAuthFileNameUnknown
+	}
+	if reflect.DeepEqual(readPlanSnapshotSection(document), section) {
+		return nil
+	}
+	patched, err := writePlanSnapshotSection(document, section)
+	if err != nil {
+		return err
+	}
+	return recorder.save(ctx, ref, name, patched)
 }
 
 // handleQuotaIdentifier answers the host's quota provider discovery call.

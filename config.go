@@ -29,6 +29,14 @@ type Config struct {
 	// decided against the injection for their deployment turns it off.
 	InjectOfficialSystemPrefix *bool `yaml:"inject_official_system_prefix"`
 
+	// AllowedStartPlanIDs restricts which Start Plan products a completed OAuth
+	// preflight will accept as the account's entitlement. Empty — the default —
+	// accepts every active Start Plan, because a Start Plan the plugin has
+	// never heard of is a legitimate plan, and a candidate whose current bucket
+	// happens to be empty is still a valid credential that will refill.
+	AllowedStartPlanIDs     []string                      `yaml:"allowed_start_plan_ids"`
+	StartPlanCredentialPool StartPlanCredentialPoolConfig `yaml:"start_plan_credential_pool"`
+
 	Product        ProductConfig        `yaml:"product"`
 	Client         ClientConfig         `yaml:"client"`
 	ModelDiscovery ModelDiscoveryConfig `yaml:"model_discovery"`
@@ -80,6 +88,35 @@ type UpstreamConfig struct {
 type QuotaConfig struct {
 	RefreshConcurrency int `yaml:"refresh_concurrency"`
 }
+
+// StartPlanCredentialPoolConfig declares the cross-credential Start Plan
+// scheduling policy (credential_pool.go).
+//
+// The pool is enabled by default because one upstream account may hold several
+// auth records, and scheduling only the record the host picked for this request
+// would let one exhausted plan strand the account while another record's
+// allowance is untouched. The policy is explicitly authorized, so it must also
+// be visible and reversible: Enabled=false restores the previous
+// single-host-selected-record behaviour exactly.
+type StartPlanCredentialPoolConfig struct {
+	Enabled *bool `yaml:"enabled"`
+	// LastPriorityPlanIDs are the Start Plan products that may only be scheduled
+	// once every other Start Plan record has been found unavailable for the
+	// model at hand. It defaults to the plan this deployment discovered to be
+	// a poor last resort; an unknown active Start Plan is never demoted into
+	// this group, so a newly introduced plan is scheduled ahead of it.
+	LastPriorityPlanIDs []string `yaml:"last_priority_plan_ids"`
+}
+
+// IsEnabled reports whether the cross-credential Start Plan pool is on;
+// unset defaults to true.
+func (c StartPlanCredentialPoolConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+// defaultLastPriorityPlanID is the Start Plan product this deployment records
+// as the one that must only be spent when nothing else can serve a request.
+const defaultLastPriorityPlanID = "zcode-v3-start-plan-0817"
 
 func boolPtr(value bool) *bool { return &value }
 
@@ -172,6 +209,10 @@ func defaultConfig() Config {
 			MaxResponseBytes:      defaultMaxResponseBytes,
 		},
 		Quota: QuotaConfig{RefreshConcurrency: defaultRefreshConcurrency},
+		StartPlanCredentialPool: StartPlanCredentialPoolConfig{
+			Enabled:             boolPtr(true),
+			LastPriorityPlanIDs: []string{defaultLastPriorityPlanID},
+		},
 	}
 }
 
@@ -230,6 +271,15 @@ func mergeConfig(base, override Config) Config {
 	if override.Quota.RefreshConcurrency > 0 {
 		base.Quota.RefreshConcurrency = override.Quota.RefreshConcurrency
 	}
+	if ids := normalizePlanIDs(override.AllowedStartPlanIDs); len(ids) > 0 {
+		base.AllowedStartPlanIDs = ids
+	}
+	if pool := override.StartPlanCredentialPool; pool.Enabled != nil {
+		base.StartPlanCredentialPool.Enabled = pool.Enabled
+	}
+	if ids := normalizePlanIDs(override.StartPlanCredentialPool.LastPriorityPlanIDs); len(ids) > 0 {
+		base.StartPlanCredentialPool.LastPriorityPlanIDs = ids
+	}
 	return base
 }
 
@@ -278,5 +328,41 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.Quota.RefreshConcurrency <= 0 {
 		cfg.Quota.RefreshConcurrency = defaultRefreshConcurrency
 	}
+	cfg.AllowedStartPlanIDs = normalizePlanIDs(cfg.AllowedStartPlanIDs)
+	if cfg.StartPlanCredentialPool.Enabled == nil {
+		cfg.StartPlanCredentialPool.Enabled = boolPtr(true)
+	}
+	if ids := normalizePlanIDs(cfg.StartPlanCredentialPool.LastPriorityPlanIDs); len(ids) > 0 {
+		cfg.StartPlanCredentialPool.LastPriorityPlanIDs = ids
+	} else {
+		cfg.StartPlanCredentialPool.LastPriorityPlanIDs = []string{defaultLastPriorityPlanID}
+	}
 	return cfg
+}
+
+// normalizePlanIDs trims, drops empties, and de-duplicates a plan-id list while
+// preserving order. Plan ids are compared exactly, so no case folding happens
+// here: the ids are opaque upstream identifiers, and folding them would let a
+// configured id match a product it does not name.
+func normalizePlanIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		if _, duplicate := seen[trimmed]; duplicate {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

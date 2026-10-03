@@ -66,7 +66,16 @@ type oauthPollResponse struct {
 	Data struct {
 		Status string `json:"status"`
 		Token  string `json:"token"`
-		Zai    struct {
+		// User is the official account identity a ready payload carries. The
+		// official client refuses a ready answer without it (docs/ZCode
+		// apps/zcode-cli/packages/adapters/src/auth/cli-oauth.ts parseReadyData),
+		// so it is read for the same reason: it is the upstream's own statement of
+		// which account just authorized, and the plugin's record of that has to
+		// come from here rather than be inferred from the token's claims.
+		User struct {
+			UserID string `json:"user_id"`
+		} `json:"user"`
+		Zai struct {
 			AccessToken string `json:"access_token"`
 		} `json:"zai"`
 	} `json:"data"`
@@ -346,6 +355,7 @@ func applyPollVerdict(session *authSession, body []byte, persist func(identityID
 		token = strings.TrimSpace(parsed.Token)
 	}
 	accessToken := strings.TrimSpace(parsed.Data.Zai.AccessToken)
+	userID := strings.TrimSpace(parsed.Data.User.UserID)
 
 	switch {
 	case status == oauthPollStatusFailed:
@@ -368,7 +378,7 @@ func applyPollVerdict(session *authSession, body []byte, persist func(identityID
 			// skip the credential completion (and its upstream side effects).
 			return terminalPollOutcome(session)
 		}
-		storage, identityID, err := completeLoginStorage(token, accessToken)
+		storage, identityID, err := completeLoginStorage(token, accessToken, userID)
 		if err != nil {
 			session.fail(err.Error())
 			return pollOutcome{Kind: pollFailed, Message: err.Error()}
@@ -440,12 +450,26 @@ func pollOutcomeReply(session *authSession, outcome pollOutcome) []byte {
 // completeLoginStorage builds the plugin-owned namespace for a fresh JWT by
 // patching the previous auth document of the same identity, so a re-login
 // never destroys host fields or the managed API key of an existing account.
+//
 // The fresh OAuth access token, when present, is spent on the managed key
 // exchange in the same pass; its outcome is recorded as diagnosable api_key
 // state and never fails or rolls back the JWT login. The host store read uses
 // its own deadline: it must not be cut short by the session TTL, which only
 // bounds upstream OAuth traffic.
-func completeLoginStorage(token, accessToken string) ([]byte, string, error) {
+//
+// The candidate credential is read against the billing endpoint before any of it
+// is written. A preflight refusal returns before the first write, so a login this
+// deployment will not store leaves every existing record untouched — which is the
+// only ordering that makes "the old credentials are still there" true when a
+// user authorizes the wrong account.
+func completeLoginStorage(token, accessToken, userID string) ([]byte, string, error) {
+	cfg := normalizeConfig(currentConfig())
+	preflightCtx, cancelPreflight := context.WithTimeout(context.Background(), loginPreflightTimeout)
+	preflight, err := preflightCandidate(preflightCtx, token, userID, cfg)
+	cancelPreflight()
+	if err != nil {
+		return nil, "", err
+	}
 	subject, ok := zcodeSubjectFromJWT(token)
 	if !ok {
 		return nil, "", fmt.Errorf("upstream credential does not expose a stable identity claim; refusing to create an untrackable account")
@@ -461,6 +485,7 @@ func completeLoginStorage(token, accessToken string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("authorization result could not be stored")
 	}
+	doc = attachPreflight(doc, preflight, identityID, cfg, time.Now())
 	// The managed key exchange runs first because it already performs the
 	// business-token login and primes the cache, so recording the business
 	// token afterwards costs no second upstream call. Doing it in this order is
@@ -599,9 +624,18 @@ func zcodeSubjectFromJWT(token string) (string, bool) {
 // identityDigest derives a digest for stable inputs that are too long or
 // unsafe to use verbatim as a subject.
 func identityDigest(value string) string {
-	sum := sha256.Sum256([]byte(identityDomainSeparator + "\x00" + value))
-	return hex.EncodeToString(sum[:16])
+	return hex.EncodeToString(sha256Sum(identityDomainSeparator + "\x00" + value)[:16])
 }
+
+// sha256Sum is the one hashing call the plugin makes, so every digest here is
+// domain-separated by its caller and truncated by its caller.
+func sha256Sum(value string) []byte {
+	sum := sha256.Sum256([]byte(value))
+	return sum[:]
+}
+
+// hexEncode renders a hash as lower-case hex.
+func hexEncode(sum []byte) string { return hex.EncodeToString(sum) }
 
 // identityIDFor renders the plugin's identity id from a subject.
 func identityIDFor(subject string) string { return "zcode-" + subject }
@@ -609,8 +643,7 @@ func identityIDFor(subject string) string { return "zcode-" + subject }
 // authFileNameFor derives a stable, filesystem-safe auth file name from an
 // identity id so re-login reuses the same host account record.
 func authFileNameFor(identityID string) string {
-	sum := sha256.Sum256([]byte(identityID))
-	return "zcode-" + hex.EncodeToString(sum[:8]) + ".json"
+	return "zcode-" + hexEncode(sha256Sum(identityID)[:8]) + ".json"
 }
 
 // buildZcodeStorage writes the plugin-owned zcode namespace of the host auth

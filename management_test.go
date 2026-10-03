@@ -50,6 +50,11 @@ func newManagementFixtureOver(t *testing.T, oauth *upstreamFixture) *managementF
 }
 
 func (f *managementFixture) setup(t *testing.T) {
+	// A login completed through the management plane reads the candidate
+	// credential's Start Plan entitlement before storing it, so this fixture's
+	// billing endpoint answers a live Start Plan by default; a test about a
+	// particular reading sets its own body.
+	f.billBody = startPlanBalanceBody
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/zcode-plan/anthropic/v1/models", f.servePlanModels)
 	mux.HandleFunc("/api/anthropic/v1/models", f.serveZaiModels)
@@ -365,15 +370,17 @@ func TestManagementPageAlignsEveryAccountCard(t *testing.T) {
 	// discarded would render a card silently missing that credential section,
 	// so the full call shape is pinned, not just the name.
 	for _, mount := range []string{
+		`factRow(facts, "Start Plan", planCard(account.plan))`,
 		`factRow(facts, "JWT(主凭证)", jwtCard(account.jwt))`,
 		`factRow(facts, "API Key(回退)", apiKeyCard(account.api_key))`,
 		`factRow(facts, "OAuth", oauthCard(account.oauth))`,
+		`factRow(facts, "登录账号", loginCard(account.login))`,
 	} {
 		if !strings.Contains(script, mount) {
 			t.Errorf("page does not mount a credential section via %q; the card loses that section", mount)
 		}
 	}
-	for _, builder := range []string{"jwtCard", "apiKeyCard", "oauthCard", "quotaCard"} {
+	for _, builder := range []string{"jwtCard", "apiKeyCard", "oauthCard", "quotaCard", "planCard", "loginCard"} {
 		if !strings.Contains(script, "function "+builder+"(") {
 			t.Errorf("page is missing the %s builder", builder)
 		}
@@ -724,6 +731,21 @@ func TestManagementStateRedactsSecrets(t *testing.T) {
 			"last_error":   map[string]any{"stage": "create", "message": "upstream rejected the key creation", "at": "2026-01-02T00:00:00Z"},
 		}
 		zcode["oauth"] = map[string]any{"access_token": oauthSecret, "received_at": "2026-01-01T00:00:00Z"}
+		// A record that has been through the login preflight and a quota refresh:
+		// the plan section names the products and the per-model allowance, and the
+		// login section carries a digest of the account id. Neither may carry the
+		// raw identifiers they were derived from.
+		zcode["plan"] = map[string]any{
+			"readable":       true,
+			"checked_at":     "2026-01-02T00:00:00Z",
+			"plan_ids":       []any{"zcode-v3-start-plan-0817"},
+			"plan_instances": []any{"zcode-v3-start-plan-0817#0123456789ab"},
+			"last_priority":  true,
+			"models": map[string]any{
+				"GLM-5.3-Flash": map[string]any{"allowance": "empty", "reset_at": "2026-01-03T00:00:00Z", "buckets": json.Number("1")},
+			},
+		}
+		zcode["login"] = map[string]any{"user_id_hash": "7a917e45efea", "checked_at": "2026-01-02T00:00:00Z"}
 		return nil
 	})
 	if err != nil {
@@ -770,6 +792,40 @@ func TestManagementStateRedactsSecrets(t *testing.T) {
 	oauthView := account["oauth"].(map[string]any)
 	if oauthView["has_access_token"] != true {
 		t.Fatalf("oauth view = %+v", oauthView)
+	}
+	// The plan section is what tells an exhausted plan apart from a wrong-account
+	// login, so it must reach the page intact.
+	planView := account["plan"].(map[string]any)
+	ids := planView["plan_ids"].([]any)
+	if len(ids) != 1 || ids[0] != "zcode-v3-start-plan-0817" {
+		t.Fatalf("plan ids = %+v", ids)
+	}
+	if planView["last_priority"] != true || planView["readable"] != true {
+		t.Fatalf("plan view = %+v", planView)
+	}
+	flash := planView["models"].(map[string]any)["GLM-5.3-Flash"].(map[string]any)
+	if flash["allowance"] != "empty" || flash["reset_at"] != "2026-01-03T00:00:00Z" {
+		t.Fatalf("model allowance view = %+v", flash)
+	}
+	loginView := account["login"].(map[string]any)
+	if loginView["user_id_hash"] != "7a917e45efea" {
+		t.Fatalf("login view = %+v", loginView)
+	}
+}
+
+// A record that has never been read carries no plan section at all, which the page
+// renders as "not read" rather than as an account with no plan.
+func TestManagementStateOmitsPlanForAnUnreadRecord(t *testing.T) {
+	fixture := newManagementFixture(t)
+	fixture.accountDoc(t, "auth-plain", "zcode-plain-user", "active", "key-material")
+	state := fixture.callState(t)
+	accounts := state["accounts"].([]any)
+	account := accounts[0].(map[string]any)
+	if _, present := account["plan"]; present {
+		t.Fatalf("plan view = %+v, want absent for a record with no snapshot", account["plan"])
+	}
+	if _, present := account["login"]; present {
+		t.Fatalf("login view = %+v, want absent for a record with no login section", account["login"])
 	}
 }
 

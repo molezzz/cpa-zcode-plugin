@@ -55,6 +55,13 @@ type recordedState struct {
 	// models endpoint 200 proves the credential authenticates, which is not
 	// evidence about quota, and exhausted recovers through a quota refresh.
 	NotIfStatus string
+	// Model scopes a JWT conclusion to one model instead of the whole credential.
+	// The upstream charges one Start Plan JWT's buckets per model, so an empty
+	// GLM-5.3 allowance says nothing about GLM-5.3-Flash and must not take the
+	// credential out of service for models it can still serve. Empty means the
+	// conclusion is about the credential as a whole, which is what an
+	// authentication verdict is.
+	Model string
 }
 
 // errAuthFileNameUnknown reports that the host auth store could not name the
@@ -353,19 +360,34 @@ func applyCredentialState(doc []byte, conclusions []recordedState, now time.Time
 // exactly as they were. A conclusion that matches what is already recorded
 // changes nothing at all, so a steady stream of successful requests does not
 // rewrite the host auth file once per request.
+//
+// A model-scoped conclusion takes a separate path. It is about one model's
+// allowance rather than about the credential, so it must not move the section's
+// own status, and writing it there would take the whole record out of service
+// for every model that still has allowance left.
 func applyStateSection(zcode map[string]any, conclusion recordedState, now time.Time) {
 	name := credentialSectionName(conclusion.Kind)
 	existing, _ := zcode[name].(map[string]any)
 	if !conclusionApplies(conclusion, normalizeStatus(stringField(existing, "status"))) {
 		return
 	}
+	if modelScoped(conclusion) {
+		if stateModelAlreadyRecorded(existing, conclusion) {
+			return
+		}
+		merged := mergeSection(existing)
+		applyModelConclusion(merged, conclusion)
+		merged[credentialCheckedAtField(conclusion.Kind)] = now.UTC().Format(time.RFC3339)
+		if conclusion.Code != "" {
+			merged["last_error_code"] = conclusion.Code
+		}
+		zcode[name] = merged
+		return
+	}
 	if stateAlreadyRecorded(existing, conclusion) {
 		return
 	}
-	merged := map[string]any{}
-	for key, value := range existing {
-		merged[key] = value
-	}
+	merged := mergeSection(existing)
 	merged["status"] = conclusion.Status
 	setOrDrop(merged, "retry_after", formatRetryAfter(conclusion.RetryAfter))
 	// A conclusion with no code — the skip block re-asserting a state the
@@ -376,6 +398,10 @@ func applyStateSection(zcode map[string]any, conclusion recordedState, now time.
 		merged["last_error_code"] = conclusion.Code
 	}
 	merged[credentialCheckedAtField(conclusion.Kind)] = now.UTC().Format(time.RFC3339)
+	// A model-scoped conclusion can also carry the credential back into service
+	// when it succeeds, which is the recovery half of the same rule: a model that
+	// answers again proves the credential is usable for that model.
+	applyModelConclusion(merged, conclusion)
 
 	// A recorded window is only ever kept while it still says something true.
 	// A windowed conclusion that has elapsed heals in place — that is what
@@ -393,6 +419,116 @@ func applyStateSection(zcode map[string]any, conclusion recordedState, now time.
 	zcode[name] = merged
 }
 
+// mergeSection copies a persisted section so the merge never edits the map the
+// document already holds.
+func mergeSection(existing map[string]any) map[string]any {
+	merged := make(map[string]any, len(existing)+1)
+	for key, value := range existing {
+		merged[key] = value
+	}
+	return merged
+}
+
+// modelQuotaNoDeadline is the recorded deadline of a model recorded as exhausted
+// whose buckets the upstream gave no window for. It is a distinct value rather
+// than an absent one so the block survives a restart, and it is deliberately not
+// a date: there is no time at which the plugin may assume the bucket refilled, so
+// only a reading that observes an allowance can lift it.
+const modelQuotaNoDeadline = "unknown"
+
+// modelScoped reports whether a conclusion is about one model's allowance
+// rather than about the credential as a whole.
+func modelScoped(conclusion recordedState) bool {
+	return conclusion.Kind == CredentialJWT && normalizeRequestModel(conclusion.Model, nil) != ""
+}
+
+// stateModelAlreadyRecorded reports whether a model-scoped conclusion is already
+// expressed in the section, so a repeat of the same per-model outcome does not
+// rewrite the host auth file on every request.
+func stateModelAlreadyRecorded(existing map[string]any, conclusion recordedState) bool {
+	if existing == nil {
+		return false
+	}
+	quota, _ := existing["model_quota"].(map[string]any)
+	if quota == nil {
+		return false
+	}
+	recorded, present := quota[normalizeRequestModel(conclusion.Model, nil)]
+	text, isText := recorded.(string)
+	if conclusion.Status == activeStatusFor(conclusion.Kind) {
+		// Only an entry this model actually has can be the one being cleared.
+		// Comparing against the empty string alone would read "no entry for this
+		// model" and "an entry that records no deadline" as the same thing, which
+		// would skip a clear or a first block depending on which other models the
+		// credential happens to be tracking.
+		return !present
+	}
+	if !present {
+		return false
+	}
+	// The deadline-less sentinel is what a conclusion with no window records, so
+	// it is compared as such rather than as an absent value.
+	if !isText {
+		return false
+	}
+	return text == recordedModelDeadline(conclusion.RetryAfter)
+}
+
+// recordedModelDeadline renders the value a model-scoped conclusion stores for
+// one model's block. A conclusion with no refill deadline stores a sentinel rather
+// than an empty string, because the reader treats an empty value as no conclusion
+// at all and the block would not survive a restart.
+func recordedModelDeadline(retryAfter time.Time) string {
+	if deadline := formatRetryAfter(retryAfter); deadline != "" {
+		return deadline
+	}
+	return modelQuotaNoDeadline
+}
+
+// applyModelConclusion records or clears one model's standing inside a
+// credential section.
+//
+// A model-scoped conclusion is stored apart from the section's own status
+// because it is not a statement about the credential: the credential is fine,
+// this one model has nothing left to spend. Writing it into `status` would take
+// the whole record out of service and strand every model that still has
+// allowance, which is precisely the failure this dimension exists to prevent.
+//
+// Reaching the active status for a scoped model clears that model's entry and
+// nothing else, so a model whose buckets came back does not depend on an
+// unrelated model staying exhausted.
+func applyModelConclusion(section map[string]any, conclusion recordedState) {
+	model := normalizeRequestModel(conclusion.Model, nil)
+	if model == "" || conclusion.Kind != CredentialJWT {
+		return
+	}
+	quota, _ := section["model_quota"].(map[string]any)
+	if quota == nil {
+		quota = map[string]any{}
+	}
+	existing := normalizeStatus(stringField(quota, model))
+	if conclusion.Status == activeStatusFor(conclusion.Kind) {
+		// Only an entry that is still the conclusion being reversed is removed,
+		// so a recovery observed mid-flight cannot erase a newer block.
+		if conclusion.Code == "" || existing == "" || conclusion.appliesTo(existing) {
+			delete(quota, model)
+		}
+	} else {
+		// A conclusion with no deadline still has to be recorded as blocking, and
+		// it cannot be recorded as an empty string: the reader treats an empty
+		// value as no conclusion at all, so a model the upstream gave no window
+		// for would be blocked in memory and schedulable again after a restart.
+		// The sentinel says "blocked, deadline unknown", and it is cleared by the
+		// next reading that shows an allowance rather than by the clock.
+		quota[model] = recordedModelDeadline(conclusion.RetryAfter)
+	}
+	if len(quota) == 0 {
+		delete(section, "model_quota")
+		return
+	}
+	section["model_quota"] = quota
+}
+
 // stateAlreadyRecorded reports whether the persisted section already expresses
 // this conclusion, so a repeat of the same outcome is not rewritten. The
 // checked-at stamp is deliberately ignored: it only records that a conclusion
@@ -407,6 +543,14 @@ func applyStateSection(zcode map[string]any, conclusion recordedState, now time.
 // to decide whether to persist, and the management plane uses it to report only
 // the conclusions that were actually reached. Sharing it is what keeps a
 // refresh from claiming a recovery it did not perform.
+// appliesTo reports whether this conclusion still describes a section whose
+// status reads currentStatus. It is the guarded comparison conclusionApplies
+// performs, factored out so the model-scoped entries of a section can be
+// checked against the same rules the section-level status is.
+func (c recordedState) appliesTo(currentStatus string) bool {
+	return conclusionApplies(c, currentStatus)
+}
+
 func conclusionApplies(conclusion recordedState, currentStatus string) bool {
 	current := normalizeStatus(currentStatus)
 	if conclusion.OnlyIfStatus != "" && current != conclusion.OnlyIfStatus {

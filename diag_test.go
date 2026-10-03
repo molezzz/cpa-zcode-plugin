@@ -174,3 +174,42 @@ func TestDiagDisabledKeepsStderrQuietAcrossPackage(t *testing.T) {
 		t.Fatalf("disabled diagf wrote %q", buf.String())
 	}
 }
+
+// Acceptance criterion 10: the preflight, snapshot, recheck and pool diagnostic
+// lines carry no credential, no token, no device id, no account id, and no raw
+// upstream plan or bucket identifier.
+func TestDiagPlanLinesCarryNoSensitiveIdentifiers(t *testing.T) {
+	defer storeDebugConfig(true)()
+	buf := captureDiagLog(t)
+	const (
+		jwt     = "jwt-super-secret-value"
+		account = "70861758810173130"
+		device  = "11111111-2222-4333-8444-555555555555"
+		userID  = "34dd6d87-1234-4321-abcd-0123456789ab"
+	)
+	snapshot := startPlanSnapshotFrom(t,
+		`[{"name":"ZCode V3 Start Plan","plan_id":"zcode-v3-start-plan-0817","user_plan_id":"`+userID+`","status":"active"}]`,
+		`{"show_name":"GLM-5.3-Flash","plan_id":"zcode-v3-start-plan-0817","user_plan_id":"`+userID+`","capabilities":["model:glm-5.3-flash"],"remaining_units":4,"expires_at":"2026-10-04T00:00:00Z"}`,
+		time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC))
+
+	diagf("plan_snapshot auth=%s identity=%s readable=%v last_priority=%v plans=[%s] models=[%s]",
+		"auth-x", "zcode-user", snapshot.Readable, snapshot.isLastPriority(normalizeConfig(Config{})),
+		strings.Join(snapshot.startPlanIDs(), " "), diagModelAllowance(snapshot))
+	diagf("oauth_preflight identity=%s readable=%v verdict=%s plans=[%s] models=[%s]",
+		preflightIdentityDiag(account), snapshot.Readable, "available",
+		strings.Join(snapshot.startPlanIDs(), " "), diagModelAllowance(snapshot))
+	diagf("plan_recheck tag=%s auth=%s model=%q decision=%s", "tag", "auth-x", "GLM-5.3-Flash", "empty")
+	diagf("pool auth=%s model=%q candidates=%d", "auth-x", "GLM-5.3-Flash", 2)
+
+	out := buf.String()
+	for _, forbidden := range []string{jwt, account, device, userID} {
+		if strings.Contains(out, forbidden) {
+			t.Errorf("a plan diagnostic line leaked %q:\n%s", forbidden, out)
+		}
+	}
+	// The lines must still say the actionable thing: the plan and the model's
+	// standing are what an operator reads.
+	if !strings.Contains(out, "zcode-v3-start-plan-0817") || !strings.Contains(out, "GLM-5.3-Flash=funded") {
+		t.Errorf("plan diagnostics dropped the facts they exist to report:\n%s", out)
+	}
+}

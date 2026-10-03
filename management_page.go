@@ -736,6 +736,57 @@ const managementPageHTML = `<!DOCTYPE html>
     list.appendChild(valueNode);
   }
 
+  // ALLOWANCE_STATES translate the plugin's per-model allowance into the
+  // operator's terms. A model the plugin has no reading for is not an empty one:
+  // the billing answer may simply not have named it, so it renders as unknown
+  // rather than as spent.
+  var ALLOWANCE_STATES = {
+    funded: ["有额度", "pill-ok"],
+    empty: ["额度已用完", "pill-bad"],
+    unknown: ["未知", "pill-warn"]
+  };
+
+  // planCard renders which Start Plan products this record holds and, per model,
+  // whether an allowance is left. It is the section that tells a wrong-account
+  // login and an exhausted plan apart: the JWT status alone reports both as "not
+  // serving", and only this one says which happened.
+  function planCard(plan) {
+    var dd = el("dd");
+    if (!plan) { dd.appendChild(statusSpan("未读取", "")); return dd; }
+    if (!plan.readable) {
+      appendStack(dd, statusSpan("上次读取失败", "pill-warn"), ["配额接口的返回无法解析；此前的读数已保留"]);
+      return dd;
+    }
+    var stack = [];
+    if (plan.plan_ids && plan.plan_ids.length) {
+      stack.push("套餐 " + plan.plan_ids.join("、"));
+    } else {
+      stack.push("未读到 Start Plan");
+    }
+    if (plan.last_priority) {
+      stack.push("末位优先：仅在其他记录都无法服务时才调度");
+    }
+    Object.keys(plan.models || {}).sort().forEach(function (model) {
+      var line = plan.models[model];
+      var label = ALLOWANCE_STATES[line.allowance] || [line.allowance, ""];
+      var parts = [statusSpan(label[0], label[1])];
+      if (line.reset_at) { parts.push("恢复 " + line.reset_at); }
+      parts.push(text(el("span"), " " + line.buckets + " 个额度桶"));
+      stack.push(parts);
+    });
+    appendStack(dd, statusSpan(plan.plan_ids && plan.plan_ids.length ? "已识别" : "无套餐", ""), stack);
+    return dd;
+  }
+
+  function loginCard(login) {
+    var dd = el("dd");
+    if (!login) { dd.appendChild(statusSpan("未记录", "")); return dd; }
+    var lines = ["账号 " + login.user_id_hash];
+    if (login.checked_at) { lines.push("登录于 " + login.checked_at); }
+    appendStack(dd, statusSpan("已关联", "pill-ok"), lines);
+    return dd;
+  }
+
   function actionButton(label, action, authIndex) {
     var button = el("button");
     text(button, label);
@@ -764,9 +815,11 @@ const managementPageHTML = `<!DOCTYPE html>
     card.appendChild(quotaSlot);
 
     var facts = el("dl", "facts");
+    factRow(facts, "Start Plan", planCard(account.plan));
     factRow(facts, "JWT(主凭证)", jwtCard(account.jwt));
     factRow(facts, "API Key(回退)", apiKeyCard(account.api_key));
     factRow(facts, "OAuth", oauthCard(account.oauth));
+    factRow(facts, "登录账号", loginCard(account.login));
     card.appendChild(facts);
 
     var authIndex = account.auth_index || "";

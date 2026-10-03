@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -943,8 +944,8 @@ func TestQuotaFetchUnknownEvidenceLeavesStateUntouched(t *testing.T) {
 	jwt := makeJWT(t, map[string]any{"sub": "quota-unknown"})
 	doc := newTestAccountDoc(t, "zcode-quota-unknown", jwt, "exhausted", "")
 	addFakeAccount(t, fixture.store, "auth-q2", "zcode-quota-unknown", string(doc))
-	// A schema-drifted balance body is unknown: the exhausted credential must
-	// stay exactly as it was.
+	// A balance body the upstream answers with a plan-less account: the exhausted
+	// credential's own state must stay exactly as it was.
 	fixture.balanceBody = `{"data":{"balances":[{"show_name":"GLM"}]}}`
 
 	request, err := json.Marshal(pluginapi.QuotaFetchRequest{AuthIndex: "auth-q2", Provider: pluginID})
@@ -966,10 +967,51 @@ func TestQuotaFetchUnknownEvidenceLeavesStateUntouched(t *testing.T) {
 	if response.Subscription != nil || len(response.Summary) > 0 || len(response.Groups) > 0 {
 		t.Fatalf("unknown evidence rendered as data: %+v", response)
 	}
-	fixture.store.mu.Lock()
-	defer fixture.store.mu.Unlock()
-	if len(fixture.store.saves) != 0 {
-		t.Fatalf("unknown evidence wrote state %d times", len(fixture.store.saves))
+	// The invariant is about the credential's conclusion, not about how many
+	// writes the refresh made: a plan-less reading concludes nothing about any
+	// allowance, so the recorded exhaustion must survive it untouched.
+	snap, err := readCredentialSnapshot(fixture.store.docs["auth-q2"])
+	if err != nil {
+		t.Fatalf("read account after refresh: %v", err)
+	}
+	if snap.JWTStatus != "exhausted" || len(snap.ModelQuota) != 0 {
+		t.Fatalf("concluding reading moved credential state: status=%q models=%v", snap.JWTStatus, snap.ModelQuota)
+	}
+}
+
+func TestQuotaFetchUnreadableSnapshotKeepsTheLastGoodOne(t *testing.T) {
+	fixture := newQuotaFixture(t)
+	jwt := makeJWT(t, map[string]any{"sub": "quota-unreadable"})
+	doc := newTestAccountDoc(t, "zcode-quota-unreadable", jwt, "active", "")
+	good := renderPlanSnapshot(StartPlanSnapshot{
+		CheckedAt: time.Now(),
+		Readable:  true,
+		Plans:     []quotaPlan{{PlanID: "zcode-v3-start-plan-trust-1003", Status: planStatusActive}},
+		Buckets:   []startPlanBucket{{Models: []string{"GLM-5.3-Flash"}, Remaining: float64Ptr(4)}},
+	}, normalizeConfig(Config{}))
+	doc, err := writePlanSnapshotSection(doc, good)
+	if err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+	addFakeAccount(t, fixture.store, "auth-q3", "zcode-quota-unreadable", string(doc))
+
+	// A schema-drifted body is unreadable evidence. It must neither conclude
+	// anything nor replace the last good snapshot with an empty one: that section
+	// is what an operator reads to tell a wrong account from an exhausted one.
+	fixture.balanceBody = `{"data":{"balances":"not-an-array"}}`
+	if _, err := runQuotaRefresh(t.Context(), fixture.store, quotaRefreshScope{
+		AuthIndex:  "auth-q3",
+		IdentityID: "zcode-quota-unreadable",
+		JWT:        jwt,
+		AppVersion: defaultAppVersion,
+		DeviceID:   testDeviceID,
+		Document:   doc,
+	}, time.Now()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	after := readPlanSnapshotSection(fixture.store.docs["auth-q3"])
+	if !reflect.DeepEqual(after, good) {
+		t.Fatalf("unreadable reading replaced the snapshot:\n got %+v\nwant %+v", after, good)
 	}
 }
 
