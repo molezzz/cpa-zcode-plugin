@@ -2,47 +2,60 @@ package main
 
 import "strings"
 
-// The upstream admits a Messages request to the Coding Plan gateway partly by a
-// client-integrity fingerprint in the request body's system field: the array must
-// LEAD with the official ZCode system prompt's opening blocks, in order, as
-// separate blocks. This was established by an authorized differential capture of
-// the official client (mitmproxy session 20261002-194452_2344fd, issue #16) and a
-// 26-test single-variable verification (matrix archived with issue #16): every
-// header-level difference was eliminated (dual auth, UA suffix, device-mid,
-// referer, attribution ids — the official header set byte-identical still gets
-// 3012 from a scripted client), while the plugin's own current headers plus these
-// two system blocks return 200. Swapped, merged, missing, or caller-prefixed
-// blocks return 3012.
+// The upstream admits a Messages request to the Coding Plan gateway by a
+// client-integrity fingerprint carried in the request body's system field: that
+// field must contain a sufficiently long contiguous verbatim slice of one of
+// the official client's own system prompts. Established by an authorized
+// differential capture (mitmproxy session 20261002-194452_2344fd, issue #16)
+// and re-pinned by an 86-case single-variable matrix on 2026-10-03 (issue #22,
+// docs/evidence-3012-matrix.json, harness scripts/probe-3012-matrix.py).
+//
+// What the matrix settled. An absent system field is refused whatever else the
+// request carries, and a present one is admitted when it holds enough
+// contiguous official text — so the two blocks injected below are sufficient,
+// but they are not the whole rule, and they are not necessary either: the
+// official client's own title-generation prompt (997 bytes) passes with no
+// official block at all, which is the counterexample that reopened the question
+// after #16 closed it. Length alone is not the test — 20000 bytes of filler and
+// 7565 bytes of a genuine official block are both refused, while a 1400-byte
+// prefix of one block and the 997-byte title prompt both pass — so the gateway
+// matches on recognized prompt text, not on size or token count. b1 and b2 in
+// this order are one recognized run, so their order matters (swapped is
+// refused) while their being separate blocks does not (concatenated passes).
+//
+// What the matrix eliminated. Every header-level difference remains irrelevant:
+// anthropic-beta: mid-conversation-system-2026-04-07, the ai/6.0.193 UA
+// suffix, x-api-key dual auth, x-device-mid, x-session-id, x-zcode-session-type
+// and Accept were each varied on a passing baseline with no effect on the
+// verdict. So were the body's thinking, output_config, metadata, max_tokens and
+// message shape. Those two body fields had been the leading suspects after the
+// title-gen counterexample surfaced; they are now measured and exonerated.
+//
+// The verdict does not depend on plan exhaustion: on an account whose buckets
+// were at zero the bare probe was refused and these passing shapes were still
+// admitted.
 //
 // The maintainer decided (issue #16, 2026-10-02) that the plugin injects this
 // prefix automatically: the official blocks lead, the caller's own system
 // content follows. The texts are the official client's own system prompt
 // opening (docs/ZCode apps/zcode-cli/packages/core/src/context/sections/
 // cli-prefix.ts and identity.ts, Apache-2.0), verified byte-for-byte against a
-// live official-client capture for app version 3.14.4. Block 2 is the prefix the
-// capture's 4KB body preview carried; the live verification proved that prefix
-// satisfies the gate (tests V1/X1/Y2 = 200).
+// live official-client capture for app version 3.14.4 and re-verified against
+// it on 2026-10-03 (b1 42 bytes, b2 2313 bytes, both identical).
 //
 // The injected blocks carry no cache_control: the capture shows the official
-// client sets it, but the verification proved it irrelevant (test V2 = 200), and
-// omitting it keeps the caller's own cache breakpoints untouched.
+// client sets it, and the matrix confirmed it irrelevant (both forms admitted).
 //
-// KNOWN COUNTEREXAMPLE (2026-10-03, issue #21/#22). The evidence above covers
-// the official client's *agent* request shape only, and it is not the whole
-// gate. The same capture also holds the official client's *title-generation*
-// request — 1410 bytes, answered 200 — whose system array is a single
-// title-gen prompt with neither official block, and which carries
-// "thinking":{"type":"enabled"} and "output_config":{"effort":"low"} instead.
-// A bare probe in the same session (same dual auth, same UA suffix, same
-// session id, same attribution headers) was answered 3012. So the official
-// blocks are one sufficient way to pass the precheck, not the only one, and
-// the necessary-and-sufficient condition set is still open.
+// These blocks remain the injection because they are what the plugin can
+// honestly present: the matrix shows every payload the plugin currently emits
+// is already admitted (issue #22), so there is no missing field to add, and
+// changing verified-working behaviour for an unmeasured variant would trade a
+// known-good default for a guess. The two official blocks are used because they
+// are the official client's real identity, not because they are the shortest
+// text that happens to pass.
 //
-// This injection is therefore NOT changed on the strength of that observation:
-// it was verified effective against the agent shape, and replacing a verified
-// behavior with an unverified hypothesis would trade a known-good default for a
-// guess. The differential matrix that pins the real condition belongs to #22.
-// When it lands, this comment and prepareUpstreamPayload move together.
+// If the upstream tightens the fingerprint, this comment and
+// prepareUpstreamPayload move together.
 
 // officialSystemPrefixBlock1 is the official client's CLI prefix section
 // (sections/cli-prefix.ts CLI_PREFIX_PROMPT).
@@ -56,9 +69,11 @@ const officialSystemPrefixBlock2 = "\nYou are an interactive ZCode agent that he
 // injectOfficialSystemPrefix prepends the official ZCode system prompt's
 // leading blocks to one decoded upstream payload's system field, in place.
 //
-// The gateway's integrity precheck demands the official blocks LEAD the system
-// array (verified: caller content before them is rejected, after them is
-// accepted), so the caller's own system content follows as further blocks:
+// The gateway's integrity precheck requires the system field to carry a
+// sufficiently long verbatim slice of an official system prompt; these two
+// blocks are one such slice (file header for what the matrix measured). Placing
+// them first is what makes the caller's own content add to the system prompt
+// rather than displace it:
 //
 //   - no system field: the payload gains the two official blocks;
 //   - a string system: it is preserved as a third text block after them;
@@ -87,8 +102,9 @@ func injectOfficialSystemPrefix(body map[string]any) {
 }
 
 // prefixBlock1 and prefixBlock2 render the official blocks as Anthropic text
-// blocks: the form the official client sends and the differential verification
-// confirmed.
+// blocks: the form the official client sends. Their concatenation is what the
+// gateway recognizes, so the pair is emitted as two blocks to mirror the
+// official client rather than to satisfy the precheck.
 func prefixBlock1() map[string]any {
 	return map[string]any{"type": "text", "text": officialSystemPrefixBlock1}
 }
@@ -100,8 +116,8 @@ func prefixBlock2() map[string]any {
 // leadsWithOfficialPrefix reports whether a system block array already opens
 // with the official prefix blocks, in order, so a request from an
 // official-shaped caller is not given a second copy of its own identity. The
-// comparison is on the block text alone; the verification showed the gateway
-// does not read cache_control on these blocks.
+// comparison is on the block text alone; cache_control on these blocks was
+// measured irrelevant and is not compared.
 func leadsWithOfficialPrefix(system []any) bool {
 	if len(system) < 2 {
 		return false

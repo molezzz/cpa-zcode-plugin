@@ -299,10 +299,11 @@ func decodeExecutorRequest(request []byte) (executorRequestRPC, []byte) {
 // streaming, injects the request-body identity, and applies the official
 // system prefix: both streaming and non-streaming callers consume the same
 // upstream SSE pump, the official client writes its identity into every
-// Anthropic request body, and the gateway's integrity precheck admits only
-// requests whose system leads with the official ZCode system prompt blocks
-// (system_prefix.go, issue #16). The failure envelope carries the sanitized
-// reason.
+// Anthropic request body, and the gateway's integrity precheck admits a
+// request whose system carries a long verbatim slice of an official system
+// prompt (system_prefix.go for the measured rule; issue #16 added the
+// injection, issue #22 pinned the rule). The failure envelope carries the
+// sanitized reason.
 func prepareUpstreamPayload(payload []byte, model string, catalog []string, identity requestIdentity, injectSystemPrefix bool) ([]byte, string, []byte) {
 	trimmed := bytes.TrimSpace(payload)
 	if len(trimmed) == 0 {

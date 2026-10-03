@@ -135,9 +135,47 @@ func TestInjectOfficialSystemPrefixConfigDefault(t *testing.T) {
 	}
 }
 
-// The gateway rejects caller content placed BEFORE the official blocks, so the
-// injected prefix must always lead. This guards the ordering invariant the
-// differential verification established (issue #16 tests Y1/W3).
+// The injected text is the fingerprint the gateway matches on, so an edit to
+// either constant is a protocol change, not a refactor. These are the exact
+// lengths of the official client's own blocks as captured in mitmproxy session
+// 20261002-194452_2344fd and re-verified 2026-10-03; the 2026-10-03 matrix
+// showed a 1400-byte prefix of block 2 is still admitted while a 1200-byte one
+// is refused, so a silent truncation would move the plugin from admitted to
+// refused without any local signal. Block 2 carries four multi-byte em-dashes,
+// so its byte and character counts differ.
+func TestOfficialSystemPrefixBlocksMatchCapture(t *testing.T) {
+	if got := len(officialSystemPrefixBlock1); got != 42 {
+		t.Errorf("official block 1 is %d bytes, want the captured 42", got)
+	}
+	if got := len(officialSystemPrefixBlock2); got != 2317 {
+		t.Errorf("official block 2 is %d bytes, want the captured 2317 (2313 characters)", got)
+	}
+	const opener = "You are ZCode, an interactive coding agent"
+	if officialSystemPrefixBlock1 != opener {
+		t.Errorf("official block 1 = %q, want %q", officialSystemPrefixBlock1, opener)
+	}
+	// The gateway matches a long contiguous run of one recognized prompt: b1
+	// followed by b2 is such a run, and their order is what makes it one.
+	// leadsWithOfficialPrefix compares them in this order, so the dependency
+	// the gate depends on is the one the code relies on.
+	if !leadsWithOfficialPrefix([]any{
+		map[string]any{"type": "text", "text": officialSystemPrefixBlock1},
+		map[string]any{"type": "text", "text": officialSystemPrefixBlock2},
+	}) {
+		t.Error("the two injected constants must be recognized as the official prefix")
+	}
+	if leadsWithOfficialPrefix([]any{
+		map[string]any{"type": "text", "text": officialSystemPrefixBlock2},
+		map[string]any{"type": "text", "text": officialSystemPrefixBlock1},
+	}) {
+		t.Error("the reversed pair must not be recognized as the official prefix")
+	}
+}
+
+// The gateway recognizes the official prefix as one contiguous run of text,
+// so caller content before it separates the run from the blocks that form it.
+// The injected prefix must therefore always lead (issue #16 test Y1; measured
+// again in the 2026-10-03 matrix, case F9).
 func TestInjectOfficialSystemPrefixAlwaysLeads(t *testing.T) {
 	caller := []map[string]any{
 		{"type": "text", "text": "first caller block"},

@@ -1,0 +1,634 @@
+{
+  "measured_at": "2026-10-03",
+  "harness": "scripts/probe-3012-matrix.py",
+  "primary_account": {
+    "user_id": "70861758810173130",
+    "plan": "zcode-v3-start-plan-trust-1003 (ZCode Trust Build)",
+    "status": "active",
+    "device_mid": "d544db64-8bc3-4e44-9b73-7c7b7f7d1499"
+  },
+  "cross_account_control": {
+    "user_id": "34dd6d87-ad21-4726-80ed-1cac8d7f3292",
+    "plan": "zcode-v3-start-plan-0817 (ZCode Start Plan)",
+    "buckets_at_measurement": {
+      "GLM-5.3": 0,
+      "GLM-5.3-Flash": 0
+    },
+    "note": "bare probe C1 = 3012, plugin shape E1 = 200, title-gen baseline A1 = 200; same verdicts as the primary account, so the gate does not depend on plan exhaustion"
+  },
+  "block_lengths_bytes": {
+    "b1": 42,
+    "b2": 2313,
+    "b3": 7565,
+    "title_system": 997
+  },
+  "verdict_counts": {
+    "200": 46,
+    "3012": 37,
+    "other": 3
+  },
+  "results": [
+    {
+      "case": "A1 title-gen baseline replay (captured 200)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1278,
+      "logid": ""
+    },
+    {
+      "case": "A2 agent baseline replay (official b1+b2)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2897,
+      "logid": ""
+    },
+    {
+      "case": "B1  200 baseline - thinking",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1248,
+      "logid": ""
+    },
+    {
+      "case": "B2  200 baseline - output_config",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1245,
+      "logid": ""
+    },
+    {
+      "case": "B3  200 baseline - thinking - output_config",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1215,
+      "logid": ""
+    },
+    {
+      "case": "B4  200 baseline - system",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 215,
+      "logid": "20261003064053caf7ca33409253f13c1c"
+    },
+    {
+      "case": "B5  200 baseline - metadata",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1250,
+      "logid": ""
+    },
+    {
+      "case": "B6  200 baseline - max_tokens (dropped)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1260,
+      "logid": ""
+    },
+    {
+      "case": "B7  200 baseline - model (dropped)",
+      "verdict": "http-400",
+      "http": 400,
+      "body_bytes": 1254,
+      "logid": "2026100306410188893e9b3766df2c2b55"
+    },
+    {
+      "case": "C1 captured-3012 shape verbatim",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 139,
+      "logid": "2026100306410351431f25397eff65ba2c"
+    },
+    {
+      "case": "C2 C1 + system=official b1+b2",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2599,
+      "logid": ""
+    },
+    {
+      "case": "C3 C1 + system=official b1+b2 +cache_control",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2673,
+      "logid": ""
+    },
+    {
+      "case": "C4 C1 + system=title-gen prompt",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1202,
+      "logid": ""
+    },
+    {
+      "case": "C5 C1 + thinking + output_config",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 202,
+      "logid": "2026100306411311c075491fd0912981ff"
+    },
+    {
+      "case": "C6 C1 + system=official b1+b2 + thinking + output_config",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2662,
+      "logid": ""
+    },
+    {
+      "case": "C7 C1 + system=title-gen + thinking + output_config",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1265,
+      "logid": ""
+    },
+    {
+      "case": "C8 C1 + content as text block (not bare string)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 164,
+      "logid": "2026100306411963bd1ac82c83316aeebe"
+    },
+    {
+      "case": "D1 200 baseline + anthropic-beta",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1278,
+      "logid": ""
+    },
+    {
+      "case": "D2 200 baseline - ai/6.0.193 UA suffix",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1278,
+      "logid": ""
+    },
+    {
+      "case": "D3 200 baseline - x-api-key dual auth",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1278,
+      "logid": ""
+    },
+    {
+      "case": "D4 200 baseline + Accept: text/event-stream",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1278,
+      "logid": ""
+    },
+    {
+      "case": "D5 200 baseline - x-device-mid",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1278,
+      "logid": ""
+    },
+    {
+      "case": "D6 200 baseline - x-session-id",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1278,
+      "logid": ""
+    },
+    {
+      "case": "D7 200 baseline - x-zcode-session-type",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1278,
+      "logid": ""
+    },
+    {
+      "case": "E1 plugin shape (as emitted today)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2756,
+      "logid": ""
+    },
+    {
+      "case": "E2 plugin shape + thinking",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2786,
+      "logid": ""
+    },
+    {
+      "case": "E3 plugin shape + thinking + output_config",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2819,
+      "logid": ""
+    },
+    {
+      "case": "E4 plugin shape + output_config only",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2789,
+      "logid": ""
+    },
+    {
+      "case": "E5 plugin shape, max_tokens=128000",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2760,
+      "logid": ""
+    },
+    {
+      "case": "E6 plugin shape + thinking + max_tokens=128000",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2790,
+      "logid": ""
+    },
+    {
+      "case": "F1  system = one tiny block (42B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 218,
+      "logid": "202610030643022cf50f84c06648bdd907"
+    },
+    {
+      "case": "F2  system = one 997B filler block",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1173,
+      "logid": "20261003064303b89013d759c7ec8e31d8"
+    },
+    {
+      "case": "F3  system = one 4096B filler block",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 4272,
+      "logid": "202610030643057489ff39da1578143dcc"
+    },
+    {
+      "case": "F4  system = title prompt, first 500B",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 688,
+      "logid": "20261003064306ce48adc17849427ad224"
+    },
+    {
+      "case": "F5  system = title prompt, last 597B",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 793,
+      "logid": "2026100306430846438d7fe5c9704edc78"
+    },
+    {
+      "case": "F6  system = title prompt as a bare STRING",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1177,
+      "logid": ""
+    },
+    {
+      "case": "F7  system = official b1+b2, b2 cut to 500B",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 747,
+      "logid": "20261003064312925ea81549f134938728"
+    },
+    {
+      "case": "F8  system = official b2+b1 swapped (#16 V3)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 2599,
+      "logid": "202610030643131e186b20071ac5bfd0d1"
+    },
+    {
+      "case": "F9  system = tiny caller block BEFORE official b1+b2 (#16 Y1)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 2653,
+      "logid": "20261003064314a271a9a96ac7e34890e8"
+    },
+    {
+      "case": "G1 system official + content bare string (#16-era shape)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2599,
+      "logid": ""
+    },
+    {
+      "case": "G2 system official + content text block",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2624,
+      "logid": ""
+    },
+    {
+      "case": "G3 system official + content empty block list",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2612,
+      "logid": ""
+    },
+    {
+      "case": "H1 system official, max_tokens=1",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2598,
+      "logid": ""
+    },
+    {
+      "case": "H2 system official, max_tokens=200000",
+      "verdict": "http-400",
+      "http": 400,
+      "body_bytes": 2603,
+      "logid": ""
+    },
+    {
+      "case": "H3 system official, GLM-5.2",
+      "verdict": "http-400",
+      "http": 400,
+      "body_bytes": 2593,
+      "logid": "2026100306462506d634695a4c7d387697"
+    },
+    {
+      "case": "H4 system official, GLM-5.3",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2593,
+      "logid": "202610030646270bf76120bdc17005d8c3"
+    },
+    {
+      "case": "I-b2[:1000] official b1 + b2 prefix (1042B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1257,
+      "logid": "20261003064419d73889201ba2bf97e3ac"
+    },
+    {
+      "case": "I-b2[:1400] official b1 + b2 prefix (1442B)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1670,
+      "logid": ""
+    },
+    {
+      "case": "I-b2[:1800] official b1 + b2 prefix (1842B)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2075,
+      "logid": ""
+    },
+    {
+      "case": "I-b2[:2000] official b1 + b2 prefix (2042B)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2278,
+      "logid": ""
+    },
+    {
+      "case": "I-b2[:2200] official b1 + b2 prefix (2242B)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2481,
+      "logid": ""
+    },
+    {
+      "case": "I-b2[:2300] official b1 + b2 prefix (2342B)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2586,
+      "logid": ""
+    },
+    {
+      "case": "I-b2[:600] official b1 + b2 prefix (642B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 850,
+      "logid": "20261003064416c7019c73711084d139df"
+    },
+    {
+      "case": "I-b2[:800] official b1 + b2 prefix (842B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1057,
+      "logid": "20261003064418498db3f62a6b0c68254f"
+    },
+    {
+      "case": "I-title[:300] title prompt prefix (300B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 483,
+      "logid": "20261003064434372d838412e76708d3f3"
+    },
+    {
+      "case": "I-title[:500] title prompt prefix (500B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 688,
+      "logid": "2026100306443692289403ec72553fcc14"
+    },
+    {
+      "case": "I-title[:600] title prompt prefix (600B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 789,
+      "logid": "20261003064437ce4f2f17166b8baddf12"
+    },
+    {
+      "case": "I-title[:700] title prompt prefix (700B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 892,
+      "logid": "20261003064439ba128d394ecb50272d6a"
+    },
+    {
+      "case": "I-title[:800] title prompt prefix (800B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 994,
+      "logid": "2026100306444027a36111390cb51dc843"
+    },
+    {
+      "case": "I-title[:900] title prompt prefix (900B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1100,
+      "logid": "20261003064442d1bf4e4a89c5dfae0413"
+    },
+    {
+      "case": "I-title[:950] title prompt prefix (950B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1151,
+      "logid": "20261003064443470d48267f19839a34d5"
+    },
+    {
+      "case": "I-title[:997] title prompt prefix (997B)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1202,
+      "logid": ""
+    },
+    {
+      "case": "J1  20000B of 'A' (very low token density)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 20176,
+      "logid": "20261003064534673e05b63c7bad77bf6e"
+    },
+    {
+      "case": "J2  20000B of natural prose (high token density)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 20544,
+      "logid": "20261003064536a8724064f1c778a52d4e"
+    },
+    {
+      "case": "J3  7565B official b3 block verbatim",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 7960,
+      "logid": "202610030645373a1916c2826382305214"
+    },
+    {
+      "case": "J4  7565B of 'A' (same bytes as b3, opposite density)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 7741,
+      "logid": "20261003064538cb377fd605219741dc12"
+    },
+    {
+      "case": "J5  b3 verbatim + padding blocks of 'A'",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 20038,
+      "logid": "20261003064540b79d6d9edda6da2059ce"
+    },
+    {
+      "case": "K1 caller has NO system -> plugin emits [b1,b2]",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2599,
+      "logid": ""
+    },
+    {
+      "case": "K2 caller system STRING -> plugin emits [b1,b2,caller]",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2660,
+      "logid": ""
+    },
+    {
+      "case": "K3 caller system ARRAY not official -> plugin emits [b1,b2,caller]",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2660,
+      "logid": ""
+    },
+    {
+      "case": "K4 caller already official -> plugin leaves untouched",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2599,
+      "logid": ""
+    },
+    {
+      "case": "K5 caller system [b2,b1] swapped -> plugin prepends b1,b2",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 5048,
+      "logid": ""
+    },
+    {
+      "case": "K6 full agent flow: b1+b2+thinking+effort max+stream+metadata",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2798,
+      "logid": ""
+    },
+    {
+      "case": "L1 b1+b2 as ONE merged block (#16 V4)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2573,
+      "logid": ""
+    },
+    {
+      "case": "L2 b1 only, repeated 3x",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 354,
+      "logid": "202610030649232a0228d9189f4e7da735"
+    },
+    {
+      "case": "L3 b2 alone",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 2531,
+      "logid": "20261003064925f3ca23f8cbd1793ee283"
+    },
+    {
+      "case": "L4 b2 + b1 (swapped)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 2599,
+      "logid": "20261003064926c957f6d985fc8756c67e"
+    },
+    {
+      "case": "M1 b2[:1400] alone, no b1",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1602,
+      "logid": "202610030652333fe337f21f24f0a3a560"
+    },
+    {
+      "case": "M2 b1 + b2 middle slice [900:1400], no official head",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 757,
+      "logid": "20261003065234dd7d59b21b47badd2dfa"
+    },
+    {
+      "case": "M3 b1 + title_system complete (two official texts)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1270,
+      "logid": "2026100306523685c50cee4fc1196abbab"
+    },
+    {
+      "case": "M4 b1 + title_system[:950]",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1219,
+      "logid": "20261003065237bb509948a2cd37b8ecf1"
+    },
+    {
+      "case": "M5 title_system complete + trailing filler",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 6228,
+      "logid": ""
+    },
+    {
+      "case": "M6 b1 + b2[:1400] + caller block",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1724,
+      "logid": ""
+    },
+    {
+      "case": "M7 b1 + b2[:1200]",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1464,
+      "logid": "202610030652448ec223dc850d2effd2a2"
+    },
+    {
+      "case": "M8 b1 + b2[:1100]",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1358,
+      "logid": "20261003065245503e052287e4b1b9fb35"
+    },
+    {
+      "case": "M9 b1 + b2[:1050]",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1308,
+      "logid": "20261003065246025e11e6f50af1d40712"
+    }
+  ]
+}
