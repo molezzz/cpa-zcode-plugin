@@ -767,8 +767,8 @@ func parseQuotaCapabilities(raw json.RawMessage) ([]string, bool) {
 			// ids it does carry are still evidence.
 			continue
 		}
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			capabilities = append(capabilities, trimmed)
+		if value != "" {
+			capabilities = append(capabilities, value)
 		}
 	}
 	return capabilities, true

@@ -14,18 +14,48 @@
       "GLM-5.3": 0,
       "GLM-5.3-Flash": 0
     },
-    "note": "bare probe C1 = 3012, plugin shape E1 = 200, title-gen baseline A1 = 200; same verdicts as the primary account, so the gate does not depend on plan exhaustion"
+    "note": "bare probe C1 = 3012, plugin shape E1 = 200, title-gen baseline A1 = 200; identical verdicts to the primary account, so the gate does not depend on plan exhaustion"
   },
-  "block_lengths_bytes": {
-    "b1": 42,
-    "b2": 2313,
-    "b3": 7565,
-    "title_system": 997
+  "block_lengths": {
+    "b1": {
+      "characters": 42,
+      "bytes": 42
+    },
+    "b2": {
+      "characters": 2313,
+      "bytes": 2317,
+      "note": "two multi-byte em-dashes, so byte and character counts differ"
+    },
+    "b3": {
+      "characters": 7565,
+      "bytes": 7619
+    },
+    "title_system": {
+      "characters": 997,
+      "bytes": 997
+    }
   },
   "verdict_counts": {
-    "200": 46,
-    "3012": 37,
+    "200": 53,
+    "3012": 54,
     "other": 3
+  },
+  "measured_boundaries": {
+    "block_2_prefix_after_block_1": {
+      "1200_chars": 3012,
+      "1250_chars": 200
+    },
+    "title_system_prefix": {
+      "996_chars": 3012,
+      "997_chars_full": 200
+    },
+    "note": "the two boundaries sit at different lengths, so the precheck is not a size threshold; it is per-prompt recognition. The exact cut-off for each prompt was bracketed, not bisected to the character."
+  },
+  "rejected_upstream_of_the_precheck": {
+    "B7": "dropped model -> 3001 parameter error",
+    "H2": "max_tokens=200000 -> 1210 out of range [1,131072]",
+    "H3": "GLM-5.2 -> 3006 model not allowed (this Start Plan grants only model:glm-5.3-flash)",
+    "note": "ordinary upstream validation, never subject to the 3012 precheck; archived so they are not mistaken for gate measurements"
   },
   "results": [
     {
@@ -33,602 +63,880 @@
       "verdict": "200",
       "http": 200,
       "body_bytes": 1278,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_202610031440316fcbf332ce0647c7\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Source message is \\\"Reply with OK\\\" — trivial. Title sh"
     },
     {
       "case": "A2 agent baseline replay (official b1+b2)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2897,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144034408952484f92409d\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "B1  200 baseline - thinking",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1248,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_2026100314403637848ece90ee4638\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Just title.\",\"signature\":\"32b4d2acce7240c898eae89a\"},{\""
     },
     {
       "case": "B2  200 baseline - output_config",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1245,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_202610031440399f21c3bbb08d4283\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user says \\\"Reply with OK.\\\" This is the source mat"
     },
     {
       "case": "B3  200 baseline - thinking - output_config",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1215,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_20261003144047fa27385c55344731\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user is asking me to reply with \\\"OK\\\", but my syst"
     },
     {
       "case": "B4  200 baseline - system",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 215,
-      "logid": "20261003064053caf7ca33409253f13c1c"
+      "logid": "20261003064053caf7ca33409253f13c1c",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064053caf7ca33409253f13c1c\"}"
     },
     {
       "case": "B5  200 baseline - metadata",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1250,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_20261003144055b5ea5801e729406f\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"No source material; user just said \\\"Reply with OK.\\\" N"
     },
     {
       "case": "B6  200 baseline - max_tokens (dropped)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1260,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_202610031440585189bfae603a461b\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"They want a title for a message that just says \\\"Reply "
     },
     {
       "case": "B7  200 baseline - model (dropped)",
       "verdict": "http-400",
       "http": 400,
       "body_bytes": 1254,
-      "logid": "2026100306410188893e9b3766df2c2b55"
+      "logid": "2026100306410188893e9b3766df2c2b55",
+      "resp_head": "{\"code\":3001,\"msg\":\"parameter error\",\"logid\":\"2026100306410188893e9b3766df2c2b55\"}"
     },
     {
       "case": "C1 captured-3012 shape verbatim",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 139,
-      "logid": "2026100306410351431f25397eff65ba2c"
+      "logid": "2026100306410351431f25397eff65ba2c",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"2026100306410351431f25397eff65ba2c\"}"
     },
     {
       "case": "C2 C1 + system=official b1+b2",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2599,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144104467f644166374a82\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "C3 C1 + system=official b1+b2 +cache_control",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2673,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144106be56a76e819b46b5\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "C4 C1 + system=title-gen prompt",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1202,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144111e5b77234da464dde\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "C5 C1 + thinking + output_config",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 202,
-      "logid": "2026100306411311c075491fd0912981ff"
+      "logid": "2026100306411311c075491fd0912981ff",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"2026100306411311c075491fd0912981ff\"}"
     },
     {
       "case": "C6 C1 + system=official b1+b2 + thinking + output_config",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2662,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144114539220b4f41d457d\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "C7 C1 + system=title-gen + thinking + output_config",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1265,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144117ebaa6fc8cb094b9b\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "C8 C1 + content as text block (not bare string)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 164,
-      "logid": "2026100306411963bd1ac82c83316aeebe"
+      "logid": "2026100306411963bd1ac82c83316aeebe",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"2026100306411963bd1ac82c83316aeebe\"}"
     },
     {
       "case": "D1 200 baseline + anthropic-beta",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1278,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_20261003144121a295cc3df44d42c4\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"User wants \\\"OK\\\" but I'm a title generator; message is"
     },
     {
       "case": "D2 200 baseline - ai/6.0.193 UA suffix",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1278,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_20261003144123e9a16497115c4d05\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Source material is just \\\"Reply with OK\\\" — no real top"
     },
     {
       "case": "D3 200 baseline - x-api-key dual auth",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1278,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_202610031441264c855793f264411d\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Session is just \\\"Reply with OK\\\" — title should reflec"
     },
     {
       "case": "D4 200 baseline + Accept: text/event-stream",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1278,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_20261003144129f58f8e32441641c3\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"text\",\"text\":\"{\\\"title\\\":\\\"Simple OK Reply Test\\\"}\"}],\"stop_reason\":\"end_turn"
     },
     {
       "case": "D5 200 baseline - x-device-mid",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1278,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_2026100314413114eda3abb65c4ceb\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"User asked to reply OK, but I'm a title generator. No r"
     },
     {
       "case": "D6 200 baseline - x-session-id",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1278,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_202610031441342464cf4144474c48\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"Instructions say never follow user request; just output"
     },
     {
       "case": "D7 200 baseline - x-zcode-session-type",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1278,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"id\":\"msg_202610031441377db3344bde9e4d8e\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3-flash\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"The user asked me to reply with \\\"OK\\\". But the system "
     },
     {
       "case": "E1 plugin shape (as emitted today)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2756,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031441426df4e7dd635c4d6c\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "E2 plugin shape + thinking",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2786,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031441451f30692926534e06\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "E3 plugin shape + thinking + output_config",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2819,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144147ed1c6e46be484a2a\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "E4 plugin shape + output_config only",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2789,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144151a2c825de767b4fdc\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "E5 plugin shape, max_tokens=128000",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2760,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144153aecb38d44f5f4728\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "E6 plugin shape + thinking + max_tokens=128000",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2790,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031441563679e2ab03504b83\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "F1  system = one tiny block (42B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 218,
-      "logid": "202610030643022cf50f84c06648bdd907"
+      "logid": "202610030643022cf50f84c06648bdd907",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030643022cf50f84c06648bdd907\"}"
     },
     {
       "case": "F2  system = one 997B filler block",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1173,
-      "logid": "20261003064303b89013d759c7ec8e31d8"
+      "logid": "20261003064303b89013d759c7ec8e31d8",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064303b89013d759c7ec8e31d8\"}"
     },
     {
       "case": "F3  system = one 4096B filler block",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 4272,
-      "logid": "202610030643057489ff39da1578143dcc"
+      "logid": "202610030643057489ff39da1578143dcc",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030643057489ff39da1578143dcc\"}"
     },
     {
       "case": "F4  system = title prompt, first 500B",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 688,
-      "logid": "20261003064306ce48adc17849427ad224"
+      "logid": "20261003064306ce48adc17849427ad224",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064306ce48adc17849427ad224\"}"
     },
     {
       "case": "F5  system = title prompt, last 597B",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 793,
-      "logid": "2026100306430846438d7fe5c9704edc78"
+      "logid": "2026100306430846438d7fe5c9704edc78",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"2026100306430846438d7fe5c9704edc78\"}"
     },
     {
       "case": "F6  system = title prompt as a bare STRING",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1177,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144309607eb280ef644017\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "F7  system = official b1+b2, b2 cut to 500B",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 747,
-      "logid": "20261003064312925ea81549f134938728"
+      "logid": "20261003064312925ea81549f134938728",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064312925ea81549f134938728\"}"
     },
     {
       "case": "F8  system = official b2+b1 swapped (#16 V3)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 2599,
-      "logid": "202610030643131e186b20071ac5bfd0d1"
+      "logid": "202610030643131e186b20071ac5bfd0d1",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030643131e186b20071ac5bfd0d1\"}"
     },
     {
       "case": "F9  system = tiny caller block BEFORE official b1+b2 (#16 Y1)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 2653,
-      "logid": "20261003064314a271a9a96ac7e34890e8"
+      "logid": "20261003064314a271a9a96ac7e34890e8",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064314a271a9a96ac7e34890e8\"}"
+    },
+    {
+      "case": "F10 system = title block BEFORE official b1+b2",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 3651,
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003152439fd683282cf024aea\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
+    },
+    {
+      "case": "F11 system = official b1 alone, 42B",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 218,
+      "logid": "2026100307244459ae3ecccc19aefcf0b5",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"2026100307244459ae3ecccc19aefcf0b5\"}"
+    },
+    {
+      "case": "F12 system = official b2 alone, 2313B",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 2531,
+      "logid": "20261003072448f42a8c88917bf46b3076",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003072448f42a8c88917bf46b3076\"}"
+    },
+    {
+      "case": "F13 system = b1+b2 merged into one block",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 2573,
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003152453f59f011309ff4bbc\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "G1 system official + content bare string (#16-era shape)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2599,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031446196fcb82ed7d06481b\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "G2 system official + content text block",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2624,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144621b0a6cd4ce8a742be\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "G3 system official + content empty block list",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2612,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144623ed047ba4fa704519\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "H1 system official, max_tokens=1",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2598,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144631244314f11d114f9e\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "H2 system official, max_tokens=200000",
       "verdict": "http-400",
       "http": 400,
       "body_bytes": 2603,
-      "logid": ""
+      "logid": "",
+      "resp_head": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"1210\",\"message\":\"[1210][max_tokens参数非法：限制数值范围[1,131072]][2026100314463343e37e93033b4b1f]\"},\"request_id\":\"2026100314463343e37e93033b4b1f\""
     },
     {
       "case": "H3 system official, GLM-5.2",
       "verdict": "http-400",
       "http": 400,
       "body_bytes": 2593,
-      "logid": "2026100306462506d634695a4c7d387697"
+      "logid": "2026100306462506d634695a4c7d387697",
+      "resp_head": "{\"code\":3006,\"msg\":\"model not allowed\",\"logid\":\"2026100306462506d634695a4c7d387697\"}"
     },
     {
       "case": "H4 system official, GLM-5.3",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2593,
-      "logid": "202610030646270bf76120bdc17005d8c3"
+      "logid": "202610030646270bf76120bdc17005d8c3",
+      "resp_head": "{\"code\":1005,\"msg\":\"exceed quota limit\",\"logid\":\"202610030646270bf76120bdc17005d8c3\"}"
     },
     {
       "case": "I-b2[:1000] official b1 + b2 prefix (1042B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1257,
-      "logid": "20261003064419d73889201ba2bf97e3ac"
+      "logid": "20261003064419d73889201ba2bf97e3ac",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064419d73889201ba2bf97e3ac\"}"
     },
     {
       "case": "I-b2[:1400] official b1 + b2 prefix (1442B)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1670,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144420134c4c943fe54cee\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "I-b2[:1800] official b1 + b2 prefix (1842B)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2075,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_2026100314442501cf57ab1fae41a6\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "I-b2[:2000] official b1 + b2 prefix (2042B)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2278,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144427e262ea6f65304485\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "I-b2[:2200] official b1 + b2 prefix (2242B)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2481,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144429139377a16ac54afd\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "I-b2[:2300] official b1 + b2 prefix (2342B)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2586,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_2026100314443257fbee0b68ea4aa4\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "I-b2[:600] official b1 + b2 prefix (642B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 850,
-      "logid": "20261003064416c7019c73711084d139df"
+      "logid": "20261003064416c7019c73711084d139df",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064416c7019c73711084d139df\"}"
     },
     {
       "case": "I-b2[:800] official b1 + b2 prefix (842B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1057,
-      "logid": "20261003064418498db3f62a6b0c68254f"
+      "logid": "20261003064418498db3f62a6b0c68254f",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064418498db3f62a6b0c68254f\"}"
     },
     {
       "case": "I-title[:300] title prompt prefix (300B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 483,
-      "logid": "20261003064434372d838412e76708d3f3"
+      "logid": "20261003064434372d838412e76708d3f3",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064434372d838412e76708d3f3\"}"
     },
     {
       "case": "I-title[:500] title prompt prefix (500B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 688,
-      "logid": "2026100306443692289403ec72553fcc14"
+      "logid": "2026100306443692289403ec72553fcc14",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"2026100306443692289403ec72553fcc14\"}"
     },
     {
       "case": "I-title[:600] title prompt prefix (600B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 789,
-      "logid": "20261003064437ce4f2f17166b8baddf12"
+      "logid": "20261003064437ce4f2f17166b8baddf12",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064437ce4f2f17166b8baddf12\"}"
     },
     {
       "case": "I-title[:700] title prompt prefix (700B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 892,
-      "logid": "20261003064439ba128d394ecb50272d6a"
+      "logid": "20261003064439ba128d394ecb50272d6a",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064439ba128d394ecb50272d6a\"}"
     },
     {
       "case": "I-title[:800] title prompt prefix (800B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 994,
-      "logid": "2026100306444027a36111390cb51dc843"
+      "logid": "2026100306444027a36111390cb51dc843",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"2026100306444027a36111390cb51dc843\"}"
     },
     {
       "case": "I-title[:900] title prompt prefix (900B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1100,
-      "logid": "20261003064442d1bf4e4a89c5dfae0413"
+      "logid": "20261003064442d1bf4e4a89c5dfae0413",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064442d1bf4e4a89c5dfae0413\"}"
     },
     {
       "case": "I-title[:950] title prompt prefix (950B)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1151,
-      "logid": "20261003064443470d48267f19839a34d5"
+      "logid": "20261003064443470d48267f19839a34d5",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064443470d48267f19839a34d5\"}"
     },
     {
       "case": "I-title[:997] title prompt prefix (997B)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1202,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144444b96c7468507f48c5\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "J1  20000B of 'A' (very low token density)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 20176,
-      "logid": "20261003064534673e05b63c7bad77bf6e"
+      "logid": "20261003064534673e05b63c7bad77bf6e",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064534673e05b63c7bad77bf6e\"}"
     },
     {
       "case": "J2  20000B of natural prose (high token density)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 20544,
-      "logid": "20261003064536a8724064f1c778a52d4e"
+      "logid": "20261003064536a8724064f1c778a52d4e",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064536a8724064f1c778a52d4e\"}"
     },
     {
       "case": "J3  7565B official b3 block verbatim",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 7960,
-      "logid": "202610030645373a1916c2826382305214"
+      "logid": "202610030645373a1916c2826382305214",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030645373a1916c2826382305214\"}"
     },
     {
       "case": "J4  7565B of 'A' (same bytes as b3, opposite density)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 7741,
-      "logid": "20261003064538cb377fd605219741dc12"
+      "logid": "20261003064538cb377fd605219741dc12",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064538cb377fd605219741dc12\"}"
     },
     {
       "case": "J5  b3 verbatim + padding blocks of 'A'",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 20038,
-      "logid": "20261003064540b79d6d9edda6da2059ce"
+      "logid": "20261003064540b79d6d9edda6da2059ce",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064540b79d6d9edda6da2059ce\"}"
     },
     {
       "case": "K1 caller has NO system -> plugin emits [b1,b2]",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2599,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031449016859fe5dd6aa4729\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "K2 caller system STRING -> plugin emits [b1,b2,caller]",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2660,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_2026100314490400b5a6a250264e7d\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "K3 caller system ARRAY not official -> plugin emits [b1,b2,caller]",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2660,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031449063edbaaf908514679\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "K4 caller already official -> plugin leaves untouched",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2599,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003144908a04fbbe407ec4982\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "K5 caller system [b2,b1] swapped -> plugin prepends b1,b2",
       "verdict": "200",
       "http": 200,
       "body_bytes": 5048,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031449100d7bda4e8cc44939\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "K6 full agent flow: b1+b2+thinking+effort max+stream+metadata",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2798,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031449130ed1585fef9a419e\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "L1 b1+b2 as ONE merged block (#16 V4)",
       "verdict": "200",
       "http": 200,
       "body_bytes": 2573,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031449209d2ffb046f244dec\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "L2 b1 only, repeated 3x",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 354,
-      "logid": "202610030649232a0228d9189f4e7da735"
+      "logid": "202610030649232a0228d9189f4e7da735",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030649232a0228d9189f4e7da735\"}"
     },
     {
       "case": "L3 b2 alone",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 2531,
-      "logid": "20261003064925f3ca23f8cbd1793ee283"
+      "logid": "20261003064925f3ca23f8cbd1793ee283",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064925f3ca23f8cbd1793ee283\"}"
     },
     {
       "case": "L4 b2 + b1 (swapped)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 2599,
-      "logid": "20261003064926c957f6d985fc8756c67e"
+      "logid": "20261003064926c957f6d985fc8756c67e",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003064926c957f6d985fc8756c67e\"}"
     },
     {
       "case": "M1 b2[:1400] alone, no b1",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1602,
-      "logid": "202610030652333fe337f21f24f0a3a560"
+      "logid": "202610030652333fe337f21f24f0a3a560",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030652333fe337f21f24f0a3a560\"}"
     },
     {
       "case": "M2 b1 + b2 middle slice [900:1400], no official head",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 757,
-      "logid": "20261003065234dd7d59b21b47badd2dfa"
+      "logid": "20261003065234dd7d59b21b47badd2dfa",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003065234dd7d59b21b47badd2dfa\"}"
     },
     {
       "case": "M3 b1 + title_system complete (two official texts)",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1270,
-      "logid": "2026100306523685c50cee4fc1196abbab"
+      "logid": "2026100306523685c50cee4fc1196abbab",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"2026100306523685c50cee4fc1196abbab\"}"
     },
     {
       "case": "M4 b1 + title_system[:950]",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1219,
-      "logid": "20261003065237bb509948a2cd37b8ecf1"
+      "logid": "20261003065237bb509948a2cd37b8ecf1",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003065237bb509948a2cd37b8ecf1\"}"
     },
     {
       "case": "M5 title_system complete + trailing filler",
       "verdict": "200",
       "http": 200,
       "body_bytes": 6228,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031452385b1e0554900d4f5b\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "M6 b1 + b2[:1400] + caller block",
       "verdict": "200",
       "http": 200,
       "body_bytes": 1724,
-      "logid": ""
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031452416c7589986d604abc\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
     },
     {
       "case": "M7 b1 + b2[:1200]",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1464,
-      "logid": "202610030652448ec223dc850d2effd2a2"
+      "logid": "202610030652448ec223dc850d2effd2a2",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030652448ec223dc850d2effd2a2\"}"
     },
     {
       "case": "M8 b1 + b2[:1100]",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1358,
-      "logid": "20261003065245503e052287e4b1b9fb35"
+      "logid": "20261003065245503e052287e4b1b9fb35",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003065245503e052287e4b1b9fb35\"}"
     },
     {
       "case": "M9 b1 + b2[:1050]",
       "verdict": "3012",
       "http": 405,
       "body_bytes": 1308,
-      "logid": "20261003065246025e11e6f50af1d40712"
+      "logid": "20261003065246025e11e6f50af1d40712",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003065246025e11e6f50af1d40712\"}"
+    },
+    {
+      "case": "N-b1+b2[:1100] head boundary (1142B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1358,
+      "logid": "20261003071939e77a3f76aa027ddb42fc",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003071939e77a3f76aa027ddb42fc\"}"
+    },
+    {
+      "case": "N-b1+b2[:1200] head boundary (1242B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1464,
+      "logid": "202610030719408b4ebb8b460239fb71f1",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030719408b4ebb8b460239fb71f1\"}"
+    },
+    {
+      "case": "N-b1+b2[:1250] head boundary (1292B)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1518,
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031519422025f4a338794947\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
+    },
+    {
+      "case": "N-b1+b2[:1300] head boundary (1342B)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1569,
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003151944397fd914383b4e4e\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
+    },
+    {
+      "case": "N-b1+b2[:1350] head boundary (1392B)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1620,
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003151946e7576be9d57a4d87\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
+    },
+    {
+      "case": "N-title[:955] head boundary (955B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1156,
+      "logid": "202610030719486161afdecd039d8fe106",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030719486161afdecd039d8fe106\"}"
+    },
+    {
+      "case": "N-title[:965] head boundary (965B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1166,
+      "logid": "202610030719493da319dd5b1a766a2a7a",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030719493da319dd5b1a766a2a7a\"}"
+    },
+    {
+      "case": "N-title[:975] head boundary (975B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1176,
+      "logid": "20261003071951631a53cbcce2f3303fc2",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003071951631a53cbcce2f3303fc2\"}"
+    },
+    {
+      "case": "N-title[:985] head boundary (985B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1187,
+      "logid": "20261003071952bc4840b0b052bcf483d2",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003071952bc4840b0b052bcf483d2\"}"
+    },
+    {
+      "case": "N-title[:990] head boundary (990B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1193,
+      "logid": "202610030719547b44fb20c381ba2ddb80",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030719547b44fb20c381ba2ddb80\"}"
+    },
+    {
+      "case": "N-title[:991] head boundary (991B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1194,
+      "logid": "2026100307213077636c4ff80a360f3c26",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"2026100307213077636c4ff80a360f3c26\"}"
+    },
+    {
+      "case": "N-title[:993] head boundary (993B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1197,
+      "logid": "202610030721343e60deee95f590e9dce4",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030721343e60deee95f590e9dce4\"}"
+    },
+    {
+      "case": "N-title[:995] head boundary (995B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1199,
+      "logid": "202610030721382198b34090bb47ba915a",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030721382198b34090bb47ba915a\"}"
+    },
+    {
+      "case": "N-title[:996] head boundary (996B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1201,
+      "logid": "20261003072143895b9b720bddd2baa967",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003072143895b9b720bddd2baa967\"}"
+    },
+    {
+      "case": "N1 b2[:1400] alone, caller block AFTER",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1656,
+      "logid": "202610030720143fbe8887b0eeae735bb1",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030720143fbe8887b0eeae735bb1\"}"
+    },
+    {
+      "case": "N2 b1 + b2[:1400] split differently (b1 truncated to 20B)",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1648,
+      "logid": "202610030720185fbabf966723d232ed68",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030720185fbabf966723d232ed68\"}"
+    },
+    {
+      "case": "N3 b1 + b2[:1400] where b2 starts at 0 (b1 duplicated after)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1738,
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_20261003152022ecc9cc6f8e2741ce\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
+    },
+    {
+      "case": "N4 title_system full + b1 (title leads)",
+      "verdict": "200",
+      "http": 200,
+      "body_bytes": 1270,
+      "logid": "",
+      "resp_head": "event: message_start data: {\"type\": \"message_start\", \"message\": {\"id\": \"msg_202610031520271ad408b498a94ae4\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"glm-5.3-flash\", \"content\": [], \"stop_reas"
+    },
+    {
+      "case": "N5 b2[:1400] with 1 leading space",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1603,
+      "logid": "202610030720330acd5f0a90542cc4f855",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"202610030720330acd5f0a90542cc4f855\"}"
+    },
+    {
+      "case": "N6 b1 + b2[:1400] with b1 having 1 leading space",
+      "verdict": "3012",
+      "http": 405,
+      "body_bytes": 1671,
+      "logid": "20261003072037fbafe1c1f306205faee4",
+      "resp_head": "{\"code\":3012,\"msg\":\"request has been blocked due to unusual activity.\",\"logid\":\"20261003072037fbafe1c1f306205faee4\"}"
     }
   ]
 }

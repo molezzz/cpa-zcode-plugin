@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+	"unicode/utf8"
 )
 
 // decodeSystem reads one prepared payload's system array back as raw JSON so
@@ -139,36 +140,46 @@ func TestInjectOfficialSystemPrefixConfigDefault(t *testing.T) {
 // either constant is a protocol change, not a refactor. These are the exact
 // lengths of the official client's own blocks as captured in mitmproxy session
 // 20261002-194452_2344fd and re-verified 2026-10-03; the 2026-10-03 matrix
-// showed a 1400-byte prefix of block 2 is still admitted while a 1200-byte one
-// is refused, so a silent truncation would move the plugin from admitted to
-// refused without any local signal. Block 2 carries four multi-byte em-dashes,
+// showed block 2's 1200-byte prefix is refused while a 1250-byte one is
+// admitted, so a silent truncation could move the plugin from admitted to
+// refused without any local signal. Block 2 carries two multi-byte em-dashes,
 // so its byte and character counts differ.
 func TestOfficialSystemPrefixBlocksMatchCapture(t *testing.T) {
 	if got := len(officialSystemPrefixBlock1); got != 42 {
 		t.Errorf("official block 1 is %d bytes, want the captured 42", got)
 	}
 	if got := len(officialSystemPrefixBlock2); got != 2317 {
-		t.Errorf("official block 2 is %d bytes, want the captured 2317 (2313 characters)", got)
+		t.Errorf("official block 2 is %d bytes, want the captured 2317", got)
+	}
+	if got := utf8.RuneCountInString(officialSystemPrefixBlock2); got != 2313 {
+		t.Errorf("official block 2 is %d characters, want the captured 2313", got)
 	}
 	const opener = "You are ZCode, an interactive coding agent"
 	if officialSystemPrefixBlock1 != opener {
 		t.Errorf("official block 1 = %q, want %q", officialSystemPrefixBlock1, opener)
 	}
-	// The gateway matches a long contiguous run of one recognized prompt: b1
-	// followed by b2 is such a run, and their order is what makes it one.
-	// leadsWithOfficialPrefix compares them in this order, so the dependency
-	// the gate depends on is the one the code relies on.
-	if !leadsWithOfficialPrefix([]any{
-		map[string]any{"type": "text", "text": officialSystemPrefixBlock1},
-		map[string]any{"type": "text", "text": officialSystemPrefixBlock2},
-	}) {
-		t.Error("the two injected constants must be recognized as the official prefix")
+}
+
+// The gateway recognizes block 1 followed by block 2 as one run and refuses
+// either alone or the reversed pair, so the order leadsWithOfficialPrefix
+// checks is load-bearing for the de-duplication decision it makes: a reversed
+// official-shaped caller is a caller, not a caller to leave untouched.
+func TestLeadsWithOfficialPrefixRequiresOrder(t *testing.T) {
+	block1 := map[string]any{"type": "text", "text": officialSystemPrefixBlock1}
+	block2 := map[string]any{"type": "text", "text": officialSystemPrefixBlock2}
+
+	if !leadsWithOfficialPrefix([]any{block1, block2}) {
+		t.Error("blocks 1 then 2 must be recognized as the official prefix")
 	}
-	if leadsWithOfficialPrefix([]any{
-		map[string]any{"type": "text", "text": officialSystemPrefixBlock2},
-		map[string]any{"type": "text", "text": officialSystemPrefixBlock1},
-	}) {
-		t.Error("the reversed pair must not be recognized as the official prefix")
+	for name, system := range map[string][]any{
+		"reversed":       {block2, block1},
+		"block 1 alone":  {block1},
+		"block 2 alone":  {block2},
+		"caller leading": {map[string]any{"type": "text", "text": "caller"}, block1, block2},
+	} {
+		if leadsWithOfficialPrefix(system) {
+			t.Errorf("%s must not be recognized as the official prefix", name)
+		}
 	}
 }
 

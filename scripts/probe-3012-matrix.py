@@ -359,6 +359,32 @@ def build_cases(b1, b2, title_system, b3=""):
     case("M8 b1 + b2[:1100]", bare_probe_body(system=[block(b1), block(b2[:1100])]))
     case("M9 b1 + b2[:1050]", bare_probe_body(system=[block(b1), block(b2[:1050])]))
 
+    # --- Row N: pin the boundary and test prefix-vs-contains directly. ---
+    # M1/M2 showed b2's slice is refused alone and refused mid-array but
+    # accepted after b1, so "contains a long slice" is the wrong rule. These
+    # locate the real boundary and check whether position or head matters.
+    for n in (1100, 1200, 1250, 1300, 1350):
+        case(f"N-b1+b2[:{n}] head boundary ({42 + n}B)",
+             bare_probe_body(system=[block(b1), block(b2[:n])]))
+    for n in (955, 965, 975, 985, 990):
+        case(f"N-title[:{n}] head boundary ({n}B)",
+             bare_probe_body(system=[block(title_system[:n])]))
+    for n in (991, 993, 995, 996):
+        case(f"N-title[:{n}] head boundary ({n}B)",
+             bare_probe_body(system=[block(title_system[:n])]))
+    case("N1 b2[:1400] alone, caller block AFTER",
+         bare_probe_body(system=[block(b2[:1400]), block("You are a helpful assistant.")]))
+    case("N2 b1 + b2[:1400] split differently (b1 truncated to 20B)",
+         bare_probe_body(system=[block(b1[:20]), block(b2[:1400])]))
+    case("N3 b1 + b2[:1400] where b2 starts at 0 (b1 duplicated after)",
+         bare_probe_body(system=[block(b1), block(b2[:1400]), block(b1)]))
+    case("N4 title_system full + b1 (title leads)",
+         bare_probe_body(system=[block(title_system), block(b1)]))
+    case("N5 b2[:1400] with 1 leading space",
+         bare_probe_body(system=[block(" " + b2[:1400])]))
+    case("N6 b1 + b2[:1400] with b1 having 1 leading space",
+         bare_probe_body(system=[block(" " + b1), block(b2[:1400])]))
+
     return cases
 
 
