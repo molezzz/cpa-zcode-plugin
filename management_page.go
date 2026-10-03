@@ -100,7 +100,10 @@ const managementPageHTML = `<!DOCTYPE html>
 
   .stack { display: flex; flex-direction: column; gap: 3px; }
   .sub { font-size: 12px; color: var(--text-muted); }
-  .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  /* align-items: center keeps a text sibling (the item count) on the same
+     optical line as the buttons next to it. Without it flex stretches that
+     span to the button's height and pins its text to the top of the box. */
+  .actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 
   button {
     font: inherit; font-size: 12px; cursor: pointer; border-radius: 7px;
