@@ -698,7 +698,9 @@ func quotaExpiryText(raw json.RawMessage) string {
 	return time.Unix(int64(*seconds), 0).UTC().Format(time.RFC3339)
 }
 
-// optionalString reads an optional JSON string.
+// optionalString reads an optional JSON string. The value is trimmed of the
+// whitespace a JSON document may carry inside its strings, so callers compare
+// identity fields directly without each trimming again.
 func optionalString(raw json.RawMessage) (string, bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
@@ -708,7 +710,7 @@ func optionalString(raw json.RawMessage) (string, bool) {
 	if err := json.Unmarshal(trimmed, &value); err != nil {
 		return "", false
 	}
-	return value, true
+	return strings.TrimSpace(value), true
 }
 
 // optionalNumber reads an optional JSON number. present distinguishes an
@@ -888,7 +890,7 @@ const (
 // the id and the name are evidence here.
 func isStartPlanPlan(plan quotaPlan) bool {
 	for _, value := range []string{plan.PlanID, plan.Name} {
-		if lowered := strings.ToLower(strings.TrimSpace(value)); lowered != "" &&
+		if lowered := strings.ToLower(value); lowered != "" &&
 			(strings.Contains(lowered, startPlanIdentityMarker) || strings.Contains(lowered, startPlanNameMarker)) {
 			return true
 		}
@@ -925,15 +927,10 @@ type quotaGroup struct {
 	Balances []quotaBalance
 }
 
-// groupBalancesByPlan places every bucket under the plan that granted it, and
-// is the short form callers that only need the grouping use.
-func groupBalancesByPlan(plans []quotaPlan, balances []quotaBalance) []quotaGroup {
-	groups, _ := placeBucketsByPlan(plans, balances)
-	return groups
-}
-
 // placeBucketsByPlan groups the buckets by the plan that granted them, and
-// reports each bucket's group index alongside.
+// reports each bucket's group index alongside. Callers that only need the
+// groups discard the axis; it is a second return value because the management
+// page joins each bucket to its group by position, not by label.
 //
 // Ownership follows the upstream's own rule, evaluated per bucket-and-plan
 // pair rather than through an index: when both rows state a user plan id they
@@ -999,13 +996,18 @@ func placeBucketsByPlan(plans []quotaPlan, balances []quotaBalance) ([]quotaGrou
 // planGrantsBucket reports whether a plan is the one a bucket's numbers come
 // from, by the upstream's own comparison: the instance id when both rows state
 // one, the product id otherwise.
+//
+// The product-id branch requires the plan to state one. The upstream's own
+// rule compares the bare ids, under which two rows that both state none would
+// match and their buckets would fold into one plan; requiring the plan's id is
+// a deliberate divergence, because a plan with no readable identity has no
+// evidence it granted anything, and an idless bucket already has its own
+// unassigned group.
 func planGrantsBucket(plan quotaPlan, balance quotaBalance) bool {
-	userPlanID, bucketUserPlanID := strings.TrimSpace(plan.UserPlanID), strings.TrimSpace(balance.UserPlanID)
-	if userPlanID != "" && bucketUserPlanID != "" {
-		return userPlanID == bucketUserPlanID
+	if plan.UserPlanID != "" && balance.UserPlanID != "" {
+		return plan.UserPlanID == balance.UserPlanID
 	}
-	planID := strings.TrimSpace(plan.PlanID)
-	return planID != "" && planID == strings.TrimSpace(balance.PlanID)
+	return plan.PlanID != "" && plan.PlanID == balance.PlanID
 }
 
 // planGroupKind names the billing axis a plan's group belongs to.
@@ -1016,11 +1018,15 @@ func planGrantsBucket(plan quotaPlan, balance quotaBalance) bool {
 // reading an unreadable plan as the coding axis is precisely the mislabeling
 // this grouping exists to prevent, and the official client treats the same
 // unreadable case as unproven rather than as one axis or the other.
+//
+// The readable case knows of exactly two axes: any readable plan that is not a
+// Start Plan is the general Coding Plan. A third plan kind the upstream later
+// introduces would land on the coding axis until this switch learns it.
 func planGroupKind(plan quotaPlan) string {
 	switch {
 	case isStartPlanPlan(plan):
 		return planGroupStartPlan
-	case strings.TrimSpace(plan.PlanID) != "" || strings.TrimSpace(plan.Name) != "":
+	case plan.PlanID != "" || plan.Name != "":
 		return planGroupCodingPlan
 	default:
 		return planGroupUnassigned
@@ -1032,13 +1038,13 @@ func planGroupKind(plan quotaPlan) string {
 // unnamed plan is still a real axis, so it is named by its id rather than
 // dropped or given a placeholder.
 func planGroupLabel(plan quotaPlan) string {
-	if name := strings.TrimSpace(plan.Name); name != "" {
-		return name
+	if plan.Name != "" {
+		return plan.Name
 	}
-	if userPlanID := strings.TrimSpace(plan.UserPlanID); userPlanID != "" {
-		return userPlanID
+	if plan.UserPlanID != "" {
+		return plan.UserPlanID
 	}
-	return strings.TrimSpace(plan.PlanID)
+	return plan.PlanID
 }
 
 // unassignedGroupKey names the group of a bucket no plan claimed, by the key
@@ -1046,12 +1052,10 @@ func planGroupLabel(plan quotaPlan) string {
 // which is honest: the plugin cannot tell them apart, and inventing a split
 // would suggest a distinction the evidence does not carry.
 func unassignedGroupKey(balance quotaBalance) string {
-	for _, key := range []string{balance.PlanID, balance.UserPlanID} {
-		if trimmed := strings.TrimSpace(key); trimmed != "" {
-			return trimmed
-		}
+	if balance.PlanID != "" {
+		return balance.PlanID
 	}
-	return ""
+	return balance.UserPlanID
 }
 
 // renderView renders the normalized host/management view of the evidence into
@@ -1089,7 +1093,8 @@ func (e *quotaEvidence) renderView() {
 			})
 		}
 	}
-	for _, group := range groupBalancesByPlan(e.Plans, e.Balances) {
+	groups, _ := placeBucketsByPlan(e.Plans, e.Balances)
+	for _, group := range groups {
 		rendered := pluginapi.QuotaGroup{DisplayName: group.Label}
 		for _, balance := range group.Balances {
 			// A bucket needs both ends of the window; a remaining value without

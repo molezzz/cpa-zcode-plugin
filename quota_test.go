@@ -1679,7 +1679,7 @@ func TestGroupBalancesByPlanPrefersTheUserPlanID(t *testing.T) {
 		{Name: "GLM-5.3-Flash", PlanID: "zcode-v3-start-plan", UserPlanID: "upl_a"},
 		{Name: "GLM-5.3", PlanID: "zcode-v3-start-plan", UserPlanID: "upl_b"},
 	}
-	groups := groupBalancesByPlan(plans, balances)
+	groups, _ := placeBucketsByPlan(plans, balances)
 	if len(groups) != 2 {
 		t.Fatalf("groups = %d, want 2; one product sold twice is two quota axes", len(groups))
 	}
@@ -1702,7 +1702,7 @@ func TestGroupBalancesByPlanPrefersTheUserPlanID(t *testing.T) {
 func TestGroupBalancesByPlanFallsBackToTheProductID(t *testing.T) {
 	plans := []quotaPlan{{Name: "GLM Coding Plan", PlanID: "zcode-v3-coding-plan", Status: planStatusActive}}
 	balances := []quotaBalance{{Name: "GLM", PlanID: "zcode-v3-coding-plan"}}
-	groups := groupBalancesByPlan(plans, balances)
+	groups, _ := placeBucketsByPlan(plans, balances)
 	if len(groups) != 1 {
 		t.Fatalf("groups = %d, want 1", len(groups))
 	}
@@ -1722,7 +1722,7 @@ func TestGroupBalancesByPlanKeepsOrphansUnassigned(t *testing.T) {
 		{Name: "GLM", PlanID: "zcode-v3-coding-plan"},
 		{Name: "GLM-5.3-Flash", PlanID: "zcode-v3-start-plan-trust-1003"},
 	}
-	groups := groupBalancesByPlan(plans, balances)
+	groups, _ := placeBucketsByPlan(plans, balances)
 	if len(groups) != 2 {
 		t.Fatalf("groups = %d, want the coding group plus one orphan group", len(groups))
 	}
@@ -1749,7 +1749,7 @@ func TestGroupBalancesByPlanOrdersByUpstreamBalanceOrder(t *testing.T) {
 		{Name: "coding", PlanID: "zcode-v3-coding-plan"},
 		{Name: "flash", PlanID: "zcode-v3-start-plan-1003", UserPlanID: "upl_1"},
 	}
-	groups := groupBalancesByPlan(plans, balances)
+	groups, _ := placeBucketsByPlan(plans, balances)
 	if len(groups) != 2 {
 		t.Fatalf("groups = %d, want 2", len(groups))
 	}
