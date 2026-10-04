@@ -25,6 +25,11 @@ const (
 	authSessionCompleted authSessionState = "completed"
 	authSessionFailed    authSessionState = "failed"
 	authSessionExpired   authSessionState = "expired"
+	// authSessionCancelled is the terminal state an operator's explicit
+	// cancellation lands in. It is distinct from failed so the page can say
+	// "you stopped this" instead of implying an upstream error, and from
+	// expired so a session stopped well before its deadline reads as a choice.
+	authSessionCancelled authSessionState = "cancelled"
 )
 
 // pollSecretBytes is the upstream polling secret length. It authenticates
@@ -216,6 +221,22 @@ func (s *authSession) expireIfDue(now time.Time) authSessionState {
 	return s.state
 }
 
+// cancel moves a pending session into the cancelled terminal state at the
+// operator's request. It reports whether this call was the one that cancelled:
+// an already-terminal session keeps its first outcome, so a cancel racing a
+// completion can never overwrite a landed credential with "cancelled".
+func (s *authSession) cancel() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != authSessionPending {
+		return false
+	}
+	s.state = authSessionCancelled
+	s.message = "authorization cancelled by operator"
+	s.clearSecretsLocked()
+	return true
+}
+
 // destroy releases the session's secrets and connections; it is idempotent
 // and safe to call for cleanup on remove and shutdown paths.
 func (s *authSession) destroy() {
@@ -279,13 +300,31 @@ var activeSessions = newSessionManager()
 // flow data, poll secret, and the dedicated HTTP client used for the init
 // call, and schedules its cleanup. It fails only on local randomness errors.
 func (m *sessionManager) create(flowID, authorizeURL, pollSecret string, client *http.Client, ttl time.Duration, site string) (*authSession, error) {
-	sessionID, err := randomHexToken(sessionIDBytes)
-	if err != nil {
-		return nil, fmt.Errorf("generate authorization session id: %w", err)
+	return m.createWithID("", flowID, authorizeURL, pollSecret, client, ttl, site)
+}
+
+// createWithID registers a pending session under a handle the caller already
+// minted, or a fresh one when sessionID is empty.
+//
+// The host-driven login adopts the token it was already given rather than making
+// the host learn a second one mid-flow; see startAuthorizationSessionWithID for
+// why that handle has to exist before the site does.
+func (m *sessionManager) createWithID(sessionID, flowID, authorizeURL, pollSecret string, client *http.Client, ttl time.Duration, site string) (*authSession, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		var err error
+		sessionID, err = randomHexToken(sessionIDBytes)
+		if err != nil {
+			return nil, fmt.Errorf("generate authorization session id: %w", err)
+		}
 	}
 	session := newState(sessionID, flowID, authorizeURL, pollSecret, client, m.now(), ttl, site)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// A handle already in use is refused rather than overwritten: two logins
+	// sharing one State would leave the host polling whichever finished last.
+	if _, exists := m.sessions[sessionID]; exists {
+		return nil, errors.New("authorization session id is already in use")
+	}
 	m.sessions[sessionID] = session
 	m.timers[sessionID] = time.AfterFunc(ttl+sessionGrace, func() { m.remove(sessionID) })
 	return session, nil
@@ -321,6 +360,18 @@ func (m *sessionManager) remove(sessionID string) {
 	}
 }
 
+// cancel moves one pending session into the cancelled terminal state. It
+// reports whether the session existed and was still pending: an unknown id or
+// an already-terminal session is a no-op, and the caller turns the boolean
+// into the management response.
+func (m *sessionManager) cancel(sessionID string) bool {
+	session := m.lookup(sessionID)
+	if session == nil {
+		return false
+	}
+	return session.cancel()
+}
+
 // shutdownAll clears every session; it runs from runShutdown.
 func (m *sessionManager) shutdownAll() {
 	m.mu.Lock()
@@ -342,11 +393,23 @@ func (m *sessionManager) shutdownAll() {
 // flow identifier, and polling secret are authorization parameters that never
 // appear in management data.
 type sessionView struct {
-	State      string `json:"state"`
-	Message    string `json:"message,omitempty"`
-	CreatedAt  string `json:"created_at,omitempty"`
-	ExpiresAt  string `json:"expires_at,omitempty"`
-	IdentityID string `json:"identity_id,omitempty"`
+	// ID is the session's own handle. It is a 256-bit random token — the same
+	// unguessable value the host holds as login State — and its only use on
+	// the management plane is naming the session an action (cancel) targets.
+	// It authorizes nothing by itself: every action route sits behind the
+	// management key, and the host-driven poll path keeps its own guard.
+	ID        string `json:"id"`
+	State     string `json:"state"`
+	Message   string `json:"message,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+	// IdentityHash is the authorized account's identity as the shared digest.
+	// The raw identity never appears in management data; this is the same digest
+	// the record shows on the accounts page and in diagnostic lines.
+	IdentityHash string `json:"identity_hash,omitempty"`
+	// Cancellable marks a pending session the operator may still stop. A
+	// terminal session keeps the field false: there is nothing left to cancel.
+	Cancellable bool `json:"cancellable,omitempty"`
 }
 
 // view lists the redacted state of every live session, settling pending
@@ -369,13 +432,17 @@ func (m *sessionManager) view(now time.Time) []sessionView {
 		session.expireIfDue(now)
 		snap := session.snapshot()
 		view := sessionView{
+			ID:        session.id,
 			State:     string(snap.State),
 			Message:   snap.Message,
 			CreatedAt: session.createdAt.UTC().Format(time.RFC3339),
 			ExpiresAt: session.expiresAt.UTC().Format(time.RFC3339),
 		}
+		if snap.State == authSessionPending {
+			view.Cancellable = true
+		}
 		if snap.Result != nil {
-			view.IdentityID = snap.Result.IdentityID
+			view.IdentityHash = identityDiag(snap.Result.IdentityID)
 		}
 		views = append(views, view)
 	}

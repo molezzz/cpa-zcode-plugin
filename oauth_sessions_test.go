@@ -190,6 +190,56 @@ func TestSessionBeforeTTLStaysPending(t *testing.T) {
 	}
 }
 
+func TestSessionCancelIsTerminalAndReleasesSecrets(t *testing.T) {
+	resetSessions(t)
+	session, _ := newTestSession(t, activeSessions, "flow-cancel")
+
+	if !activeSessions.cancel(session.id) {
+		t.Fatal("cancelling a pending session must succeed")
+	}
+	snap := session.snapshot()
+	if snap.State != authSessionCancelled {
+		t.Fatalf("state = %q, want cancelled", snap.State)
+	}
+	if snap.Message != "authorization cancelled by operator" {
+		t.Fatalf("cancelled message = %q", snap.Message)
+	}
+	if session.pollSecret != "" || session.flowID != "" || session.authorizeURL != "" || session.client != nil {
+		t.Fatal("cancelled session must drop every secret and client")
+	}
+	// Cancel is a terminal state: a completion and a second cancel must both
+	// be refused, exactly as they are for failed and expired sessions.
+	if _, isNew := session.complete(completedLogin{IdentityID: "x"}); isNew {
+		t.Fatal("cancelled session must not complete afterwards")
+	}
+	if activeSessions.cancel(session.id) {
+		t.Fatal("cancelling an already-cancelled session must report false")
+	}
+}
+
+func TestSessionCancelDoesNotOverwriteCompletion(t *testing.T) {
+	resetSessions(t)
+	session, _ := newTestSession(t, activeSessions, "flow-cancel-race")
+	if _, isNew := session.complete(completedLogin{IdentityID: "zcode-user", Storage: []byte(`{"zcode":{}}`)}); !isNew {
+		t.Fatal("completion must land first")
+	}
+	// A cancel racing a landed credential loses: the login is real and the
+	// operator must never see "cancelled" over it.
+	if activeSessions.cancel(session.id) {
+		t.Fatal("cancelling a completed session must report false")
+	}
+	if state := session.snapshot().State; state != authSessionCompleted {
+		t.Fatalf("state = %q, want completed after the lost cancel", state)
+	}
+}
+
+func TestSessionManagerCancelUnknownIDIsFalse(t *testing.T) {
+	resetSessions(t)
+	if activeSessions.cancel("00000000000000000000000000000000") {
+		t.Fatal("cancelling an unknown session id must report false")
+	}
+}
+
 func TestSessionManagerRemoveDropsSecrets(t *testing.T) {
 	resetSessions(t)
 	session, _ := newTestSession(t, activeSessions, "flow-remove")
