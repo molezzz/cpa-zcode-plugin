@@ -61,6 +61,44 @@ func TestPoolSchedulesReservedPlanLast(t *testing.T) {
 	}
 }
 
+// Acceptance criterion 3 of the dual-site issue: the pool's policy is cross-site.
+// A domestic (bigmodel) record on a trust plan is scheduled before an
+// international (zai) record on the reserved 0817 plan, even when the host picked
+// the reserved one for the request — the site a record belongs to never outranks
+// the plan-id policy, and the host pick only breaks ties inside a group.
+func TestPoolOrdersBigmodelTrustBeforeZaiReserved(t *testing.T) {
+	fixture := newQuotaFixture(t)
+	bigmodel := poolRecordDoc(t, "bm-trust-user", "zcode-v3-start-plan-trust-1004", "GLM-5.3-Flash", 50)
+	bigmodel, err := pinCredentialSite(bigmodel, siteBigmodel)
+	if err != nil {
+		t.Fatalf("pin bigmodel site: %v", err)
+	}
+	zai := poolRecordDoc(t, "zai-0817-user", "zcode-v3-start-plan-0817", "GLM-5.3-Flash", 900)
+	zai, err = pinCredentialSite(zai, siteZai)
+	if err != nil {
+		t.Fatalf("pin zai site: %v", err)
+	}
+	addFakeAccount(t, fixture.store, "auth-bm-trust", "bm-trust-user", string(bigmodel))
+	addFakeAccount(t, fixture.store, "auth-zai-0817", "zai-0817-user", string(zai))
+
+	// The host picked the reserved zai record; the policy must still send the
+	// request to the bigmodel trust record first.
+	candidates, err := buildCredentialPool(context.Background(), fixture.store, "auth-zai-0817", "GLM-5.3-Flash", normalizeConfig(Config{}), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := poolOrder(candidates)
+	if len(order) != 2 || order[0] != "auth-bm-trust" || order[1] != "auth-zai-0817" {
+		t.Fatalf("order = %v, want the bigmodel trust record first even with the host pick and 900 units on the zai reserved one", order)
+	}
+	// And the records the pool scheduled really are the two sites' records: the
+	// snapshots must say so through their plans, since the pool never reads site
+	// as a scheduling input.
+	if candidates[0].Snapshot.PlanIDs[0] != "zcode-v3-start-plan-trust-1004" || candidates[1].Snapshot.PlanIDs[0] != "zcode-v3-start-plan-0817" {
+		t.Fatalf("plans = %v, %v", candidates[0].Snapshot.PlanIDs, candidates[1].Snapshot.PlanIDs)
+	}
+}
+
 // Acceptance criterion 7: the order is reproducible and does not depend on the
 // store's enumeration order.
 func TestPoolOrderIsStableAcrossEnumerationOrder(t *testing.T) {

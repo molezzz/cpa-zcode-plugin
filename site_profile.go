@@ -108,6 +108,20 @@ var (
 	}
 )
 
+// siteProfiles lists every site this build can log into, in the order the
+// chooser offers them. It reads the same table the rest of the plugin resolves
+// against, so a site added to the profiles appears in the chooser without a
+// second list to keep in step.
+func siteProfiles() []siteProfile {
+	profiles := make([]siteProfile, 0, len(knownSites))
+	for _, site := range knownSites {
+		if profile, ok := siteProfileFor(site); ok {
+			profiles = append(profiles, profile)
+		}
+	}
+	return profiles
+}
+
 // siteProfileFor resolves one site identifier to its profile. ok is false for
 // anything not in the known set, and the callers that must not guess check it.
 //
@@ -210,14 +224,13 @@ func parsePollAccessToken(body []byte, profile siteProfile) string {
 // requests does not churn the host auth file.
 func pinCredentialSite(doc []byte, site string) ([]byte, error) {
 	site = strings.TrimSpace(site)
-	stored := rawCredentialSite(doc)
-	// Nothing recorded and nothing to record: the document has no site and the
-	// caller had none to carry, so there is no migration to perform. A document
-	// whose site is absent but whose caller resolved one is the legacy case this
-	// exists for, and it is deliberately not this branch.
-	if site == "" && stored == "" {
+	// Nothing to pin: a caller that resolved no site has no site to record, and
+	// writing one would clear a site an earlier write already fixed — a stale or
+	// partial read must never erase the pin, so an empty value is always a no-op.
+	if site == "" {
 		return doc, nil
 	}
+	stored := rawCredentialSite(doc)
 	if stored == site {
 		return doc, nil
 	}

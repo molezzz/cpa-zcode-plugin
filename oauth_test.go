@@ -249,6 +249,25 @@ func (f *upstreamFixture) startLogin(t *testing.T) pluginapi.AuthLoginStartRespo
 	return response
 }
 
+// chooseSite completes the chooser step a host-driven login now starts with, so
+// a test that polls afterwards exercises the same path an operator does: start,
+// pick a site, then poll. Tests about the session itself want the session, not
+// the chooser page, so they go through here rather than through the raw handle.
+func chooseSite(t *testing.T, state, site string) pluginapi.AuthLoginStartResponse {
+	t.Helper()
+	if strings.TrimSpace(site) == "" {
+		site = siteZai
+	}
+	page := serveManagementHTTP(http.MethodGet, loginChooserPath, map[string][]string{
+		"state": {state},
+		"site":  {site},
+	}, nil)
+	if page.StatusCode != http.StatusFound {
+		t.Fatalf("chooser status = %d, want a redirect to the chosen site", page.StatusCode)
+	}
+	return pluginapi.AuthLoginStartResponse{Provider: pluginID, URL: page.Headers.Get("Location"), State: state}
+}
+
 // pollLogin drives one auth.login.poll call for a state handle.
 func pollLogin(t *testing.T, state string) pluginabi.Envelope {
 	t.Helper()
@@ -292,63 +311,112 @@ func TestAuthIdentifierReturnsPluginID(t *testing.T) {
 	}
 }
 
-func TestAuthLoginStartReturnsBrowserLinkAndPollableState(t *testing.T) {
+// A host-driven login starts at the plugin's own chooser, not at an upstream
+// authorization page: the host's start request carries no site, so returning an
+// authorize URL would make the configured default the only site an operator can
+// reach from the entry they actually add accounts through.
+func TestAuthLoginStartReturnsTheChooserAndPollableState(t *testing.T) {
 	fixture := newUpstreamFixture(t)
 	response := fixture.startLogin(t)
 
 	if response.Provider != pluginID {
 		t.Fatalf("provider = %q", response.Provider)
 	}
-	if response.URL == "" || !strings.HasPrefix(response.URL, "https://zcode.z.ai/authorize") {
-		t.Fatalf("authorize URL missing: %q", response.URL)
+	if !strings.HasPrefix(response.URL, loginChooserPath+"?state=") {
+		t.Fatalf("start URL = %q, want the chooser page", response.URL)
 	}
 	if !hexTokenPattern.MatchString(response.State) {
 		t.Fatalf("state is not an unguessable handle: %q", response.State)
 	}
+	// The token in the URL and the token the host polls with must be the same
+	// one: that identity is what lets the host poll straight through the choice
+	// without a second handshake.
+	if !strings.Contains(response.URL, "state="+response.State) {
+		t.Fatalf("chooser URL %q does not carry the polled state %q", response.URL, response.State)
+	}
 	if response.ExpiresAt.IsZero() || !response.ExpiresAt.After(time.Now()) {
 		t.Fatalf("expires_at must be in the future: %v", response.ExpiresAt)
 	}
-	if got := time.Until(response.ExpiresAt); got > time.Duration(defaultConfig().OAuth.SessionTTLSeconds)*time.Second+5*time.Second {
-		t.Fatalf("session TTL too long: %v", got)
+	// The chooser's own window bounds the wait, and nothing has been authorized
+	// yet — so it must not be advertised as the longer session TTL.
+	if got := time.Until(response.ExpiresAt); got > pendingLoginChoiceTTL+5*time.Second {
+		t.Fatalf("chooser deadline too long: %v", got)
+	}
+	// Nothing is authorized until a site is chosen: a start that has only opened
+	// the chooser must not have called the upstream at all.
+	if len(fixture.initBodies) != 0 {
+		t.Fatalf("start opened an upstream authorization before any site was chosen: %v", fixture.initBodies)
+	}
+	if activeSessions.lookup(response.State) != nil {
+		t.Fatal("no authorization session may exist before a site is chosen")
+	}
+}
+
+// Choosing a site is what opens the login: the upstream init call happens there,
+// at the site the operator picked, and only then does a pollable session exist
+// under the handle the host was already given.
+func TestChoosingASiteOpensTheAuthorizationSession(t *testing.T) {
+	fixture := newUpstreamFixture(t)
+	start := fixture.startLogin(t)
+
+	chosen := chooseSite(t, start.State, siteBigmodel)
+
+	if !strings.HasPrefix(chosen.URL, "https://zcode.z.ai/authorize") {
+		t.Fatalf("redirect target = %q, want the chosen site's authorize URL", chosen.URL)
+	}
+	if len(fixture.initBodies) != 1 || !strings.Contains(fixture.initBodies[0], `"provider":"bigmodel"`) {
+		t.Fatalf("init bodies = %v, want one selecting bigmodel", fixture.initBodies)
 	}
 	if len(fixture.initAuth) != 1 || !strings.HasPrefix(fixture.initAuth[0], "Bearer ") {
 		t.Fatalf("init call must authenticate with the polling secret: %v", fixture.initAuth)
 	}
-	if !strings.Contains(fixture.initBodies[0], `"provider":"zai"`) {
-		t.Fatalf("init body missing provider selector: %q", fixture.initBodies[0])
+	session := activeSessions.lookup(start.State)
+	if session == nil {
+		t.Fatal("the session must adopt the handle the host is already polling")
 	}
 	// The session handle must never equal the polling secret material.
-	secret := strings.TrimPrefix(fixture.initAuth[0], "Bearer ")
-	if response.State == secret {
+	if secret := strings.TrimPrefix(fixture.initAuth[0], "Bearer "); start.State == secret {
 		t.Fatal("state must be independent of the polling secret")
-	}
-	if activeSessions.lookup(response.State) == nil {
-		t.Fatal("session must be registered for polling")
 	}
 }
 
-func TestAuthLoginStartUpstreamFailureIsRedactedAndLeavesNoSession(t *testing.T) {
+// An upstream that rejects the init call fails the choice, not the start: the
+// operator is still on the chooser's page, so the site must be retryable and the
+// failure must leave no session behind for the host to poll.
+func TestChoosingASiteRedactsUpstreamFailureAndLeavesNoSession(t *testing.T) {
 	fixture := newUpstreamFixture(t)
 	fixture.mu.Lock()
 	fixture.initStatus = http.StatusServiceUnavailable
 	fixture.mu.Unlock()
 
-	env := callMethod(t, pluginabi.MethodAuthLoginStart, []byte(`{"Provider":"zcode"}`))
-	if env.OK {
-		t.Fatal("start must fail when upstream rejects the init call")
+	start := fixture.startLogin(t)
+	page := serveManagementHTTP(http.MethodGet, loginChooserPath, map[string][]string{
+		"state": {start.State},
+		"site":  {siteZai},
+	}, nil)
+
+	if page.StatusCode != http.StatusOK {
+		t.Fatalf("chooser status = %d, want the page to stay usable for a retry", page.StatusCode)
 	}
-	if env.Error == nil || env.Error.Code != "oauth_upstream_failed" {
-		t.Fatalf("expected oauth_upstream_failed, got %+v", env.Error)
+	body := string(page.Body)
+	assertNoLeak(t, page.Body, fixture.pollAuth...)
+	// The upstream's own status is the plugin's business; the operator gets a
+	// page that says the site could not be reached and can choose again.
+	if strings.Contains(body, "http 503") {
+		t.Errorf("the chooser leaked the upstream failure detail:\n%s", body)
 	}
-	if !strings.Contains(env.Error.Message, "http 503") {
-		t.Fatalf("error should carry the upstream status: %q", env.Error.Message)
+	if !strings.Contains(body, "重选") {
+		t.Errorf("the chooser does not offer a retry:\n%s", body)
 	}
-	assertNoLeak(t, []byte(env.Error.Message), fixture.pollAuth...)
+	// The token was refunded, so the same login can still be completed.
+	if _, ok := pendingLoginChoices.peek(start.State); !ok {
+		t.Error("a failed site choice must leave the login retryable")
+	}
 	activeSessions.mu.Lock()
 	remaining := len(activeSessions.sessions)
 	activeSessions.mu.Unlock()
 	if remaining != 0 {
-		t.Fatalf("failed start must not create sessions, found %d", remaining)
+		t.Fatalf("a failed choice must not create sessions, found %d", remaining)
 	}
 }
 
@@ -368,6 +436,7 @@ func TestAuthLoginPollWaitsWhileUpstreamPending(t *testing.T) {
 	}
 	fixture.queuePoll(http.StatusOK, string(body))
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	env := pollLogin(t, start.State)
 	if !env.OK {
@@ -401,6 +470,7 @@ func TestAuthLoginPollSuccessStoresJWTPreservingExistingAccount(t *testing.T) {
 
 	fixture.queuePollReady(token)
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	env := pollLogin(t, start.State)
 	if !env.OK {
@@ -411,7 +481,10 @@ func TestAuthLoginPollSuccessStoresJWTPreservingExistingAccount(t *testing.T) {
 		t.Fatalf("status = %q (%s), want success", response.Status, response.Message)
 	}
 	auth := response.Auth
-	if auth.Provider != pluginID || auth.ID != "zcode-user-42" {
+	// The record ID is the auth file name: the host's auth.save upserts by a
+	// path-derived key, so an identity-keyed record gets duplicated by the
+	// first write-back after login. The identity stays in the document.
+	if auth.Provider != pluginID || auth.ID != auth.FileName {
 		t.Fatalf("auth identity mismatch: %+v", auth)
 	}
 	if auth.FileName == "" || !strings.HasSuffix(auth.FileName, ".json") {
@@ -452,7 +525,7 @@ func TestAuthLoginPollSuccessStoresJWTPreservingExistingAccount(t *testing.T) {
 		t.Fatalf("second poll failed: %+v", env2.Error)
 	}
 	response2 := decodePoll(t, env2)
-	if response2.Status != pluginapi.AuthLoginStatusSuccess || response2.Auth.ID != "zcode-user-42" {
+	if response2.Status != pluginapi.AuthLoginStatusSuccess || response2.Auth.ID != response.Auth.ID {
 		t.Fatalf("second poll must be idempotent: %+v", response2)
 	}
 	if len(fixture.pollFlowIDs) != pollsSoFar {
@@ -471,6 +544,7 @@ func TestAuthLoginPollSuccessStoresManagedAPIKeyFallback(t *testing.T) {
 
 	fixture.queuePollReady(token)
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	env := pollLogin(t, start.State)
 	if !env.OK {
@@ -518,6 +592,7 @@ func TestAuthLoginReLoginReusesManagedKeyWithoutNameSearch(t *testing.T) {
 
 	fixture.queuePollReady(token)
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	env := pollLogin(t, start.State)
 	if !env.OK {
@@ -578,6 +653,7 @@ func TestAuthLoginPollReadyFinalizesExactlyOnce(t *testing.T) {
 	defer releaseCreate()
 
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	first := make(chan pluginabi.Envelope, 1)
 	go func() {
@@ -649,6 +725,7 @@ func TestAuthLoginPollSuccessSurvivesManagedKeyExchangeFailure(t *testing.T) {
 
 	fixture.queuePollReady(token)
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	env := pollLogin(t, start.State)
 	if !env.OK {
@@ -687,6 +764,7 @@ func TestAuthLoginPollRejectsReadyWithoutCredential(t *testing.T) {
 	fixture := newUpstreamFixture(t)
 	fixture.queuePoll(http.StatusOK, `{"data":{"status":"ready"}}`)
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	env := pollLogin(t, start.State)
 	if !env.OK {
@@ -706,6 +784,7 @@ func TestAuthLoginPollReportsUpstreamRejection(t *testing.T) {
 	fixture := newUpstreamFixture(t)
 	fixture.queuePoll(http.StatusOK, `{"data":{"status":"failed"}}`)
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	env := pollLogin(t, start.State)
 	response := decodePoll(t, env)
@@ -723,6 +802,7 @@ func TestAuthLoginPollStaysPendingOnTransientUpstreamErrors(t *testing.T) {
 	fixture.queuePoll(http.StatusInternalServerError, `{"error":"boom"}`)
 	fixture.queuePoll(http.StatusForbidden, `{"error":"no"}`)
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	for i := 0; i < 2; i++ {
 		env := pollLogin(t, start.State)
@@ -744,6 +824,7 @@ func TestAuthLoginPollReportsExpiredInsteadOfBogusSuccessOnRace(t *testing.T) {
 	token := makeJWT(t, map[string]any{"sub": "race-user"})
 	fixture.queuePollReady(token)
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	// Simulate a concurrent poll whose lazy expiry flips the session to
 	// expired while this poll was reading the upstream ready reply. The
@@ -776,6 +857,7 @@ func TestAuthLoginPollReportsExpiredInsteadOfBogusSuccessOnRace(t *testing.T) {
 func TestAuthLoginPollExpiredSessionNeverTouchesUpstream(t *testing.T) {
 	fixture := newUpstreamFixture(t)
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	// Age the clock past the session TTL.
 	base := activeSessions.now()
@@ -822,6 +904,7 @@ func TestAuthLoginPollRequiresState(t *testing.T) {
 func TestShutdownClearsAuthorizationSessions(t *testing.T) {
 	fixture := newUpstreamFixture(t)
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 	if activeSessions.lookup(start.State) == nil {
 		t.Fatal("precondition: session exists")
 	}
@@ -877,6 +960,7 @@ func TestAuthLoginPollRefusesCredentialWithoutStableIdentity(t *testing.T) {
 	// every re-login and duplicate the host account.
 	fixture.queuePollReady(makeJWT(t, map[string]any{"exp": 1234567890}))
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 
 	env := pollLogin(t, start.State)
 	if !env.OK {
@@ -953,7 +1037,10 @@ func TestAuthParseClaimsZcodeDocumentsOnly(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &parsed); err != nil {
 		t.Fatal(err)
 	}
-	if !parsed.Handled || parsed.Auth.Provider != pluginID || parsed.Auth.ID != "zcode-user-7" {
+	// The record ID is the file the host named for the document — the same key
+	// the host's auth.save derives from the path — so a login result and a
+	// write-back address one record, not two.
+	if !parsed.Handled || parsed.Auth.Provider != pluginID || parsed.Auth.ID != "zcode-x.json" || parsed.Auth.FileName != "zcode-x.json" {
 		t.Fatalf("zcode document not claimed: %+v", parsed)
 	}
 	if string(parsed.Auth.StorageJSON) != doc {
@@ -988,7 +1075,10 @@ func TestAuthParseClaimsZcodeDocumentsOnly(t *testing.T) {
 func TestAuthRefreshEchoesStoredCredential(t *testing.T) {
 	storage := []byte(`{"zcode":{"identity_id":"zcode-user-1","jwt":{"token":"t"}}}`)
 	request, err := json.Marshal(map[string]any{
-		"AuthID":       "zcode-user-1",
+		// The host addresses the record by its primary key, which for this
+		// plugin's records is the auth file name; the echo must keep both the
+		// key and that file.
+		"AuthID":       "zcode-abc12345.json",
 		"AuthProvider": pluginID,
 		"StorageJSON":  storage,
 		"Metadata":     map[string]any{"type": pluginID},
@@ -1004,11 +1094,69 @@ func TestAuthRefreshEchoesStoredCredential(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatal(err)
 	}
-	if response.Auth.Provider != pluginID || response.Auth.ID != "zcode-user-1" {
+	if response.Auth.Provider != pluginID || response.Auth.ID != "zcode-abc12345.json" {
 		t.Fatalf("refresh must echo the record: %+v", response.Auth)
+	}
+	if response.Auth.FileName != "zcode-abc12345.json" {
+		t.Fatalf("refresh must keep the record's own file, got %q", response.Auth.FileName)
 	}
 	if string(response.Auth.StorageJSON) != string(storage) {
 		t.Fatal("refresh must not alter the stored credential")
+	}
+}
+
+// A record created before the record id became the file name is still keyed by
+// its identity id. Refresh must not re-key it to the derived file name, or the
+// host's update would miss the record it addressed and the plugin would mint a
+// second physical file for the same account.
+func TestAuthRefreshKeepsLegacyIdentityKeyedRecord(t *testing.T) {
+	storage := []byte(`{"zcode":{"identity_id":"zcode-legacy","jwt":{"token":"t"}}}`)
+	request, err := json.Marshal(map[string]any{
+		"AuthID":       "zcode-legacy",
+		"AuthProvider": pluginID,
+		"StorageJSON":  storage,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := callMethod(t, pluginabi.MethodAuthRefresh, request)
+	if !env.OK {
+		t.Fatalf("auth.refresh failed: %+v", env.Error)
+	}
+	var response pluginapi.AuthRefreshResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Auth.ID != "zcode-legacy" {
+		t.Fatalf("legacy record re-keyed: %+v", response.Auth)
+	}
+	if response.Auth.FileName != authFileNameFor("zcode-legacy") {
+		t.Fatalf("legacy record file = %q, want the derived name", response.Auth.FileName)
+	}
+}
+
+// The host's auth.save upserts by a path-derived id and registers a second
+// runtime record when no record answers to that key. The login result, the
+// parse claim, and the refresh echo must therefore all present the same key
+// the file implies — this test pins the login side of that contract.
+func TestLoginRecordIDMatchesAuthFileName(t *testing.T) {
+	fixture := newUpstreamFixture(t)
+	fixture.queuePollReady(makeJWT(t, map[string]any{"sub": "keyed"}))
+	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
+	env := pollLogin(t, start.State)
+	if !env.OK {
+		t.Fatalf("poll failed: %+v", env.Error)
+	}
+	auth := decodePoll(t, env).Auth
+	if auth.ID == "" {
+		t.Fatal("login result carries no record id")
+	}
+	if auth.ID != auth.FileName {
+		t.Fatalf("record id %q and file name %q disagree; auth.save would duplicate this record", auth.ID, auth.FileName)
+	}
+	if !strings.HasSuffix(auth.ID, ".json") {
+		t.Fatalf("record id %q is not a file name", auth.ID)
 	}
 }
 
@@ -1018,6 +1166,7 @@ func TestAuthLoginFlowNeverLeaksSecretsIntoResponses(t *testing.T) {
 	fixture.queuePollReady(token)
 
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 	secret := strings.TrimPrefix(fixture.initAuth[0], "Bearer ")
 	env := pollLogin(t, start.State)
 	if !env.OK {

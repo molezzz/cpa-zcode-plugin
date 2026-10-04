@@ -237,6 +237,10 @@ func runShutdown() {
 		// Authorization sessions hold OAuth secrets and must never outlive
 		// the plugin.
 		activeSessions.shutdownAll()
+		// Unchosen host-driven logins hold a one-time token and nothing else, but
+		// their expiry timers are the same hazard: one firing after the library
+		// unloads would jump into unmapped code.
+		pendingLoginChoices.drain()
 		// Management-initiated authorization loops poll the upstream and save
 		// through the host; cancel them before the library can unload.
 		managementOAuth.stopAll()

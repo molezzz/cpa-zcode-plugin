@@ -159,9 +159,19 @@ type authLoginStartRPC struct {
 	Metadata map[string]any
 }
 
-// handleAuthLoginStart creates one authorization session and returns the
-// browser authorization link plus the opaque polling handle. The polling
-// secret stays inside the session.
+// handleAuthLoginStart opens one host-driven login at the site the operator
+// chooses.
+//
+// The host's request carries a provider and nothing else, so there is no site
+// in it to honor: the response is therefore the plugin's own chooser, and the
+// operator picks a site there. Returning an authorization URL directly — which
+// is what this did while the two sites were still one — makes the configured
+// default the only site reachable from the host's add-account entry, which is
+// the one entry a user adding their second account actually goes through.
+//
+// The State handed back is the chooser token, which is also the id the session
+// adopts once a site is chosen. That is what lets the host poll auth.login.poll
+// with it straight through the choice.
 func handleAuthLoginStart(request []byte) ([]byte, error) {
 	var req authLoginStartRPC
 	if len(request) > 0 {
@@ -172,27 +182,26 @@ func handleAuthLoginStart(request []byte) ([]byte, error) {
 	if strings.TrimSpace(req.Provider) != "" && req.Provider != pluginID {
 		return errorEnvelope("unknown_provider", "auth.login.start does not handle provider "+req.Provider, http.StatusBadRequest), nil
 	}
-	// The host's native entry carries no site, so the configured default decides.
-	// An unrecognized configured site stops the login here rather than silently
-	// authorizing at the other one.
-	site, err := currentConfig().OAuth.SiteOrDefault()
+	token, expires, err := startLoginChooser()
 	if err != nil {
-		return errorEnvelope("invalid_config", err.Error(), http.StatusInternalServerError), nil
-	}
-
-	session, err := startAuthorizationSession(currentConfig(), site)
-	if err != nil {
-		if errors.Is(err, errOAuthUpstream) {
-			return errorEnvelope("oauth_upstream_failed", err.Error(), http.StatusBadGateway), nil
-		}
 		return errorEnvelope("plugin_error", "could not create authorization session", http.StatusInternalServerError), nil
 	}
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
-		Provider:  pluginID,
-		URL:       session.authorizeURL,
-		State:     session.id,
-		ExpiresAt: session.expiresAt,
+		Provider: pluginID,
+		URL:      loginChooserURL(token),
+		State:    token,
+		// The deadline is the chooser's, not a session's: no authorization has
+		// started yet, so the session TTL does not describe this window.
+		ExpiresAt: expires,
 	})
+}
+
+// loginChooserURL is the chooser page for one unchosen login. It is a relative
+// path with the token in the query, so it resolves against whatever address the
+// operator reached CPA on rather than against an assumption about the
+// deployment's host or scheme.
+func loginChooserURL(token string) string {
+	return loginChooserPath + "?state=" + url.QueryEscape(token)
 }
 
 // errOAuthUpstream marks a session-start failure that originated at the
@@ -215,6 +224,20 @@ var errUnknownSite = errors.New("unknown ZCode site")
 // selected, and the ready payload's access token has to be read against the same
 // site, so a session may not re-read a configured default halfway through.
 func startAuthorizationSession(cfg Config, site string) (*authSession, error) {
+	return startAuthorizationSessionWithID(cfg, site, "")
+}
+
+// startAuthorizationSessionWithID is startAuthorizationSession for a caller that
+// already minted the session's handle.
+//
+// The host-driven login path needs this: the host is handed a login State at
+// auth.login.start and polls auth.login.poll with it, but it only learns which
+// site it is authorizing at afterwards — the operator picks one in the chooser
+// in between. Minting the handle up front and letting the session adopt it is
+// what lets the host poll straight through the chooser without a second
+// handshake. An empty sessionID means "mint one", which is what the management
+// page's own entries do.
+func startAuthorizationSessionWithID(cfg Config, site, sessionID string) (*authSession, error) {
 	profile, ok := siteProfileFor(site)
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", errUnknownSite, strings.TrimSpace(site))
@@ -233,7 +256,7 @@ func startAuthorizationSession(cfg Config, site string) (*authSession, error) {
 		}
 		return nil, err
 	}
-	session, err := activeSessions.create(flowID, authorizeURL, pollSecret, client, time.Duration(cfg.OAuth.SessionTTLSeconds)*time.Second, profile.Site)
+	session, err := activeSessions.createWithID(sessionID, flowID, authorizeURL, pollSecret, client, time.Duration(cfg.OAuth.SessionTTLSeconds)*time.Second, profile.Site)
 	if err != nil {
 		client.CloseIdleConnections()
 		return nil, errors.New("could not create authorization session")
@@ -263,6 +286,14 @@ func handleAuthLoginPoll(request []byte) ([]byte, error) {
 	}
 	session := activeSessions.lookup(state)
 	if session == nil {
+		// The host starts polling the moment it is handed the chooser URL, which
+		// is before the operator has picked a site — and until they do there is no
+		// upstream flow to poll. That wait is a login in progress, not a failure:
+		// reporting it as one makes the host tear down a login the operator is
+		// still completing in their browser.
+		if _, unchosen := pendingLoginChoices.peek(state); unchosen {
+			return pollResponse(pluginapi.AuthLoginStatusPending, "waiting for a login site to be chosen", nil), nil
+		}
 		return pollResponse(pluginapi.AuthLoginStatusError, "authorization session expired or unknown", nil), nil
 	}
 
@@ -712,15 +743,24 @@ func buildZcodeStorage(previousDoc []byte, identityID, token, accessToken, site 
 // authDataFromStorage renders the pluginapi.AuthData the host persists on
 // successful login. StorageJSON carries the plugin-owned namespace document.
 //
+// The record's ID is the auth file name, not the identity id. The host's
+// auth.save upserts by a path-derived id — the file name under the auth dir —
+// and registers a second runtime record when no record answers to that key, so
+// an identity-keyed record here would be silently duplicated by the first
+// write-back (a quota refresh or state conclusion) after this login. Keeping
+// ID and FileName the same value makes the file the primary key end to end: a
+// re-login overwrites its own file, a write-back upserts its own record.
+//
 // The label names the site the account was authorized against, read back from
 // the document rather than remembered: the storage is what the host persists and
 // what a later parse or refresh re-reads, so a label assembled from anything else
 // would drift from the credential it names.
 func authDataFromStorage(identityID string, storage []byte) pluginapi.AuthData {
+	fileName := authFileNameFor(identityID)
 	return pluginapi.AuthData{
 		Provider:    pluginID,
-		ID:          identityID,
-		FileName:    authFileNameFor(identityID),
+		ID:          fileName,
+		FileName:    fileName,
 		Label:       authLabelFor(readCredentialSite(storage)),
 		StorageJSON: storage,
 	}
@@ -737,6 +777,11 @@ type authParseRPC struct {
 // handleAuthParse claims host auth documents that belong to this plugin and
 // reconstructs the schedulable auth record from the zcode namespace. Foreign
 // documents are left unhandled so other providers can claim them.
+//
+// The record's ID is the file the document lives in — the host's auth.save
+// derives its upsert key from the path and would otherwise register a second
+// runtime record for a document it already holds. When the host names no file
+// the identity-derived name is the same fallback auth.save itself resolves to.
 func handleAuthParse(request []byte) ([]byte, error) {
 	var req authParseRPC
 	if len(request) > 0 {
@@ -759,7 +804,7 @@ func handleAuthParse(request []byte) ([]byte, error) {
 		Handled: true,
 		Auth: pluginapi.AuthData{
 			Provider:    pluginID,
-			ID:          identityID,
+			ID:          fileName,
 			FileName:    fileName,
 			Label:       authLabelFor(readCredentialSite(req.RawJSON)),
 			StorageJSON: req.RawJSON,
@@ -802,6 +847,12 @@ type authRefreshRPC struct {
 // handleAuthRefresh echoes the stored credential back unchanged. The Coding
 // Plan JWT has no observed refresh flow, so refresh keeps the record valid
 // instead of failing the host's refresh cycle.
+//
+// The host's AuthID is the record's primary key — for this plugin's records,
+// the auth file name. Echoing it verbatim and re-deriving FileName from it
+// keeps the record's ID, its file, and the host's upsert key one and the same;
+// swapping in the identity-derived name here would point the next save at a
+// second physical file.
 func handleAuthRefresh(request []byte) ([]byte, error) {
 	var req authRefreshRPC
 	if len(request) > 0 {
@@ -814,10 +865,6 @@ func handleAuthRefresh(request []byte) ([]byte, error) {
 		provider = pluginID
 	}
 	identityID := strings.TrimSpace(req.AuthID)
-	fileName := ""
-	if identityID != "" {
-		fileName = authFileNameFor(identityID)
-	}
 	data := pluginapi.AuthData{
 		Provider:    provider,
 		ID:          identityID,
@@ -826,6 +873,13 @@ func handleAuthRefresh(request []byte) ([]byte, error) {
 		Attributes:  req.Attributes,
 	}
 	if identityID != "" {
+		fileName := identityID
+		if !strings.HasSuffix(fileName, ".json") {
+			// A pre-#26 record still keyed by identity id: its file name is
+			// derived, and the echo keeps both keys so the host's update lands
+			// on the record it addressed and the file it already has.
+			fileName = authFileNameFor(identityID)
+		}
 		data.FileName = fileName
 		data.Label = authLabelFor(readCredentialSite(req.StorageJSON))
 	}

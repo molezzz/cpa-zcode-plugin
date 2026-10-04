@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -34,9 +33,9 @@ func TestNativeLoginUsesConfiguredDefaultSite(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.site, func(t *testing.T) {
 			fixture := newUpstreamFixture(t)
-			withOAuthConfig(t, func(cfg *Config) { cfg.OAuth.DefaultSite = tc.site })
 
-			fixture.startLogin(t)
+			start := fixture.startLogin(t)
+			chooseSite(t, start.State, tc.site)
 
 			if len(fixture.initBodies) != 1 {
 				t.Fatalf("init calls = %d, want one", len(fixture.initBodies))
@@ -48,20 +47,31 @@ func TestNativeLoginUsesConfiguredDefaultSite(t *testing.T) {
 	}
 }
 
-// A site this build does not know must stop the login at the native entry, not
-// fall back to the first one. Falling back would send the operator to the wrong
-// site's login page, and the only symptom would be an account they did not mean
-// to authorize.
-func TestNativeLoginRefusesUnknownConfiguredSite(t *testing.T) {
-	newUpstreamFixture(t)
-	withOAuthConfig(t, func(cfg *Config) { cfg.OAuth.DefaultSite = "big-model" })
-
-	env := callMethod(t, pluginabi.MethodAuthLoginStart, []byte(`{"Provider":"zcode"}`))
-	if env.OK {
-		t.Fatal("a login started with an unknown default site")
+// The chooser is what makes the site a choice, so the configured default must not
+// decide it: an operator whose config names one site and who picks the other
+// gets the site they picked. This is the property the host's add-account entry
+// could not have before — its request carries no site at all.
+func TestChosenSiteOverridesTheConfiguredDefault(t *testing.T) {
+	cases := []struct {
+		defaultSite string
+		chosen      string
+		wantBody    string
+	}{
+		{defaultSite: siteZai, chosen: siteBigmodel, wantBody: `"provider":"bigmodel"`},
+		{defaultSite: siteBigmodel, chosen: siteZai, wantBody: `"provider":"zai"`},
 	}
-	if env.Error == nil || env.Error.Code != "invalid_config" {
-		t.Errorf("error = %+v, want it to name the invalid configuration", env.Error)
+	for _, tc := range cases {
+		t.Run(tc.chosen+"_over_"+tc.defaultSite, func(t *testing.T) {
+			fixture := newUpstreamFixture(t)
+			withOAuthConfig(t, func(cfg *Config) { cfg.OAuth.DefaultSite = tc.defaultSite })
+
+			start := fixture.startLogin(t)
+			chooseSite(t, start.State, tc.chosen)
+
+			if len(fixture.initBodies) != 1 || !strings.Contains(fixture.initBodies[0], tc.wantBody) {
+				t.Fatalf("init bodies = %v, want the chosen site %q", fixture.initBodies, tc.chosen)
+			}
+		})
 	}
 }
 
@@ -86,6 +96,7 @@ func TestLoginKeepsItsOwnSitesAccessToken(t *testing.T) {
 			fixture.queuePollReady(token)
 
 			start := fixture.startLogin(t)
+			chooseSite(t, start.State, tc.site)
 			env := pollLogin(t, start.State)
 			if !env.OK {
 				t.Fatalf("poll failed: %+v", env.Error)
@@ -123,6 +134,7 @@ func TestLoginRecordsItsSiteOnTheDocument(t *testing.T) {
 			fixture.queuePollReady(makeJWT(t, map[string]any{"sub": "user-" + tc.site}))
 
 			start := fixture.startLogin(t)
+			chooseSite(t, start.State, tc.site)
 			env := pollLogin(t, start.State)
 			if !env.OK {
 				t.Fatalf("poll failed: %+v", env.Error)
@@ -155,6 +167,7 @@ func TestManagedKeyExchangeRunsAgainstTheLoggedInSitesOrigin(t *testing.T) {
 	fixture.queuePollReady(makeJWT(t, map[string]any{"sub": "user-bm"}))
 
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteBigmodel)
 	env := pollLogin(t, start.State)
 	if !env.OK {
 		t.Fatalf("poll failed: %+v", env.Error)
@@ -198,6 +211,7 @@ func TestDomesticLoginDoesNotSpendASecondExchange(t *testing.T) {
 	fixture.queuePollReady(makeJWT(t, map[string]any{"sub": "user-bm"}))
 
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteBigmodel)
 	env := pollLogin(t, start.State)
 	if !env.OK {
 		t.Fatalf("poll failed: %+v", env.Error)
@@ -219,6 +233,7 @@ func TestInternationalLoginStillExchanges(t *testing.T) {
 	fixture.queuePollReady(makeJWT(t, map[string]any{"sub": "user-zai"}))
 
 	start := fixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 	env := pollLogin(t, start.State)
 	if !env.OK {
 		t.Fatalf("poll failed: %+v", env.Error)
@@ -285,6 +300,7 @@ func TestTwoSitesCoexistAsSeparateCredentials(t *testing.T) {
 	withOAuthConfig(t, func(cfg *Config) { cfg.OAuth.DefaultSite = siteZai })
 	zaiFixture.queuePollReady(makeJWT(t, map[string]any{"sub": "intl-user"}))
 	start := zaiFixture.startLogin(t)
+	chooseSite(t, start.State, siteZai)
 	env := pollLogin(t, start.State)
 	if !env.OK {
 		t.Fatalf("zai poll failed: %+v", env.Error)
@@ -292,9 +308,9 @@ func TestTwoSitesCoexistAsSeparateCredentials(t *testing.T) {
 	zaiAuth := decodePoll(t, env).Auth
 
 	bmFixture := newUpstreamFixture(t)
-	withOAuthConfig(t, func(cfg *Config) { cfg.OAuth.DefaultSite = siteBigmodel })
 	bmFixture.queuePollReady(makeJWT(t, map[string]any{"sub": "12345678901234567"}))
 	start = bmFixture.startLogin(t)
+	chooseSite(t, start.State, siteBigmodel)
 	env = pollLogin(t, start.State)
 	if !env.OK {
 		t.Fatalf("bigmodel poll failed: %+v", env.Error)
@@ -307,17 +323,21 @@ func TestTwoSitesCoexistAsSeparateCredentials(t *testing.T) {
 	if zaiAuth.FileName == bmAuth.FileName {
 		t.Errorf("both logins landed in %q; a second site must not overwrite the first account's file", zaiAuth.FileName)
 	}
-	// The domestic account's numeric subject and the international account's are
-	// both preserved verbatim as identities: neither is hashed away, because the
-	// upstream's own account id is the only stable handle for it.
-	if got := recordedSiteOf(t, zaiAuth.StorageJSON); got != siteZai {
-		t.Errorf("international record site = %q, want %q", got, siteZai)
+	// The record ID is the auth file name — the host's auth.save derives its
+	// upsert key from the file path, so an identity-keyed record is duplicated
+	// by the first write-back. The upstream's numeric account id stays in the
+	// document itself.
+	if zaiAuth.ID != zaiAuth.FileName {
+		t.Errorf("zai record id = %q, file %q; the record id must be the auth file name", zaiAuth.ID, zaiAuth.FileName)
+	}
+	if bmAuth.ID != bmAuth.FileName {
+		t.Errorf("domestic record id = %q, file %q; the record id must be the auth file name", bmAuth.ID, bmAuth.FileName)
 	}
 	if got := recordedSiteOf(t, bmAuth.StorageJSON); got != siteBigmodel {
 		t.Errorf("domestic record site = %q, want %q", got, siteBigmodel)
 	}
-	if !strings.HasPrefix(bmAuth.ID, "zcode-12345678901234567") {
-		t.Errorf("domestic identity = %q, want the upstream's numeric account id preserved", bmAuth.ID)
+	if id, ok := readStoredIdentity(bmAuth.StorageJSON); !ok || !strings.Contains(id, "12345678901234567") {
+		t.Errorf("domestic identity_id lost the upstream's numeric account id: %q, ok=%v", id, ok)
 	}
 }
 

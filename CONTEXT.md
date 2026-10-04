@@ -31,9 +31,11 @@ CPA/CLIProxyAPI 与 Provider 插件之间的稳定 ABI 和回调契约。插件�
 站点选择有两种入口，语义不同：
 
 - **管理页**在页头提供两个登录按钮（"国际站 z.ai 登录" / "国内站 bigmodel 登录"，动作 `oauth_login`），并为每张账号卡片提供**本站**的"重新授权"。管理页的 `oauth_retry` **必须显式携带 `site`**：重新授权若自己挑一个站，可能把一张国内站凭证换成国际站登录，而账号看上去一切正常，直到每个请求都失败。
-- **宿主原生** `auth.login.start` 不携带站点，因此按配置项 `oauth.default_site`（未配置即 `zai`，即该选项出现前唯一存在过的登录源）。非法值**拒绝登录**并报 `invalid_config`，不回落——否则配置里一个拼写错误会让每次原生登录都静默地去另一站。
+- **宿主原生** `auth.login.start` 同样不带站点，但**它不是"没有选择"，而是把选择交给插件自己的 chooser 页**：start 返回的不是上游授权 URL，而是插件的 `/v0/resource/plugins/zcode/login?state=<一次性 token>`，操作员在页面上点"国际站 ZCode (Z.AI)"或"国内站 ZCode (BigModel)"，插件才按该站点发起 INIT 并 302 到对应授权页（`oauth_chooser.go`）。**这是唯一一处站点由原生入口决定的地方**——用户添加第二个账号走的正是这个入口，让它按配置默认值直连就等于把第二站变成不可达。`oauth.default_site` 因此**降级为 chooser 页上的默认选项**（标注"当前默认"），不再决定登录发往哪一站；配错了也只是默认项不亮，页面会说明并要求手选，而不是把每次原生登录静默送到另一站。chooser 自己的窗口（10 分钟）比会话 TTL 短：token 是"为本次登录选一站"的能力凭证，TTL 管的是人在授权页前的等待，是另一件事。
 
 管理页的站点选择只作用于本次登录，不读也不改配置默认值，因此持有双站账号的操作者永远不依赖默认值。站点值**精确匹配、不做大小写折叠**：它是上游 provider 选择器而非展示名，`BigModel` 不是上游接受的拼写，报错比悄悄去另一站更有用。
+
+chooser 的 token **就是会话自己的 id**，不是另一个句柄：宿主在 `auth.login.start` 拿到 login State 并用同一个值轮询 `auth.login.poll`，而站点要到 chooser 之后才确定，因此 token 必须先于站点存在、由选站后的会话认领（`startAuthorizationSessionWithID`）——否则宿主要么得学第二个 State，要么得在选站前就 poll 一个不存在的会话。token 未被选择时不可消费、不能凭空打开会话；**消费失败（上游不可达）要退还**，让同一页可以重选，而不是让操作员重新点一次"添加账号"。已发起的登录再打开同一个 URL 会直接回到授权页，关掉的标签页在等待窗口内不花任何代价。chooser 是 resource 路由（无鉴权），所以它**只渲染站点名与一次性 token，绝不渲染任何账号状态**。
 
 ## 分站存储与迁移
 
@@ -170,7 +172,9 @@ OAuth ready 之后、**写入宿主 auth store 之前**，用候选 JWT 调一�
 
 快照持久化在 `zcode.plan`，只含产品 id、每模型额度与恢复时刻、计划实例的**摘要**。`user_plan_id` 是账号范围的持久标识，管理面与日志都给人看，所以只存域分隔摘要；原始账号 id 同样只存摘要（`zcode.login.user_id_hash`）。这些都不进诊断行。
 
-**已知的现存例外**（#25 复核记录，非本期引入）：`zcode.identity_id` 是 `zcode-<JWT sub>` 的**原文**（国内站即 17 位数值账号 id），它进管理面 `accountView.IdentityID` 与宿主账号 id。它是宿主侧的账号主键，去掉就没法把 auth 文档与宿主账号对上；#25 的 AC4 写的是"原始 user_id 不出现"，字面上与之冲突。**实际记录的只有派生的 identity_id**：`zcode.login.user_id_hash` 存的才是原始 id 的摘要。
+`zcode.identity_id` 是 `zcode-<JWT sub>` 的**原文**（国内站即 17 位数值账号 id）。它只在 auth 文档内部存在：管理面与日志渲染的都是同一个域分隔摘要（`identity_hash` / `identityDiag`，`cpa-zcode-plugin/quota-identity/v1`），原始 id 与派生的 identity_id 都不进管理数据。`zcode.login.user_id_hash` 另存登录时刻原始 id 的摘要（独立域），两者都是摘要、互不混用。
+
+**宿主侧的账号主键是授权文件名，不是 identity_id**（#26）。宿主的 `host.auth.save` 按路径派生 id（auth 目录下的文件名）做 upsert：`GetByID` 落空就 `Register` 出第二条运行时记录——这正是"点一次刷新额度就多一个同样的授权"的根因。因此插件在 `auth.login.poll`（登录结果）、`auth.parse`（文件扫描）与 `auth.refresh`（刷新回显）三处统一以文件名作为记录 ID，与宿主的 upsert 键对齐，登录、写回、刷新寻址的是同一条记录、同一个文件。identity_id 继续作为"同一上游账号"的判据留在文档内部（重登录复用同一文件、去重设备身份、管理页摘要都由它派生）。兼容规则：`auth.refresh` 对仍以 identity_id 为主键的旧记录原样回显该键（不重命名），使宿主的更新落在它寻址的那条记录上；文件名只对无文件名可循的新登录从 identity 派生。
 
 ## Start Plan 凭证池
 

@@ -193,7 +193,7 @@ func TestDiagPlanLinesCarryNoSensitiveIdentifiers(t *testing.T) {
 		time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC))
 
 	diagf("plan_snapshot auth=%s identity=%s readable=%v last_priority=%v plans=[%s] models=[%s]",
-		"auth-x", quotaIdentityDiag(identityIDFor(account)), snapshot.Readable, snapshot.isLastPriority(normalizeConfig(Config{})),
+		"auth-x", identityDiag(identityIDFor(account)), snapshot.Readable, snapshot.isLastPriority(normalizeConfig(Config{})),
 		strings.Join(snapshot.startPlanIDs(), " "), diagModelAllowance(snapshot))
 	diagf("oauth_preflight identity=%s readable=%v verdict=%s plans=[%s] models=[%s]",
 		preflightIdentityDiag(account), snapshot.Readable, "available",

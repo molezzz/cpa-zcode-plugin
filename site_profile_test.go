@@ -205,6 +205,27 @@ func TestPinCredentialSiteRoundTrip(t *testing.T) {
 	}
 }
 
+// A caller that resolved no site has nothing to pin, and writing the empty value
+// would clear a site an earlier write already fixed. The empty call is therefore
+// a no-op even against a pinned document.
+func TestPinCredentialSiteRefusesEmptySite(t *testing.T) {
+	doc := []byte(`{"zcode":{"identity_id":"zcode-1","jwt":{"token":"t"},"site":"bigmodel"}}`)
+	pinned, err := pinCredentialSite(doc, "")
+	if err != nil {
+		t.Fatalf("pinCredentialSite: %v", err)
+	}
+	snap, err := readCredentialSnapshot(pinned)
+	if err != nil {
+		t.Fatalf("readCredentialSnapshot: %v", err)
+	}
+	if snap.Site != siteBigmodel {
+		t.Errorf("site = %q, want the recorded %q to survive an empty pin", snap.Site, siteBigmodel)
+	}
+	if string(pinned) != string(doc) {
+		t.Error("an empty pin rewrote the document")
+	}
+}
+
 // The ready payload carries the site's access token under a key named after the
 // provider. Reading the wrong key yields an empty token, which would silently
 // drop the managed key exchange rather than fail the login, so the parse has to
