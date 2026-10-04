@@ -27,10 +27,6 @@ var oauthUpstreamBase = "https://zcode.z.ai/api/v1"
 // inside the host's poll cadence.
 const oauthRequestTimeout = 30 * time.Second
 
-// oauthLoginProvider is the upstream provider selector for the CLI OAuth
-// flow; it configures what the authorize URL will authenticate against.
-const oauthLoginProvider = "zai"
-
 // maxOAuthBodyBytes bounds upstream OAuth response bodies regardless of the
 // general upstream limit, because login payloads are small JSON documents.
 const maxOAuthBodyBytes int64 = 1 << 20
@@ -61,7 +57,9 @@ type oauthInitResponse struct {
 // oauthPollResponse mirrors the observed upstream poll payload. status is
 // oauthPollStatusReady once the user finished authorization and
 // oauthPollStatusFailed when the flow was rejected; anything else means the
-// user has not finished yet.
+// user has not finished yet. The per-site provider sections are read by
+// parsePollAccessToken rather than here, because which key holds the access token
+// is a property of the site the login was started for.
 type oauthPollResponse struct {
 	Data struct {
 		Status string `json:"status"`
@@ -75,9 +73,6 @@ type oauthPollResponse struct {
 		User struct {
 			UserID string `json:"user_id"`
 		} `json:"user"`
-		Zai struct {
-			AccessToken string `json:"access_token"`
-		} `json:"zai"`
 	} `json:"data"`
 	Status string `json:"status"`
 	Token  string `json:"token"`
@@ -89,16 +84,16 @@ const (
 	oauthPollStatusFailed = "failed"
 )
 
-// zcodeAuthLabel is the user-facing label for every ZCode auth record.
-const zcodeAuthLabel = "ZCode (Z.AI)"
-
-// oauthInit starts one upstream OAuth flow authenticated by the session's
-// fresh polling secret. Errors are redacted: they carry no secret, URL
+// oauthInit starts one upstream OAuth flow for one site, authenticated by the
+// session's fresh polling secret. Errors are redacted: they carry no secret, URL
 // query, or response body.
-func oauthInit(ctx context.Context, client *http.Client, baseURL, pollSecret string) (string, string, error) {
+//
+// The site's profile supplies the provider selector, which is the only field that
+// tells the upstream which site to authenticate against.
+func oauthInit(ctx context.Context, client *http.Client, baseURL, pollSecret string, profile siteProfile) (string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, oauthRequestTimeout)
 	defer cancel()
-	payload, err := json.Marshal(map[string]string{"provider": oauthLoginProvider})
+	payload, err := json.Marshal(map[string]string{"provider": profile.OAuthProvider})
 	if err != nil {
 		return "", "", fmt.Errorf("encode authorization init request: %w", err)
 	}
@@ -177,8 +172,15 @@ func handleAuthLoginStart(request []byte) ([]byte, error) {
 	if strings.TrimSpace(req.Provider) != "" && req.Provider != pluginID {
 		return errorEnvelope("unknown_provider", "auth.login.start does not handle provider "+req.Provider, http.StatusBadRequest), nil
 	}
+	// The host's native entry carries no site, so the configured default decides.
+	// An unrecognized configured site stops the login here rather than silently
+	// authorizing at the other one.
+	site, err := currentConfig().OAuth.SiteOrDefault()
+	if err != nil {
+		return errorEnvelope("invalid_config", err.Error(), http.StatusInternalServerError), nil
+	}
 
-	session, err := startAuthorizationSession(currentConfig())
+	session, err := startAuthorizationSession(currentConfig(), site)
 	if err != nil {
 		if errors.Is(err, errOAuthUpstream) {
 			return errorEnvelope("oauth_upstream_failed", err.Error(), http.StatusBadGateway), nil
@@ -198,19 +200,32 @@ func handleAuthLoginStart(request []byte) ([]byte, error) {
 // envelope instead of a local plugin error.
 var errOAuthUpstream = errors.New("authorization upstream failed")
 
+// errUnknownSite reports a login request for a site this build does not know. It
+// is its own error so the management plane can refuse the action before any
+// authorization session exists, rather than opening a session that would
+// authorize at whichever site happened to be configured.
+var errUnknownSite = errors.New("unknown ZCode site")
+
 // startAuthorizationSession creates one pending authorization session with its
-// own polling secret, HTTP client, and cookie jar. Both the host's native
-// login entry and the management plane's re-authorization action create
-// sessions through it, so the two entries cannot drift in how sessions are
-// constructed.
-func startAuthorizationSession(cfg Config) (*authSession, error) {
+// own polling secret, HTTP client, and cookie jar. Both the host's native login
+// entry and the management plane's re-authorization action create sessions
+// through it, so the two entries cannot drift in how sessions are constructed.
+//
+// The site is fixed here, for the whole session: it is what the init body
+// selected, and the ready payload's access token has to be read against the same
+// site, so a session may not re-read a configured default halfway through.
+func startAuthorizationSession(cfg Config, site string) (*authSession, error) {
+	profile, ok := siteProfileFor(site)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", errUnknownSite, strings.TrimSpace(site))
+	}
 	client := newSessionHTTPClient(cfg)
 	pollSecret, err := randomHexToken(pollSecretBytes)
 	if err != nil {
 		client.CloseIdleConnections()
 		return nil, errors.New("could not create authorization session")
 	}
-	flowID, authorizeURL, err := oauthInit(context.Background(), client, oauthUpstreamBase, pollSecret)
+	flowID, authorizeURL, err := oauthInit(context.Background(), client, oauthUpstreamBase, pollSecret, profile)
 	if err != nil {
 		client.CloseIdleConnections()
 		if !errors.Is(err, errOAuthUpstream) {
@@ -218,7 +233,7 @@ func startAuthorizationSession(cfg Config) (*authSession, error) {
 		}
 		return nil, err
 	}
-	session, err := activeSessions.create(flowID, authorizeURL, pollSecret, client, time.Duration(cfg.OAuth.SessionTTLSeconds)*time.Second)
+	session, err := activeSessions.create(flowID, authorizeURL, pollSecret, client, time.Duration(cfg.OAuth.SessionTTLSeconds)*time.Second, profile.Site)
 	if err != nil {
 		client.CloseIdleConnections()
 		return nil, errors.New("could not create authorization session")
@@ -354,7 +369,7 @@ func applyPollVerdict(session *authSession, body []byte, persist func(identityID
 	if token == "" {
 		token = strings.TrimSpace(parsed.Token)
 	}
-	accessToken := strings.TrimSpace(parsed.Data.Zai.AccessToken)
+	accessToken := parsePollAccessToken(body, session.profile())
 	userID := strings.TrimSpace(parsed.Data.User.UserID)
 
 	switch {
@@ -378,7 +393,7 @@ func applyPollVerdict(session *authSession, body []byte, persist func(identityID
 			// skip the credential completion (and its upstream side effects).
 			return terminalPollOutcome(session)
 		}
-		storage, identityID, err := completeLoginStorage(token, accessToken, userID)
+		storage, identityID, err := completeLoginStorage(token, accessToken, userID, session.profile())
 		if err != nil {
 			session.fail(err.Error())
 			return pollOutcome{Kind: pollFailed, Message: err.Error()}
@@ -462,7 +477,11 @@ func pollOutcomeReply(session *authSession, outcome pollOutcome) []byte {
 // deployment will not store leaves every existing record untouched — which is the
 // only ordering that makes "the old credentials are still there" true when a
 // user authorizes the wrong account.
-func completeLoginStorage(token, accessToken, userID string) ([]byte, string, error) {
+//
+// The site's profile decides which access-token key the ready payload was read
+// from and which origin the key exchange spends, so the two sites' credential
+// chains cannot cross even when the protocol around them is identical.
+func completeLoginStorage(token, accessToken, userID string, profile siteProfile) ([]byte, string, error) {
 	cfg := normalizeConfig(currentConfig())
 	preflightCtx, cancelPreflight := context.WithTimeout(context.Background(), loginPreflightTimeout)
 	preflight, err := preflightCandidate(preflightCtx, token, userID, cfg)
@@ -481,7 +500,7 @@ func completeLoginStorage(token, accessToken, userID string) ([]byte, string, er
 	if err != nil {
 		return nil, "", fmt.Errorf("existing credentials could not be read; login aborted to protect them")
 	}
-	doc, err := buildZcodeStorage(previous, identityID, token, accessToken, time.Now())
+	doc, err := buildZcodeStorage(previous, identityID, token, accessToken, profile.Site, time.Now())
 	if err != nil {
 		return nil, "", fmt.Errorf("authorization result could not be stored")
 	}
@@ -491,11 +510,11 @@ func completeLoginStorage(token, accessToken, userID string) ([]byte, string, er
 	// token afterwards costs no second upstream call. Doing it in this order is
 	// also the only order that leaves the exchange result cached when the key
 	// exchange fails: a failed key exchange still obtained a business token.
-	doc = attachManagedAPIKey(doc, identityID, accessToken, time.Now())
-	return attachBusinessToken(doc, identityID, accessToken, time.Now()), identityID, nil
+	doc = attachManagedAPIKey(doc, identityID, accessToken, profile, time.Now())
+	return attachBusinessToken(doc, identityID, accessToken, profile, time.Now()), identityID, nil
 }
 
-// attachBusinessToken records the Z.AI business token for the identity, so the
+// attachBusinessToken records the site's business token for the identity, so the
 // account is usable against the business API from the moment it is created
 // rather than failing the first subscription or quota call that needs it.
 //
@@ -504,9 +523,14 @@ func completeLoginStorage(token, accessToken, userID string) ([]byte, string, er
 // cache is cold the exchange happens here, and a refusal is not a login
 // failure — the Coding Plan JWT does not depend on it, and the exchange is
 // retried on demand once the OAuth material is usable again.
-func attachBusinessToken(doc []byte, identityID, accessToken string, now time.Time) []byte {
+//
+// A site that issues its business token directly has nothing to record here:
+// its access token is already the business token, and re-recording it as a
+// product of an exchange that never happened would misreport the account's
+// credentials to the management page.
+func attachBusinessToken(doc []byte, identityID, accessToken string, profile siteProfile, now time.Time) []byte {
 	accessToken = strings.TrimSpace(accessToken)
-	if accessToken == "" {
+	if accessToken == "" || !profile.ExchangesBusinessToken {
 		return doc
 	}
 	cached, ok := activeBusinessTokens.get(identityID, accessToken, now)
@@ -517,7 +541,7 @@ func attachBusinessToken(doc []byte, identityID, accessToken string, now time.Ti
 	defer cancel()
 	client := newSessionHTTPClient(currentConfig())
 	defer client.CloseIdleConnections()
-	exchanged, err := exchangeBusinessTokenWithExpiry(ctx, client, accessToken)
+	exchanged, err := exchangeBusinessTokenWithExpiry(ctx, client, accessToken, profile)
 	if err != nil {
 		// The Coding Plan credential is unaffected, so the login still
 		// succeeds. The failure is recorded instead of discarded: it is the
@@ -649,10 +673,15 @@ func authFileNameFor(identityID string) string {
 // buildZcodeStorage writes the plugin-owned zcode namespace of the host auth
 // document for a fresh JWT login on top of the previous document. Unknown
 // fields anywhere in the previous document survive the patch.
-func buildZcodeStorage(previousDoc []byte, identityID, token, accessToken string, now time.Time) ([]byte, error) {
+//
+// The site is written here, once, and every later refresh re-pins it rather than
+// re-deriving it: it is the site this account was authorized against, and a
+// refresh reads entitlement rather than re-deciding where the account lives.
+func buildZcodeStorage(previousDoc []byte, identityID, token, accessToken, site string, now time.Time) ([]byte, error) {
 	namespace := map[string]any{
 		"schema_version": 1,
 		"identity_id":    identityID,
+		siteFieldName:    site,
 		"jwt": map[string]any{
 			"token":           token,
 			"status":          "active",
@@ -682,12 +711,17 @@ func buildZcodeStorage(previousDoc []byte, identityID, token, accessToken string
 
 // authDataFromStorage renders the pluginapi.AuthData the host persists on
 // successful login. StorageJSON carries the plugin-owned namespace document.
+//
+// The label names the site the account was authorized against, read back from
+// the document rather than remembered: the storage is what the host persists and
+// what a later parse or refresh re-reads, so a label assembled from anything else
+// would drift from the credential it names.
 func authDataFromStorage(identityID string, storage []byte) pluginapi.AuthData {
 	return pluginapi.AuthData{
 		Provider:    pluginID,
 		ID:          identityID,
 		FileName:    authFileNameFor(identityID),
-		Label:       zcodeAuthLabel,
+		Label:       authLabelFor(readCredentialSite(storage)),
 		StorageJSON: storage,
 	}
 }
@@ -727,7 +761,7 @@ func handleAuthParse(request []byte) ([]byte, error) {
 			Provider:    pluginID,
 			ID:          identityID,
 			FileName:    fileName,
-			Label:       zcodeAuthLabel,
+			Label:       authLabelFor(readCredentialSite(req.RawJSON)),
 			StorageJSON: req.RawJSON,
 		},
 	})
@@ -793,7 +827,7 @@ func handleAuthRefresh(request []byte) ([]byte, error) {
 	}
 	if identityID != "" {
 		data.FileName = fileName
-		data.Label = zcodeAuthLabel
+		data.Label = authLabelFor(readCredentialSite(req.StorageJSON))
 	}
 	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: data})
 }

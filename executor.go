@@ -175,7 +175,7 @@ func newExecutionScope(req executorRequestRPC, cfg Config, model string, doc []b
 			if modelBlockRecorded(snap, model, now) {
 				skipModel = normalizeRequestModel(model, nil)
 			}
-			skipBlockStatus, skipBlockRetry, skipBlockModel = skipBlockConclusion(doc, snap, plan.SkipBlockStatus, skipModel, now)
+			skipBlockStatus, skipBlockRetry, skipBlockModel = skipBlockConclusion(snap, plan.SkipBlockStatus, skipModel, now)
 		}
 	}
 	return executionScope{
@@ -422,7 +422,7 @@ func executionPlan(doc []byte, cfg Config, model string, callerHeaders http.Head
 	}
 	cfg = normalizeConfig(cfg)
 
-	primary, primaryErr := primaryProfile(snap, cfg, model, callerHeaders, identity, "", nil, now)
+	primary, primaryErr := primaryProfile(credentialAttempt{Snapshot: snap, Identity: identity}, cfg, model, callerHeaders, now)
 	fallback, fallbackErr := fallbackProfile(snap, cfg, model, callerHeaders, identity, now)
 	extra := pooledProfiles(pooled, cfg, model, callerHeaders, now)
 
@@ -471,7 +471,7 @@ func executionPlan(doc []byte, cfg Config, model string, callerHeaders http.Head
 func pooledProfiles(candidates []poolCandidate, cfg Config, model string, callerHeaders http.Header, now time.Time) []ResolvedProfile {
 	var profiles []ResolvedProfile
 	for _, candidate := range candidates {
-		if !candidateEligibility(candidate, model).Eligible {
+		if !candidateEligible(candidate, model) {
 			continue
 		}
 		// The candidate's own recorded state decides whether its JWT may be
@@ -488,7 +488,7 @@ func pooledProfiles(candidates []poolCandidate, cfg Config, model string, caller
 		// keep: one request must never describe two devices, and one account's
 		// credential must never be presented under another account's identity.
 		identity := requestIdentityFor(candidate.AuthIndex, candidate.Document)
-		profile, err := primaryProfile(snap, cfg, model, callerHeaders, identity, candidate.AuthIndex, candidate.Document, now)
+		profile, err := primaryProfile(credentialAttempt{Snapshot: snap, Identity: identity, AuthIndex: candidate.AuthIndex}, cfg, model, callerHeaders, now)
 		if err != nil {
 			diagf("pool auth=%s model=%q skipped=%s", candidate.AuthIndex, model, modelScopedStatus(snap, model, now))
 			continue
@@ -497,6 +497,20 @@ func pooledProfiles(candidates []poolCandidate, cfg Config, model string, caller
 		profiles = append(profiles, profile)
 	}
 	return profiles
+}
+
+// credentialAttempt names one auth record a profile is built from: the snapshot
+// of its state, the request identity its headers must describe, and the record
+// its refresh gate and state writes belong to. The three always travel
+// together, and the identity is derived from the record itself, so they are
+// carried as one value to keep them from drifting apart.
+type credentialAttempt struct {
+	Snapshot credentialSnapshot
+	Identity requestIdentity
+	// AuthIndex is empty for the record the host selected, which is why the
+	// identity cannot be re-derived here: the caller has already resolved it
+	// from that record's own document.
+	AuthIndex string
 }
 
 // primaryProfile builds the Coding Plan JWT profile, or the classified failure
@@ -510,13 +524,14 @@ func pooledProfiles(candidates []poolCandidate, cfg Config, model string, caller
 // happens for this one condition; every other recorded state keeps its existing
 // behaviour, because those recover through a credential refresh rather than
 // through a balance call.
-func primaryProfile(snap credentialSnapshot, cfg Config, model string, callerHeaders http.Header, identity requestIdentity, authIndex string, document []byte, now time.Time) (ResolvedProfile, error) {
+func primaryProfile(attempt credentialAttempt, cfg Config, model string, callerHeaders http.Header, now time.Time) (ResolvedProfile, error) {
+	snap := attempt.Snapshot
 	if strings.TrimSpace(snap.JWTToken) == "" {
 		return ResolvedProfile{}, errNoCredential
 	}
 	if !jwtUsableForModel(snap, model, now) {
 		if jwtUsable(snap.JWTStatus, snap.JWTRetryAfter, now) && snap.modelQuotaBlocked(model, now) {
-			if refreshed, ok := refreshedModelSnapshot(snap, cfg, model, authIndex, document, now); ok {
+			if refreshed, ok := refreshedModelSnapshot(snap, cfg, model, attempt.AuthIndex, attempt.Identity.DeviceID, now); ok {
 				snap = refreshed
 			}
 		}
@@ -524,17 +539,27 @@ func primaryProfile(snap credentialSnapshot, cfg Config, model string, callerHea
 			return ResolvedProfile{}, credentialStatusError{Status: modelScopedStatus(snap, model, now)}
 		}
 	}
-	return newProfile(snap, CredentialJWT, cfg, model, callerHeaders, identity), nil
+	return newProfile(snap, CredentialJWT, cfg, model, callerHeaders, attempt.Identity), nil
 }
 
 // refreshedModelSnapshot re-reads the balance for a credential whose recorded
 // per-model block is holding one model out of service, and returns the snapshot
 // that now governs it.
 //
+// authIndex is the record the reading belongs to and keys the refresh gate; it
+// is the pooled record for a pooled attempt and empty for the host-selected one.
+// deviceID is the credential's already-resolved device identity, the same one its
+// Messages requests present. The caller passes the identity rather than the
+// document because the device is a property of the record that was already
+// resolved once for this request, and re-deriving it here from a document the
+// caller may not have would describe a second installation — or, on the
+// host-selected path where there is no document, mint a fresh random one that the
+// balance call and the Messages call then disagree about.
+//
 // ok is false when the reading could not be had or could not be interpreted. That
 // is not evidence the block has lifted, so the caller keeps it: an unreadable
 // reading must never turn a recorded conclusion into a schedulable credential.
-func refreshedModelSnapshot(snap credentialSnapshot, cfg Config, model string, authIndex string, document []byte, now time.Time) (credentialSnapshot, bool) {
+func refreshedModelSnapshot(snap credentialSnapshot, cfg Config, model string, authIndex string, deviceID string, now time.Time) (credentialSnapshot, bool) {
 	if strings.TrimSpace(snap.JWTToken) == "" {
 		return snap, false
 	}
@@ -549,7 +574,6 @@ func refreshedModelSnapshot(snap credentialSnapshot, cfg Config, model string, a
 	// device, or the plugin-wide config, would describe a different installation
 	// than the credential it is checking.
 	cfg = normalizeConfig(cfg)
-	deviceID := deviceIdentity(authIndex, document)
 	ctx, cancel := context.WithTimeout(context.Background(), quotaRequestTimeout)
 	defer cancel()
 	evidence := fetchQuotaEvidence(ctx, snap.JWTToken, cfg.Product.AppVersion, deviceID, now)
@@ -657,17 +681,24 @@ func credentialProfileFailure(err error) *upstreamFailure {
 // conclusion for an unrecognized status would strand the account, which is
 // worse than recording nothing.
 //
-// A per-model conclusion is returned with its model attached and the status left
-// empty, so the caller records it against that model and the credential's own
-// status is untouched.
-func skipBlockConclusion(doc []byte, snap credentialSnapshot, status, model string, now time.Time) (string, time.Time, string) {
+// A per-model conclusion is returned with its model attached, its status left
+// empty, and the window the model's own entry already carries. The status stays
+// empty so the caller records it against that model alone and never against the
+// credential's own status, which would take every model that still has allowance
+// out of service. The window comes from the record for the same reason the
+// credential-level branch reads its own: a request that skips a model the record
+// already holds must not overwrite that model's real refill deadline with a
+// deadline-less conclusion, or the "refills at ..." a caller was promised would
+// vanish on the very next request.
+func skipBlockConclusion(snap credentialSnapshot, status, model string, now time.Time) (string, time.Time, string) {
 	switch status {
 	case jwtStatusVerificationBlocked, jwtStatusExhausted, jwtStatusPlanExpired, jwtStatusCooldown, jwtStatusInvalid:
 	default:
 		return "", time.Time{}, ""
 	}
 	if model != "" {
-		return "", time.Time{}, model
+		window, _ := snap.modelQuotaWindow(model)
+		return "", recordedRetryAfter(window, now), model
 	}
 	if snap.JWTStatus == status && isSelfHealingStatus(status) {
 		// The window is the one already on the record. Re-anchoring it here
@@ -805,6 +836,18 @@ func (s executionScope) credentialRef() credentialRef {
 	return credentialRef{AuthIndex: s.AuthIndex, IdentityID: s.IdentityID, Document: s.Document}
 }
 
+// attemptRecord names the auth record an attempt's balance reading and state
+// conclusion belong to: the pooled record when the profile carries one, and the
+// host-selected record otherwise. Diagnostics must print this rather than
+// s.AuthIndex, or a conclusion about a pooled account is reported under the
+// host-selected record's id and the two become indistinguishable in the log.
+func (s executionScope) attemptRecord(profile ResolvedProfile) string {
+	if record := strings.TrimSpace(profile.Record); record != "" {
+		return record
+	}
+	return strings.TrimSpace(s.AuthIndex)
+}
+
 // recheckModelAllowance re-reads one credential's billing balance after the
 // Messages endpoint reported an exhausted allowance for one model, and reports
 // the failure the attempt should carry onward.
@@ -861,7 +904,7 @@ func (s executionScope) recheckModelAllowance(ctx context.Context, profile Resol
 	snapshot := snapshotFor(evidence, time.Now())
 	allowance := snapshot.modelAllowance(profile.ModelID)
 	diagf("plan_recheck tag=%s auth=%s model=%q verdict=%s readable=%v decision=%s",
-		s.DiagTag, s.AuthIndex, profile.ModelID, evidence.Verdict, snapshot.Readable, allowance)
+		s.DiagTag, s.attemptRecord(profile), profile.ModelID, evidence.Verdict, snapshot.Readable, allowance)
 	switch allowance {
 	case allowanceFunded:
 		// The balance contradicts an exhaustion for this model, so the recorded
@@ -1047,8 +1090,11 @@ func runExecution(ctx context.Context, scope executionScope, profiles []Resolved
 	if scope.SkipBlockModel != "" {
 		// A per-model skip re-asserts only that model's entry. Re-asserting it as
 		// the credential's status is what would take every model that still has
-		// allowance out of service, so it never travels that way.
-		scope.batch.add(recordedState{Kind: CredentialJWT, Model: scope.SkipBlockModel, Status: scope.SkipBlockStatus})
+		// allowance out of service, so it never travels that way. It carries the
+		// window already on the model's entry, so a request that skips a model the
+		// record holds does not overwrite its real refill deadline with the
+		// deadline-less sentinel.
+		scope.batch.add(recordedState{Kind: CredentialJWT, Model: scope.SkipBlockModel, Status: scope.SkipBlockStatus, RetryAfter: scope.SkipBlockRetry})
 	}
 	// The payload is the request exactly as the caller built it. Every
 	// credential attempt below replays this one buffer, so a fallback can
@@ -1072,7 +1118,7 @@ func runExecution(ctx context.Context, scope executionScope, profiles []Resolved
 		// upstream rejection cannot turn into a loop of billing calls.
 		if outcome.Failure.Class == failureExhausted && profile.CredentialKind == CredentialJWT {
 			outcome.Failure = scope.recheckModelAllowance(ctx, profile, outcome.Failure)
-			diagf("plan_recheck tag=%s auth=%s model=%q code=%s", scope.DiagTag, scope.AuthIndex, profile.ModelID, outcome.Failure.Code)
+			diagf("plan_recheck tag=%s auth=%s model=%q code=%s", scope.DiagTag, scope.attemptRecord(profile), profile.ModelID, outcome.Failure.Code)
 		}
 		if i+1 < len(profiles) {
 			next := profiles[i+1]

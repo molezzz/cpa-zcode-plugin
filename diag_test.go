@@ -193,7 +193,7 @@ func TestDiagPlanLinesCarryNoSensitiveIdentifiers(t *testing.T) {
 		time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC))
 
 	diagf("plan_snapshot auth=%s identity=%s readable=%v last_priority=%v plans=[%s] models=[%s]",
-		"auth-x", "zcode-user", snapshot.Readable, snapshot.isLastPriority(normalizeConfig(Config{})),
+		"auth-x", quotaIdentityDiag(identityIDFor(account)), snapshot.Readable, snapshot.isLastPriority(normalizeConfig(Config{})),
 		strings.Join(snapshot.startPlanIDs(), " "), diagModelAllowance(snapshot))
 	diagf("oauth_preflight identity=%s readable=%v verdict=%s plans=[%s] models=[%s]",
 		preflightIdentityDiag(account), snapshot.Readable, "available",
@@ -202,7 +202,10 @@ func TestDiagPlanLinesCarryNoSensitiveIdentifiers(t *testing.T) {
 	diagf("pool auth=%s model=%q candidates=%d", "auth-x", "GLM-5.3-Flash", 2)
 
 	out := buf.String()
-	for _, forbidden := range []string{jwt, account, device, userID} {
+	// The plan_snapshot line used to print the record's IdentityID verbatim,
+	// which for a short identity claim is the derived "zcode-<raw id>" form. Both
+	// the raw id and that derived value must not survive; only the digest does.
+	for _, forbidden := range []string{jwt, account, device, userID, identityIDFor(account)} {
 		if strings.Contains(out, forbidden) {
 			t.Errorf("a plan diagnostic line leaked %q:\n%s", forbidden, out)
 		}

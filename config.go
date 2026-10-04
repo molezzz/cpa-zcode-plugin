@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -70,11 +71,38 @@ type ModelDiscoveryConfig struct {
 type OAuthConfig struct {
 	SessionTTLSeconds    int    `yaml:"session_ttl_seconds"`
 	ManagedKeyNamePrefix string `yaml:"managed_key_name_prefix"`
+	// DefaultSite is the site the host's own login entry authorizes against.
+	//
+	// The host's native auth.login.start carries no site, so an operator whose
+	// account lives on the other site needs this to point the built-in entry at
+	// it. The management page does not read it: it asks for the site explicitly
+	// per login, so an operator with both accounts never depends on a default.
+	// Unset means the international site, which is the only site that ever had a
+	// login before this option existed.
+	DefaultSite string `yaml:"default_site"`
 	// OrganizationID and ProjectID are explicit, non-secret upstream IDs used
 	// only when the OAuth result cannot determine them; never guessed from
 	// localized display names.
 	OrganizationID string `yaml:"organization_id"`
 	ProjectID      string `yaml:"project_id"`
+}
+
+// SiteOrDefault resolves the configured default site. An unrecognized value is
+// refused rather than replaced with the international site: a typo in the
+// configuration would otherwise silently send every native login at the wrong
+// site, and the operator would have no way to see why. The value is matched
+// exactly, because it is an upstream provider selector rather than a display
+// name.
+func (c OAuthConfig) SiteOrDefault() (string, error) {
+	site := strings.TrimSpace(c.DefaultSite)
+	if site == "" {
+		return siteZai, nil
+	}
+	if _, ok := siteProfileFor(site); ok {
+		return site, nil
+	}
+	return "", fmt.Errorf("oauth.default_site %q is not a known ZCode site; use one of %s",
+		site, strings.Join(knownSites, ", "))
 }
 
 // UpstreamConfig bounds upstream HTTP behaviour.
@@ -252,6 +280,9 @@ func mergeConfig(base, override Config) Config {
 	}
 	if prefix := strings.TrimSpace(override.OAuth.ManagedKeyNamePrefix); prefix != "" {
 		base.OAuth.ManagedKeyNamePrefix = prefix
+	}
+	if site := strings.TrimSpace(override.OAuth.DefaultSite); site != "" {
+		base.OAuth.DefaultSite = site
 	}
 	if override.OAuth.OrganizationID != "" {
 		base.OAuth.OrganizationID = override.OAuth.OrganizationID

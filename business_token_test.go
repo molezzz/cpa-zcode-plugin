@@ -80,7 +80,7 @@ func TestResolveBusinessTokenExchangesOAuthToken(t *testing.T) {
 	})
 	doc := authDocWith(t, "oauth-access-token", time.Now().UTC().Format(time.RFC3339))
 	token, err := resolveBusinessToken(context.Background(), fixture.srv.Client(),
-		"zcode-user-1", doc, time.Now())
+		"zcode-user-1", doc, zaiSiteProfile, time.Now())
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestResolveBusinessTokenCachesWithinLifetime(t *testing.T) {
 	doc := authDocWith(t, "oauth-access-token", now.UTC().Format(time.RFC3339))
 	for i := 0; i < 3; i++ {
 		if _, err := resolveBusinessToken(context.Background(), fixture.srv.Client(),
-			"zcode-user-1", doc, now); err != nil {
+			"zcode-user-1", doc, zaiSiteProfile, now); err != nil {
 			t.Fatalf("resolve %d: %v", i, err)
 		}
 	}
@@ -122,12 +122,12 @@ func TestResolveBusinessTokenRefreshesBeforeExpiry(t *testing.T) {
 	doc := authDocWith(t, "oauth-access-token", issued.UTC().Format(time.RFC3339))
 	// Just outside the skew: the cached token is still good.
 	if _, err := resolveBusinessToken(context.Background(), fixture.srv.Client(),
-		"zcode-user-1", doc, issued); err != nil {
+		"zcode-user-1", doc, zaiSiteProfile, issued); err != nil {
 		t.Fatalf("initial resolve: %v", err)
 	}
 	// Nine minutes later the token has 60s left, inside the 5-minute skew.
 	if _, err := resolveBusinessToken(context.Background(), fixture.srv.Client(),
-		"zcode-user-1", doc, issued.Add(9*time.Minute)); err != nil {
+		"zcode-user-1", doc, zaiSiteProfile, issued.Add(9*time.Minute)); err != nil {
 		t.Fatalf("reskew resolve: %v", err)
 	}
 	if fixture.calls.Load() != 2 {
@@ -145,12 +145,12 @@ func TestResolveBusinessTokenIgnoresTokenFromOlderLogin(t *testing.T) {
 	now := time.Now()
 	old := authDocWith(t, "oauth-access-token-old", now.UTC().Format(time.RFC3339))
 	if _, err := resolveBusinessToken(context.Background(), fixture.srv.Client(),
-		"zcode-user-1", old, now); err != nil {
+		"zcode-user-1", old, zaiSiteProfile, now); err != nil {
 		t.Fatalf("first resolve: %v", err)
 	}
 	fresh := authDocWith(t, "oauth-access-token-new", now.UTC().Format(time.RFC3339))
 	if _, err := resolveBusinessToken(context.Background(), fixture.srv.Client(),
-		"zcode-user-1", fresh, now); err != nil {
+		"zcode-user-1", fresh, zaiSiteProfile, now); err != nil {
 		t.Fatalf("resolve after re-login: %v", err)
 	}
 	if fixture.calls.Load() != 2 {
@@ -166,14 +166,14 @@ func TestResolveBusinessTokenReadsPersistedToken(t *testing.T) {
 		w.Write([]byte(bizLoginOK(3600)))
 	})
 	now := time.Now()
-	token, err := exchangeBusinessTokenWithExpiry(context.Background(), fixture.srv.Client(), "oauth-access-token")
+	token, err := exchangeBusinessTokenWithExpiry(context.Background(), fixture.srv.Client(), "oauth-access-token", zaiSiteProfile)
 	if err != nil {
 		t.Fatalf("exchange: %v", err)
 	}
 	// A fresh process: the cache is empty, only the document carries the token.
 	activeBusinessTokens = newBusinessTokenStore()
 	doc := writeBusinessToken(authDocWith(t, "oauth-access-token", now.UTC().Format(time.RFC3339)), token, now)
-	got, err := resolveBusinessToken(context.Background(), fixture.srv.Client(), "zcode-user-1", doc, now)
+	got, err := resolveBusinessToken(context.Background(), fixture.srv.Client(), "zcode-user-1", doc, zaiSiteProfile, now)
 	if err != nil {
 		t.Fatalf("resolve after restart: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestResolveBusinessTokenRequiresReauth(t *testing.T) {
 				fixture = newBizTokenFixture(t, tc.handler)
 			}
 			if _, err := resolveBusinessToken(context.Background(), fixture.srv.Client(),
-				"zcode-user-1", tc.doc, time.Now()); err != errZaiOAuthRequired {
+				"zcode-user-1", tc.doc, zaiSiteProfile, time.Now()); err != errZaiOAuthRequired {
 				t.Fatalf("err = %v, want errZaiOAuthRequired", err)
 			}
 		})
@@ -333,7 +333,7 @@ func TestLoginPersistsTheBusinessTokenLifetime(t *testing.T) {
 	})
 	now := time.Now()
 	// A freshly exchanged token, as the managed key exchange caches it.
-	exchanged, err := exchangeBusinessTokenWithExpiry(context.Background(), fixture.srv.Client(), "oauth-access-token")
+	exchanged, err := exchangeBusinessTokenWithExpiry(context.Background(), fixture.srv.Client(), "oauth-access-token", zaiSiteProfile)
 	if err != nil {
 		t.Fatalf("exchange: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestLoginPersistsTheBusinessTokenLifetime(t *testing.T) {
 	// The recording step takes that cache hit and must carry the lifetime over.
 	doc := attachBusinessToken(
 		authDocWith(t, "oauth-access-token", now.UTC().Format(time.RFC3339)),
-		"zcode-user-1", "oauth-access-token", now)
+		"zcode-user-1", "oauth-access-token", zaiSiteProfile, now)
 	material := readOAuthMaterial(doc)
 	if material.BusinessExpires == "" {
 		t.Fatal("the persisted business token has no expiry; the lifetime was dropped on the way to disk")

@@ -208,3 +208,71 @@ func TestProductAppVersionReachesEveryRequestHeader(t *testing.T) {
 		t.Errorf("zcodeUserAgent = %q", got)
 	}
 }
+
+// The default site is what the host's own login entry authorizes against, since
+// that entry carries no site of its own. An unset value means the international
+// site, which is the only site that ever had a login before this option existed.
+func TestOAuthDefaultSiteDefaultsToInternational(t *testing.T) {
+	site, err := OAuthConfig{}.SiteOrDefault()
+	if err != nil {
+		t.Fatalf("unset default site: %v", err)
+	}
+	if site != siteZai {
+		t.Errorf("site = %q, want %q", site, siteZai)
+	}
+	if got := defaultConfig().OAuth.DefaultSite; got != "" {
+		t.Errorf("default config site = %q, want it unset so the resolver owns the default", got)
+	}
+}
+
+func TestOAuthDefaultSiteAcceptsKnownSites(t *testing.T) {
+	for _, known := range knownSites {
+		site, err := OAuthConfig{DefaultSite: known}.SiteOrDefault()
+		if err != nil {
+			t.Errorf("site %q rejected: %v", known, err)
+			continue
+		}
+		if site != known {
+			t.Errorf("site = %q, want %q", site, known)
+		}
+	}
+}
+
+// A typo in the configured site must stop the login rather than send it at the
+// other one: an operator would otherwise authorize at a site they did not ask
+// for, and the resulting credential would look complete.
+func TestOAuthDefaultSiteRefusesUnknown(t *testing.T) {
+	for _, bad := range []string{"bigmodel.cn", "BigModel", "ZAI", "openai", "big-model"} {
+		if site, err := (OAuthConfig{DefaultSite: bad}).SiteOrDefault(); err == nil {
+			t.Errorf("site %q resolved to %q, want a refusal", bad, site)
+		}
+	}
+}
+
+// An override has to reach the merged snapshot, or configuring the option would
+// silently do nothing.
+func TestMergeConfigCarriesTheDefaultSite(t *testing.T) {
+	merged := mergeConfig(defaultConfig(), Config{OAuth: OAuthConfig{DefaultSite: siteBigmodel}})
+	if merged.OAuth.DefaultSite != siteBigmodel {
+		t.Errorf("site = %q, want %q", merged.OAuth.DefaultSite, siteBigmodel)
+	}
+	// An override that names no site leaves the base alone.
+	base := defaultConfig()
+	base.OAuth.DefaultSite = siteBigmodel
+	merged = mergeConfig(base, Config{OAuth: OAuthConfig{}})
+	if merged.OAuth.DefaultSite != siteBigmodel {
+		t.Errorf("site = %q, want the base's %q preserved", merged.OAuth.DefaultSite, siteBigmodel)
+	}
+}
+
+// The value is an upstream provider selector, so it must survive YAML as the
+// exact spelling the upstream uses rather than a folded one.
+func TestParseConfigReadsDefaultSite(t *testing.T) {
+	cfg, err := parseConfig([]byte("oauth:\n  default_site: bigmodel\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OAuth.DefaultSite != siteBigmodel {
+		t.Errorf("site = %q, want %q", cfg.OAuth.DefaultSite, siteBigmodel)
+	}
+}

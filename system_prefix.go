@@ -7,27 +7,29 @@ import "strings"
 // field must open with a sufficiently complete verbatim run of one of the
 // official client's own system prompts. Established by an authorized
 // differential capture (mitmproxy session 20261002-194452_2344fd, issue #16)
-// and re-pinned by a 106-case single-variable matrix on 2026-10-03 (issue #22,
+// and re-pinned by a 110-case single-variable matrix on 2026-10-03 (issue #22,
 // docs/evidence-3012-matrix.json, harness scripts/probe-3012-matrix.py).
 //
 // What the matrix settled. An absent system field is refused whatever else the
 // request carries, and a present one is admitted when it opens with recognized
 // official text, so the two blocks injected below are sufficient — but they are
 // neither the whole rule nor necessary: the official client's own
-// title-generation prompt (997 bytes) passes with no official block at all,
-// which is the counterexample that reopened the question after #16 closed it.
+// title-generation prompt (997 characters) passes with no official block at
+// all, which is the counterexample that reopened the question after #16 closed
+// it.
 //
-// Size is not the test, and the boundary is per-prompt rather than global.
-// 20000 bytes of filler and 7565 bytes of a genuine official block are both
-// refused; a 1200-byte prefix of block 2 is refused while a 1250-byte one
-// passes, and the title prompt is refused at 996 bytes and passes at its full
-// 997. So the gateway recognizes prompt text, not length.
+// Size is not the test, and the boundary is per-prompt rather than global, and
+// the matrix thresholds are counts of CHARACTERS, not bytes. 20000 bytes of
+// filler and the whole official third block (7565 characters, 7619 bytes) are
+// both refused; a 1200-character prefix of block 2 is refused while a
+// 1250-character one passes, and the title prompt is refused at 996 characters
+// and passes at its full 997. So the gateway recognizes prompt text, not length.
 //
-// It matches a run, and the run must lead. Block 2's 1400-byte slice on its own
-// is refused, the same slice after block 1 passes, and the same slice placed
-// after a caller block is refused again; one leading space before block 1
-// breaks it, and so does truncating block 1 to 20 bytes. Position in the array
-// and completeness of the head both matter.
+// It matches a run, and the run must lead. Block 2's 1400-character slice on its
+// own is refused, the same slice after block 1 passes, and the same slice
+// placed after a caller block is refused again; one leading space before block 1
+// breaks it, and so does truncating block 1 to 20 characters. Position in the
+// array and completeness of the head both matter.
 //
 // Blocks 1 and 2 are one recognized run: reversed is refused, either alone is
 // refused, and concatenated into a single block passes — so they are emitted as

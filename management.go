@@ -48,13 +48,14 @@ const (
 var managementResourcePagePath = managementResourcePrefix + pluginID + managementResourcePage
 
 // The fixed action vocabulary of the management plane. Account-granular
-// actions require an explicit auth_index; the batch action refuses one
-// because it snapshots every account instead.
+// actions require an explicit auth_index; the login and batch actions require
+// none, because each works from a site or over every account instead of from one.
 const (
 	actionRefreshCredential = "refresh_credential"
 	actionRefreshQuota      = "refresh_quota"
 	actionRefreshModels     = "refresh_models"
 	actionOAuthRetry        = "oauth_retry"
+	actionOAuthLogin        = "oauth_login"
 	actionBatchRefresh      = "batch_refresh"
 )
 
@@ -266,15 +267,20 @@ func (s managementService) state(ctx context.Context, now time.Time) managementS
 // credential states, the OAuth material's presence, and the last quota
 // observation.
 type accountView struct {
-	AuthIndex  string      `json:"auth_index"`
-	FileName   string      `json:"file_name,omitempty"`
-	Label      string      `json:"label,omitempty"`
-	IdentityID string      `json:"identity_id,omitempty"`
-	Disabled   bool        `json:"disabled,omitempty"`
-	JWT        *jwtView    `json:"jwt,omitempty"`
-	APIKey     *apiKeyView `json:"api_key,omitempty"`
-	OAuth      *oauthView  `json:"oauth,omitempty"`
-	Quota      *quotaView  `json:"quota,omitempty"`
+	AuthIndex  string `json:"auth_index"`
+	FileName   string `json:"file_name,omitempty"`
+	Label      string `json:"label,omitempty"`
+	IdentityID string `json:"identity_id,omitempty"`
+	// Site is the ZCode site this account belongs to. An operator with accounts
+	// on both sites sees them as the same kind of record otherwise, and the only
+	// way to tell a domestic account's plan apart from an international one is to
+	// know which site issued it.
+	Site     string      `json:"site,omitempty"`
+	Disabled bool        `json:"disabled,omitempty"`
+	JWT      *jwtView    `json:"jwt,omitempty"`
+	APIKey   *apiKeyView `json:"api_key,omitempty"`
+	OAuth    *oauthView  `json:"oauth,omitempty"`
+	Quota    *quotaView  `json:"quota,omitempty"`
 	// Plan is the record's Start Plan reading: which products it holds and, per
 	// model, whether an allowance is funded, spent, or unknown. It is the section
 	// that makes a wrong-account login and an exhausted plan tell themselves
@@ -445,6 +451,7 @@ func (s managementService) accountView(ctx context.Context, entry pluginapi.Host
 		return view
 	}
 	view.IdentityID = namespace.IdentityID
+	view.Site = namespace.Site
 	view.JWT = namespace.JWT
 	view.APIKey = namespace.APIKey
 	view.OAuth = namespace.OAuth
@@ -464,9 +471,14 @@ func (s managementService) accountView(ctx context.Context, entry pluginapi.Host
 // construction.
 type accountNamespace struct {
 	IdentityID string
-	JWT        *jwtView
-	APIKey     *apiKeyView
-	OAuth      *oauthView
+	// Site is the site this account was authorized against. It is shown rather
+	// than inferred from the label because the whole reason it exists is that an
+	// operator can hold one account per site: two records that look alike in
+	// every other respect are told apart by this field alone.
+	Site   string
+	JWT    *jwtView
+	APIKey *apiKeyView
+	OAuth  *oauthView
 }
 
 // readAccountNamespace decodes the plugin-owned namespace of an auth document
@@ -477,6 +489,7 @@ func readAccountNamespace(doc []byte) (accountNamespace, error) {
 	var root struct {
 		Zcode struct {
 			IdentityID string         `json:"identity_id"`
+			Site       string         `json:"site"`
 			JWT        map[string]any `json:"jwt"`
 			APIKey     map[string]any `json:"api_key"`
 			OAuth      map[string]any `json:"oauth"`
@@ -488,7 +501,7 @@ func readAccountNamespace(doc []byte) (accountNamespace, error) {
 	if strings.TrimSpace(root.Zcode.IdentityID) == "" {
 		return accountNamespace{}, errAuthDocument
 	}
-	namespace := accountNamespace{IdentityID: strings.TrimSpace(root.Zcode.IdentityID)}
+	namespace := accountNamespace{IdentityID: strings.TrimSpace(root.Zcode.IdentityID), Site: recordedSite(root.Zcode.Site)}
 	if root.Zcode.JWT != nil {
 		namespace.JWT = &jwtView{
 			Present:       strings.TrimSpace(stringField(root.Zcode.JWT, "token")) != "",
@@ -557,7 +570,7 @@ func planViewFor(section planSnapshotSection) *planSnapshotView {
 		Readable:     section.Readable,
 		PlanIDs:      section.PlanIDs,
 		Instances:    section.Instances,
-		LastPriority: section.LastTried,
+		LastPriority: section.LastPriority,
 	}
 	if len(section.Models) > 0 {
 		view.Models = make(map[string]modelAllowanceView, len(section.Models))
@@ -654,6 +667,12 @@ func quotaFractionPointer(balance quotaBalance) *float64 {
 type managementActionRequest struct {
 	Action    string `json:"action"`
 	AuthIndex string `json:"auth_index"`
+	// Site selects which site's authorization a re-authorization starts. It is
+	// required for oauth_retry: the action's whole purpose is to recover a
+	// credential, and a recovery that silently picked a site could replace a
+	// working account with a login to the wrong one. Every other action ignores
+	// it, because a record's site is its own, not something an action chooses.
+	Site string `json:"site"`
 }
 
 // runManagementAction dispatches one action POST. Malformed input, unknown
@@ -682,12 +701,31 @@ func (s managementService) action(ctx context.Context, body []byte, now time.Tim
 	}
 	req.Action = strings.TrimSpace(req.Action)
 	req.AuthIndex = strings.TrimSpace(req.AuthIndex)
+	// The site is compared exactly, not case-folded: it is an upstream provider
+	// selector rather than a display name, and "BigModel" is not a spelling the
+	// upstream accepts. An unrecognized spelling is reported as one, which is
+	// more useful than quietly authorizing at the other site.
+	req.Site = strings.TrimSpace(req.Site)
 
 	if req.Action == actionBatchRefresh {
 		if req.AuthIndex != "" {
 			return managementErrorResponse(http.StatusBadRequest, "invalid_request", "batch_refresh operates on every account and takes no auth_index")
 		}
 		return s.batchRefresh(ctx, now)
+	}
+
+	// A fresh login names a site and no account: it is how a user adds an account,
+	// and it runs through the same session and poll loop as a re-authorization
+	// without being tied to a record that may not exist yet.
+	if req.Action == actionOAuthLogin {
+		if req.AuthIndex != "" {
+			return managementErrorResponse(http.StatusBadRequest, "invalid_request", "oauth_login takes no auth_index; it creates an account")
+		}
+		if _, ok := siteProfileFor(req.Site); !ok {
+			return managementErrorResponse(http.StatusBadRequest, "unknown_site",
+				"oauth_login requires site to be one of: "+strings.Join(knownSites, ", "))
+		}
+		return s.oauthLogin(req.Site)
 	}
 
 	switch req.Action {
@@ -698,10 +736,20 @@ func (s managementService) action(ctx context.Context, body []byte, now time.Tim
 	if req.AuthIndex == "" {
 		return managementErrorResponse(http.StatusBadRequest, "invalid_request", "this action requires an explicit auth_index")
 	}
+	// The site is validated with the rest of the request, before the store is
+	// read: it names which site's account the action re-authorizes, and an
+	// operator who mistyped it should be told that rather than be sent looking
+	// for an auth_index the request never named.
+	if req.Action == actionOAuthRetry {
+		if _, ok := siteProfileFor(req.Site); !ok {
+			return managementErrorResponse(http.StatusBadRequest, "unknown_site",
+				"oauth_retry requires site to be one of: "+strings.Join(knownSites, ", "))
+		}
+	}
 
 	// The snapshot happens before the lock: the action validates the account
-	// it was asked for, then serializes against everything else that touches
-	// the same identity.
+	// it was asked for, then serializes against everything else that touches the
+	// same identity.
 	doc, err := s.store.Get(ctx, req.AuthIndex)
 	if err != nil {
 		return managementErrorResponse(http.StatusNotFound, "unknown_auth_index", "no ZCode account matches this auth_index")
@@ -735,7 +783,7 @@ func (s managementService) action(ctx context.Context, body []byte, now time.Tim
 	case actionRefreshModels:
 		return s.refreshModels(ctx, req.AuthIndex, doc, now)
 	case actionOAuthRetry:
-		return s.oauthRetry(req.AuthIndex)
+		return s.oauthRetry(req.AuthIndex, req.Site)
 	default:
 		return managementErrorResponse(http.StatusBadRequest, "unknown_action", "unknown action: "+req.Action)
 	}
@@ -927,17 +975,39 @@ func (s managementService) refreshModels(ctx context.Context, authIndex string, 
 	return actionResult(payload)
 }
 
-// oauthRetry re-initiates the OAuth authorization for one existing account.
-// It creates a fresh authorization session through the same path the host's
-// native login entry uses, returns the browser authorization link, and lets
-// the plugin's own bounded poll loop complete the login into the host auth
-// store — the management page is a second entry, never a third flow. The
-// authorize URL is returned here deliberately: it is the one artifact the
-// operator must open to finish the retry, it belongs to this session alone,
-// and it dies with the session TTL. The redacted state views still never
-// carry it.
-func (s managementService) oauthRetry(authIndex string) pluginapi.ManagementResponse {
-	session, err := startAuthorizationSession(s.cfg)
+// oauthRetry re-authorizes one existing account. See oauthSessionStart for the
+// flow itself; the difference is only that it reports the account it recovers.
+func (s managementService) oauthRetry(authIndex, site string) pluginapi.ManagementResponse {
+	return s.oauthSessionStart(site, map[string]any{
+		"action":     actionOAuthRetry,
+		"auth_index": authIndex,
+	})
+}
+
+// oauthLogin starts a login for an account the store does not have yet, which is
+// how a user adds their second site. The completed login lands in the same store
+// under the same identity-derived file name a re-authorization would use, so the
+// two entries differ only in whether a record was already there.
+func (s managementService) oauthLogin(site string) pluginapi.ManagementResponse {
+	return s.oauthSessionStart(site, map[string]any{
+		"action": actionOAuthLogin,
+	})
+}
+
+// oauthSessionStart creates an authorization session for one site and hands it to
+// the plugin's own bounded poll loop, which completes the login into the host
+// auth store — the step the host performs for native logins. It creates a session
+// through the same path the host's native entry uses, so the management page is a
+// second entry rather than a third flow.
+//
+// The site is this caller's explicit choice and applies to this login only: an
+// operator holding accounts on both re-authorizes one without changing what the
+// other defaults to. The authorize URL is returned here deliberately — it is the
+// one artifact the operator must open to finish the flow, it belongs to this
+// session alone, and it dies with the session TTL. The redacted state views
+// still never carry it.
+func (s managementService) oauthSessionStart(site string, payload map[string]any) pluginapi.ManagementResponse {
+	session, err := startAuthorizationSession(s.cfg, site)
 	if err != nil {
 		if errors.Is(err, errOAuthUpstream) {
 			return managementErrorResponse(http.StatusBadGateway, "oauth_upstream_failed", "the authorization upstream could not start a session; try again")
@@ -945,15 +1015,13 @@ func (s managementService) oauthRetry(authIndex string) pluginapi.ManagementResp
 		return managementErrorResponse(http.StatusInternalServerError, "plugin_error", "could not create authorization session")
 	}
 	managementOAuth.start(session, s.store, s.cfg)
-	return actionResult(map[string]any{
-		"action":     actionOAuthRetry,
-		"auth_index": authIndex,
-		"session": map[string]any{
-			"state":         string(authSessionPending),
-			"authorize_url": session.authorizeURL,
-			"expires_at":    session.expiresAt.UTC().Format(time.RFC3339),
-		},
-	})
+	payload["site"] = site
+	payload["session"] = map[string]any{
+		"state":         string(authSessionPending),
+		"authorize_url": session.authorizeURL,
+		"expires_at":    session.expiresAt.UTC().Format(time.RFC3339),
+	}
+	return actionResult(payload)
 }
 
 // batchOutcomeView is one account's line in a batch summary.

@@ -11,16 +11,24 @@ import (
 )
 
 // The OAuth access token the upstream returns at login is not itself the
-// credential any business endpoint accepts. Z.AI issues it for the identity
-// service; the api.z.ai business endpoints expect a different token, obtained
-// by exchanging the OAuth token at POST /api/auth/z/login. Calling a business
-// endpoint with the OAuth token answers 401 "token expired or incorrect" even
-// moments after a successful login, which reads exactly like a stale credential
-// and sends the operator to re-authenticate for nothing.
+// credential every business endpoint accepts, but how far it has to be carried
+// is a property of the site:
 //
-// The plugin therefore keeps both: the OAuth token as the renewable exchange
-// material (it carries an exp claim), and the exchanged business token as the
-// material that calls the business API.
+//   - On the international site the token is issued for the identity service.
+//     The api.z.ai business endpoints expect a different token, obtained by
+//     exchanging the OAuth token at POST /api/auth/z/login. Calling a business
+//     endpoint with the OAuth token answers 401 "token expired or incorrect" even
+//     moments after a successful login, which reads exactly like a stale
+//     credential and sends the operator to re-authenticate for nothing.
+//   - On the domestic site the business endpoints accept the access token
+//     itself; the capture shows every getCustomerInfo and api_keys call carrying
+//     it directly and answering 200 (session 20261004-085036_a4f2e8). There is no
+//     second token to obtain, and looking for one would record an exchange
+//     failure on a perfectly good login.
+//
+// The plugin therefore keeps both where the site has both: the OAuth token as the
+// renewable exchange material (it carries an exp claim), and the exchanged
+// business token as the material that calls the business API.
 
 // businessTokenRefreshSkew is how long before its stated expiry a cached
 // business token is treated as expired. The upstream rejects an expired token
@@ -223,22 +231,30 @@ func (s *businessTokenState) put(identity, sourceToken string, token businessTok
 	s.entries[identity] = cachedBusinessToken{SourceToken: sourceToken, Token: token}
 }
 
-// resolveBusinessToken returns a usable Z.AI business token for one auth
-// document, exchanging the OAuth token when no cached one is inside its window.
+// resolveBusinessToken returns a usable business token for one auth document,
+// exchanging the OAuth token when the site requires it and no cached one is
+// inside its window.
 //
 // The three sources are tried in order of cost: the in-memory cache, the token
 // persisted on the document, and finally the exchange itself. Only the exchange
 // is a network call, so a warm plugin performs none.
 //
+// A site whose business endpoints accept the access token directly skips all of
+// it: there is nothing to exchange and nothing to cache, so the cheapest correct
+// answer is the material the login already produced.
+//
 // Every failure mode — absent OAuth material, an exchange the upstream refuses,
 // an unparsable answer — collapses to errZaiOAuthRequired, because each of them
 // means the same actionable thing to the user and none of them should be
 // mistaken for a business-endpoint rejection.
-func resolveBusinessToken(ctx context.Context, client *http.Client, identityID string, doc []byte, now time.Time) (string, error) {
+func resolveBusinessToken(ctx context.Context, client *http.Client, identityID string, doc []byte, profile siteProfile, now time.Time) (string, error) {
 	material := readOAuthMaterial(doc)
 	accessToken := material.AccessToken
 	if accessToken == "" {
 		return "", errZaiOAuthRequired
+	}
+	if !profile.ExchangesBusinessToken {
+		return accessToken, nil
 	}
 	if cached, ok := activeBusinessTokens.get(identityID, accessToken, now); ok {
 		return cached.Token, nil
@@ -248,7 +264,7 @@ func resolveBusinessToken(ctx context.Context, client *http.Client, identityID s
 		return cached.Token, nil
 	}
 
-	token, err := exchangeBusinessTokenWithExpiry(ctx, client, accessToken)
+	token, err := exchangeBusinessTokenWithExpiry(ctx, client, accessToken, profile)
 	if err != nil {
 		return "", err
 	}
@@ -256,19 +272,34 @@ func resolveBusinessToken(ctx context.Context, client *http.Client, identityID s
 	return token.Token, nil
 }
 
-// exchangeBusinessTokenWithExpiry trades the OAuth access token for a Z.AI
-// business token and reads the lifetime the upstream states.
+// businessTokenFor returns the credential the site's business endpoints accept,
+// together with the lifetime that goes with it.
+//
+// It is the one place that answers "does this site need an exchange?", so the key
+// exchange, the recording step, and the resolver cannot disagree about it: three
+// callers answering that question separately is how a site ends up being sent to
+// a login endpoint it does not have. A directly-issued token carries no stated
+// expiry, so its lifetime is the zero instant — usable now, never cached.
+func businessTokenFor(ctx context.Context, client *http.Client, accessToken string, profile siteProfile) (businessToken, error) {
+	if !profile.ExchangesBusinessToken {
+		return businessToken{Token: accessToken}, nil
+	}
+	return exchangeBusinessTokenWithExpiry(ctx, client, accessToken, profile)
+}
+
+// exchangeBusinessTokenWithExpiry trades the OAuth access token for a business
+// token and reads the lifetime the upstream states.
 //
 // The upstream answers business outcomes inside HTTP 200 as readily as in 4xx,
 // so the envelope's own code decides success rather than the status. A response
 // whose code is absent or successful and whose success flag is not false is
 // accepted; anything else is a refusal and becomes errZaiOAuthRequired.
-func exchangeBusinessTokenWithExpiry(ctx context.Context, client *http.Client, accessToken string) (businessToken, error) {
+func exchangeBusinessTokenWithExpiry(ctx context.Context, client *http.Client, accessToken string, profile siteProfile) (businessToken, error) {
 	payload, err := json.Marshal(map[string]string{"token": accessToken})
 	if err != nil {
 		return businessToken{}, errZaiOAuthRequired
 	}
-	body, err := managedKeyRequest(ctx, client, http.MethodPost, zaiBizLoginURL(), payload, "")
+	body, err := managedKeyRequest(ctx, client, http.MethodPost, siteBusinessLoginURL(profile), payload, "")
 	if err != nil {
 		return businessToken{}, errZaiOAuthRequired
 	}

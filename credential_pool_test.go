@@ -116,7 +116,7 @@ func TestPoolKeepsRecordsTheSnapshotSaysNothingAbout(t *testing.T) {
 	if len(candidates) != 1 {
 		t.Fatalf("candidates = %d, want the record kept", len(candidates))
 	}
-	if !candidateEligibility(candidates[0], "GLM-5.3-Flash").Eligible {
+	if !candidateEligible(candidates[0], "GLM-5.3-Flash") {
 		t.Fatal("a record with no snapshot reading was excluded")
 	}
 }
@@ -136,11 +136,11 @@ func TestPoolExcludesRecordsWithNoAllowanceForTheModel(t *testing.T) {
 	for _, candidate := range candidates {
 		switch candidate.AuthIndex {
 		case "auth-spent":
-			if candidateEligibility(candidate, "GLM-5.3-Flash").Eligible {
+			if candidateEligible(candidate, "GLM-5.3-Flash") {
 				t.Fatal("a record whose allowance for this model is spent is still eligible")
 			}
 		case "auth-funded":
-			if !candidateEligibility(candidate, "GLM-5.3-Flash").Eligible {
+			if !candidateEligible(candidate, "GLM-5.3-Flash") {
 				t.Fatal("a funded record was excluded from the pool")
 			}
 		}
@@ -178,8 +178,10 @@ func TestPoolIgnoresForeignAndCredentiallessRecords(t *testing.T) {
 	}
 }
 
-// Acceptance criterion 8: a cross-record replay is allowed only for the verdict
-// classes that name the credential, never for a request-level rejection.
+// Acceptance criterion 8: a cross-record replay is allowed only for a definite
+// pre-output allowance verdict — exhausted or plan-expired — because those are
+// the only conclusions another record's entitlement can cure. Every other
+// failure class, credential-level ones included, must not cross accounts.
 func TestCrossRecordReplayIsRefusedForRequestLevelRejections(t *testing.T) {
 	plan := ResolvedProfile{Record: "auth-a", Route: resolvedRoute{BillingDomain: billingPlanEntitlement}}
 	other := ResolvedProfile{Record: "auth-b", Route: resolvedRoute{BillingDomain: billingPlanEntitlement}}
@@ -188,8 +190,11 @@ func TestCrossRecordReplayIsRefusedForRequestLevelRejections(t *testing.T) {
 		class   failureClass
 		allowed bool
 	}{
-		{name: "exhausted is a credential verdict", class: failureExhausted, allowed: true},
-		{name: "an invalid credential is a credential verdict", class: failureInvalid, allowed: true},
+		{name: "exhausted is an allowance verdict", class: failureExhausted, allowed: true},
+		{name: "an expired plan is an allowance verdict", class: failurePlanExpired, allowed: true},
+		{name: "an invalid credential is not an allowance verdict", class: failureInvalid},
+		{name: "a verification block is not an allowance verdict", class: failureVerificationBlocked},
+		{name: "a cooldown is not an allowance verdict", class: failureCooldown},
 		{name: "3012 is a request verdict", class: failureRejected},
 		{name: "a network failure is neither", class: failureUnavailable},
 	}

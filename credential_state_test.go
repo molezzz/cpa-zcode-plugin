@@ -19,10 +19,12 @@ import (
 const testAPIKeyMaterial = "key-1.secret-material"
 
 // testFallbackDoc is an auth document whose identity holds both credential
-// forms: an active JWT and the plugin-managed fallback key.
+// forms: an active JWT and the plugin-managed fallback key. It carries the site
+// field login writes, so a steady-state assertion here is about conclusions
+// rather than about the one-time migration of a record that predates it.
 func testFallbackDoc(jwtStatus, apiKeyStatus string) []byte {
 	return []byte(`{"type":"zcode","other":"host-owned","zcode":{` +
-		`"identity_id":"zcode-user-1",` +
+		`"identity_id":"zcode-user-1","site":"` + siteZai + `",` +
 		`"jwt":{"token":"` + testJWT + `","status":"` + jwtStatus + `"},` +
 		`"api_key":{"status":"` + apiKeyStatus + `","managed":true,` +
 		`"key_id":"key-1","key_material":"` + testAPIKeyMaterial + `"}}}`)
@@ -225,7 +227,7 @@ func runFallbackAttempt(t *testing.T, doc []byte, forwarder *recordingForwarder)
 	scope.Primary = plan.Primary
 	if snap, snapErr := readCredentialSnapshot(doc); snapErr == nil {
 		scope.SkipBlockStatus, scope.SkipBlockRetry, scope.SkipBlockModel =
-			skipBlockConclusion(doc, snap, plan.SkipBlockStatus, "", fixedNow())
+			skipBlockConclusion(snap, plan.SkipBlockStatus, "", fixedNow())
 	}
 	if plan.Failure != nil {
 		return plan.Failure, nil, recorder
@@ -675,7 +677,7 @@ func TestDowngradedRequestsDoNotSlideTheRetryWindow(t *testing.T) {
 	var first time.Time
 	for _, elapsed := range []time.Duration{time.Minute, 2 * time.Minute, 3 * time.Minute} {
 		now := blockedAt.Add(elapsed)
-		status, retry, _ := skipBlockConclusion(doc, snap, jwtStatusVerificationBlocked, "", now)
+		status, retry, _ := skipBlockConclusion(snap, jwtStatusVerificationBlocked, "", now)
 		if status != jwtStatusVerificationBlocked {
 			t.Fatalf("status = %q, want the blocked state preserved", status)
 		}
@@ -712,7 +714,7 @@ func TestUnknownSkipStatusRecordsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, retry, model := skipBlockConclusion(doc, snap, "a_status_this_build_does_not_know", "", fixedNow())
+	status, retry, model := skipBlockConclusion(snap, "a_status_this_build_does_not_know", "", fixedNow())
 	if status != "" || !retry.IsZero() || model != "" {
 		t.Fatalf("an unknown precondition recorded %q with window %v and model %q, want nothing", status, retry, model)
 	}

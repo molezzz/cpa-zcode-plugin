@@ -115,6 +115,13 @@ type credentialSnapshot struct {
 	IdentityID string
 	JWTToken   string
 	JWTStatus  string
+	// Site is the site this credential was authorized against. A document written
+	// before the dual-site split reads as the international site, which is the
+	// only site that could have produced it. It is carried here rather than
+	// re-read at each use so that every consumer of one snapshot agrees on the
+	// site — the snapshot is the single read of the document a request is planned
+	// from.
+	Site string
 	// JWTRetryAfter is the recorded retry window of a windowed JWT state; an
 	// elapsed window means the JWT is usable again.
 	JWTRetryAfter string
@@ -138,6 +145,7 @@ func readCredentialSnapshot(doc []byte) (credentialSnapshot, error) {
 	var root struct {
 		Zcode struct {
 			IdentityID string `json:"identity_id"`
+			Site       string `json:"site"`
 			JWT        struct {
 				Token      string            `json:"token"`
 				Status     string            `json:"status"`
@@ -163,6 +171,7 @@ func readCredentialSnapshot(doc []byte) (credentialSnapshot, error) {
 		APIKeyStatus:     normalizeStatus(root.Zcode.APIKey.Status),
 		APIKeyRetryAfter: strings.TrimSpace(root.Zcode.APIKey.RetryAfter),
 		ModelQuota:       readModelQuota(root.Zcode.JWT.ModelQuota),
+		Site:             recordedSite(root.Zcode.Site),
 	}
 	if snap.JWTToken == "" && snap.APIKeyToken == "" {
 		return credentialSnapshot{}, errNoCredential
@@ -207,19 +216,35 @@ func readModelQuota(raw map[string]string) map[string]string {
 // out of service for a model whose buckets came back hours ago, which is the same
 // failure this whole change exists to remove.
 func (s credentialSnapshot) modelQuotaBlocked(model string, now time.Time) bool {
+	until, ok := s.modelQuotaWindow(model)
+	if !ok {
+		return false
+	}
+	return modelQuotaPending(until, now)
+}
+
+// modelQuotaWindow reads the raw deadline recorded against one model's block.
+// The second result is false when the model has no entry at all, which is a
+// different fact from an entry that records the deadline-less sentinel: the
+// first says this model was never blocked, the second says it was and that the
+// upstream gave no window. The caller that only asks "is it blocked" treats both
+// as pending-or-absent through modelQuotaPending, while a re-assertion has to
+// carry the stored value through so it does not overwrite a real deadline with
+// the sentinel.
+func (s credentialSnapshot) modelQuotaWindow(model string) (string, bool) {
 	target := normalizeRequestModel(model, nil)
 	if until, ok := s.ModelQuota[target]; ok {
-		return modelQuotaPending(until, now)
+		return strings.TrimSpace(until), true
 	}
 	// A caller may spell the model differently from the spelling recorded by the
 	// conclusion that blocked it, so the lookup falls back to a case-insensitive
 	// match rather than to no conclusion at all.
 	for recorded, until := range s.ModelQuota {
 		if strings.EqualFold(recorded, target) {
-			return modelQuotaPending(until, now)
+			return strings.TrimSpace(until), true
 		}
 	}
-	return false
+	return "", false
 }
 
 // modelQuotaPending reports whether a recorded per-model deadline still holds the

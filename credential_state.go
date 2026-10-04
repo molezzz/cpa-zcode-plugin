@@ -329,7 +329,20 @@ func (r *credentialStateRecorder) lockIdentity(ref credentialRef) func() {
 // reports whether anything changed. Every section is written from the same
 // read of the document, so one attempt can never interleave a stale JWT write
 // with a fresh API key write.
+//
+// The credential's site is re-pinned on the way through. It is fixed at login,
+// and a refresh that dropped it would leave the record reading as the
+// international site by default — so a domestic account would quietly start
+// spending its key material against the wrong origin.
+//
+// The pin carries the site's resolved value rather than its raw stored one,
+// because that is what makes the migration happen at all: a record predating the
+// split has no stored site and resolves to the international one, so pinning the
+// stored value would find nothing to migrate and write nothing. Pinning the value
+// a document already carries is still a no-op, so a steady stream of requests
+// does not churn the file.
 func applyCredentialState(doc []byte, conclusions []recordedState, now time.Time) ([]byte, bool, error) {
+	site := readCredentialSite(doc)
 	var before, after []byte
 	patched, err := patchZcodeNamespace(doc, func(zcode map[string]any) error {
 		before = renderNamespace(zcode)
@@ -342,6 +355,14 @@ func applyCredentialState(doc []byte, conclusions []recordedState, now time.Time
 	if err != nil {
 		return nil, false, err
 	}
+	pinned, err := pinCredentialSite(patched, site)
+	if err != nil {
+		return nil, false, err
+	}
+	// The pin counts as a change even when no conclusion did: it is the one
+	// write this path makes that no credential conclusion asked for.
+	materialized := !bytes.Equal(patched, pinned)
+	patched = pinned
 	if snap, err := readCredentialSnapshot(doc); err == nil && (snap.JWTToken != "" || snap.APIKeyToken != "") {
 		if patchedSnap, err := readCredentialSnapshot(patched); err != nil ||
 			(patchedSnap.JWTToken == "" && patchedSnap.APIKeyToken == "") {
@@ -351,7 +372,7 @@ func applyCredentialState(doc []byte, conclusions []recordedState, now time.Time
 			return nil, false, errCredentialMaterialLost
 		}
 	}
-	return patched, !bytes.Equal(before, after), nil
+	return patched, materialized || !bytes.Equal(before, after), nil
 }
 
 // applyStateSection merges one credential's conclusion into the zcode

@@ -12,11 +12,48 @@ CPA/CLIProxyAPI 与 Provider 插件之间的稳定 ABI 和回调契约。插件�
 
 ## ZCode 凭证
 
-通过 Z.AI OAuth 登录获得并由插件持有的上游身份材料。当前已知形式包括 Coding Plan JWT、登录时发放的 OAuth access token，以及由该 access token 兑换得到的 Z.AI 业务 token 和可由业务 token 创建的 Z.AI API Key；它们属于同一个上游身份的不同凭证形式，而不是靠字符串格式猜测的"账号类型"。
+通过 Z.AI OAuth 登录获得并由插件持有的上游身份材料。当前已知形式包括 Coding Plan JWT、登录时发放的 OAuth access token，以及由该 access token 兑换得到的 Z.AI 业务 token 和可由业务 token 创建的 Z.AI API Key；它们属于同一个上游身份的不同凭证形式，而不是靠字符串格式猜测的"账号类型"。登录可以发生在两个站点上，见「站点 Profile」。
+
+## 站点 Profile
+
+一个人可以同时持有**国际站（z.ai）**与**国内站（bigmodel.cn）**两个账号，两站的 Start Plan 权益各自独立、互不相通。官方 CLI 协议用同一对端点服务两站，唯一区别是 INIT 请求体里的 `provider` 字段（`zai` / `bigmodel`），以及 ready 包络里**以该 provider 命名**的 access token 键（`data.zai.access_token` / `data.bigmodel.access_token`）。协议其余部分完全相同：同一个 `zcode.z.ai` 网关、同一个 `data.token`（Start Plan JWT）、同一个 `data.user.user_id`、同一个客户端生成并回显的 `poll_token`。
+
+`siteProfile`（`site_profile.go`）是这些差异的收敛点：命名站点的 provider 串、access token 键名、业务 API origin、是否二次兑换、以及宿主侧 label 都只能从这里取，别处不得自行命名。两站真实不同的就是这五项，没有第六项。
+
+最后一处是行为上的分水岭：国际站把 access token 发给身份服务，`api.z.ai` 业务接口只认换来的业务 token，直接用 access token 会在登录成功后数分钟内得到 401，读起来与凭证过期完全一致；国内站的 `bigmodel.cn` 业务接口**直接接受 access token**（抓包会话 `20261004-085036_a4f2e8` 中每次 `getCustomerInfo` 与 `api_keys` 都带该 token 且返回 200）。因此国内站不存在"需要兑换"的业务 token，在它上面执行一次兑换只会白花一次调用，并把一次好登录报成失败。
+
+两站业务接口的**路径相同、origin 不同**（`/api/biz/customer/getCustomerInfo`、`/api/biz/v1/organization/<org>/projects/<proj>/api_keys` 及其 `/copy/<key>`），所以路径共享、只按 profile 选 origin。
+
+**绝不混用**：`data[site].access_token` 按本次登录的站点解析，只认自己那一把键——只带另一站 token 的包络必须读出空，而不是借用。拿一站的材料去另一站会被上游按无效凭证拒绝，且没有任何线索说明错在哪一站。非法/未知 provider 值**直接拒绝登录**，绝不猜站。
+
+## 登录站点选择
+
+站点选择有两种入口，语义不同：
+
+- **管理页**在页头提供两个登录按钮（"国际站 z.ai 登录" / "国内站 bigmodel 登录"，动作 `oauth_login`），并为每张账号卡片提供**本站**的"重新授权"。管理页的 `oauth_retry` **必须显式携带 `site`**：重新授权若自己挑一个站，可能把一张国内站凭证换成国际站登录，而账号看上去一切正常，直到每个请求都失败。
+- **宿主原生** `auth.login.start` 不携带站点，因此按配置项 `oauth.default_site`（未配置即 `zai`，即该选项出现前唯一存在过的登录源）。非法值**拒绝登录**并报 `invalid_config`，不回落——否则配置里一个拼写错误会让每次原生登录都静默地去另一站。
+
+管理页的站点选择只作用于本次登录，不读也不改配置默认值，因此持有双站账号的操作者永远不依赖默认值。站点值**精确匹配、不做大小写折叠**：它是上游 provider 选择器而非展示名，`BigModel` 不是上游接受的拼写，报错比悄悄去另一站更有用。
+
+## 分站存储与迁移
+
+每张 auth 文档的 `zcode` 命名空间顶层固化 `site` 字段，**登录时写入一次**，quota/plan 刷新与状态写入时**回钉**——它是"这张账号是在哪一站授权的"这一事实，不是每次刷新重新得出的观察。
+
+**没有 `site` 字段的既有凭证读作 `zai`**：双站拆分之前插件只有国际站一个登录源，现网没有别的来源，所以这是唯一可能成立的读法，不需要任何用户操作。迁移在**下一次状态写入**时物化该字段（这是唯一一次不由任何凭证结论发起的写入），因此"零用户操作"成立——存量凭证在第一次写状态时就带上 `site: "zai"`。
+
+回钉比较的是**已存储的值**而不是文档**读出来的值**，这一点决定迁移是否真的发生：旧文档读出来已经是 `zai`，拿读出来的值去回钉会判定相等而永不写入。反过来，已经带站点的记录回钉自己那个值是 no-op，所以稳定流量不会每请求重写一次宿主 auth 文件。
+
+identity 派生不变（`data.user.user_id` / JWT `sub`），两站身份天然不同（国内站 subject 是 17 位数值，国际站是 UUID），各自成文件；管理面按 site 标注每个账号，宿主侧 label 也带站点（`ZCode (Z.AI)` / `ZCode (BigModel)`）。
+
+## 跨站调度
+
+两站的 Start Plan JWT 都打到同一个 `zcode.z.ai/api/v1/zcode-plan/anthropic` 网关，`billing/balance` 同理——**执行层无需按站分流 URL**。#24 的凭证池因此无需改动：bigmodel 的记录（含 `trust-*` one_time 与 0817 日桶）自动参与"非 0817 优先、0817 最后"的既有排序，跨站记录之间按同一条顺序规则调度，单 record 内多 bucket 仍由上游选择。
 
 ## 业务 token
 
-由 OAuth access token 经 `POST /api/auth/z/login` 兑换所得的 Z.AI 业务凭证，是访问 `api.z.ai` 业务接口（订阅、额度、用量）的唯一有效形式。OAuth access token 本身不是业务凭证：直接使用会在登录后数分钟内得到 401，读起来与凭证过期完全一致。插件同时保存两者——access token 是可续期的兑换原料，业务 token 是按其声明的 `expires_in` 缓存的调用凭证，并预留过期 skew 以免在请求途中失效。兑换失败只意味着需要重新登录，不影响 Coding Plan JWT 本身。
+国际站：由 OAuth access token 经 `POST /api/auth/z/login` 兑换所得的 Z.AI 业务凭证，是访问 `api.z.ai` 业务接口（订阅、额度、用量）的唯一有效形式。OAuth access token 本身不是业务凭证：直接使用会在登录后数分钟内得到 401，读起来与凭证过期完全一致。插件同时保存两者——access token 是可续期的兑换原料，业务 token 是按其声明的 `expires_in` 缓存的调用凭证，并预留过期 skew 以免在请求途中失效。兑换失败只意味着需要重新登录，不影响 Coding Plan JWT 本身。
+
+国内站：**没有第二枚 token**，access token 即业务凭证（见「站点 Profile」）。因此国内站凭证不记录 `business_token` 字段——把从未发生过的兑换结果记进文档，只会让管理页把一份好凭证报成异常。
 
 ## 客户端版本声明
 
@@ -58,6 +95,8 @@ Z.AI 在响应体中给出的业务结论（`code` 与 `msg`），与 HTTP 状�
 一条上游路由描述一次 Messages 请求发往哪里、花谁的钱：路由标识、实际 URL、认证形态、计费/权益域，以及该 URL 是否为网关改写产物。路由在 Profile 构造处由唯一的 route resolver 解析；执行器只依据已解析的路由做回退兼容性决策，错误分类器不推测服务端成因。
 
 Start Plan JWT 走官方客户端同一的直连 `zcode-plan` Anthropic 路径，花 Coding Plan 权益；受管 API Key 走 Z.AI 业务 Anthropic 路径，花账号 API 余额。两者是不同的计费域。官方对 API-key Coding Plan 存在精确网关改写（exact-match scheme/host/port/path，保留 query、方法、body 与认证头，仅去除显式 Host），但该网关的真实计费域与 wire 契约未经授权差分抓包证实，因此改写表保持为空、适配器不启用；JWT 直连路径永不改写。
+
+两站共用这两条路由：两站的 Start Plan JWT 都打到同一个 `zcode.z.ai/api/v1/zcode-plan/anthropic` 网关（官方 `zcode-builtin.json` 中 `account:bigmodel-start-plan` 与 `account:zai-start-plan` 的 `api.baseUrl` 字面相同），`billing/balance` 同理。因此路由解析**不按站分流 URL**——站点只决定登录与业务 API 的 origin，不决定 Messages 打向哪里。
 
 跨计费域的回退只允许给"关于凭证或其可用性"的结论：验证受阻、鉴权失效、额度耗尽、套餐过期、临时冷却——这些是另一张凭证能解决的。请求级拒绝（`invalid_request`、计划访问拒绝等）不允许跨域重放：另一张凭证解决不了请求本身的问题，而重放会静默消耗另一个计费域的额度。该允许清单是封闭的：新的失败类别必须显式列入才能跨域。
 
@@ -130,6 +169,8 @@ OAuth ready 之后、**写入宿主 auth store 之前**，用候选 JWT 调一�
 **预检绝不产生第二枚 JWT**。一个 JWT 覆盖三个 plan 就是一个 JWT、存一次；plan 是上游的数据，只在管理面显示。也不因当前桶为 0 而拒绝——那是额度问题，不是凭证无效。
 
 快照持久化在 `zcode.plan`，只含产品 id、每模型额度与恢复时刻、计划实例的**摘要**。`user_plan_id` 是账号范围的持久标识，管理面与日志都给人看，所以只存域分隔摘要；原始账号 id 同样只存摘要（`zcode.login.user_id_hash`）。这些都不进诊断行。
+
+**已知的现存例外**（#25 复核记录，非本期引入）：`zcode.identity_id` 是 `zcode-<JWT sub>` 的**原文**（国内站即 17 位数值账号 id），它进管理面 `accountView.IdentityID` 与宿主账号 id。它是宿主侧的账号主键，去掉就没法把 auth 文档与宿主账号对上；#25 的 AC4 写的是"原始 user_id 不出现"，字面上与之冲突。**实际记录的只有派生的 identity_id**：`zcode.login.user_id_hash` 存的才是原始 id 的摘要。
 
 ## Start Plan 凭证池
 

@@ -1458,6 +1458,24 @@ func resolveQuotaScope(authIndex string, storageJSON []byte, store AuthStore, cf
 	return scope, scope.JWT != "", nil
 }
 
+// quotaIdentityDiag renders the record's account identity for one diagnostic
+// line. It is always the digest, never the raw value: IdentityID is derived from
+// the JWT's own identity claim, which for a short claim is the account's raw
+// upstream id, and a debug line is written to the host process log where it
+// would outlive the refresh that produced it.
+func quotaIdentityDiag(identityID string) string {
+	identityID = strings.TrimSpace(identityID)
+	if identityID == "" {
+		return "(none)"
+	}
+	return identityDigestOf(quotaIdentityDigestDomain, identityID)
+}
+
+// quotaIdentityDigestDomain domain-separates the quota-refresh identity digest
+// from the login-identity and plan-instance digests, so the same value hashed
+// for two purposes never produces the same string.
+const quotaIdentityDigestDomain = "cpa-zcode-plugin/quota-identity/v1"
+
 // runQuotaRefresh fetches, decides, records, and caches one account's quota.
 // The returned evidence is sanitized and safe to embed in management
 // responses. State conclusions land through the shared credential recorder,
@@ -1476,7 +1494,7 @@ func runQuotaRefresh(ctx context.Context, store AuthStore, scope quotaRefreshSco
 		scope.AuthIndex, balanceURL(scope.AppVersion), evidence.Verdict, evidence.Reason,
 		evidence.Plan, diagPlanSummary(evidence.Plans), diagBalanceSummary(evidence.Balances))
 	diagf("plan_snapshot auth=%s identity=%s readable=%v last_priority=%v plans=[%s] models=[%s]",
-		scope.AuthIndex, scope.IdentityID, snapshot.Readable, snapshot.isLastPriority(currentConfig()),
+		scope.AuthIndex, quotaIdentityDiag(scope.IdentityID), snapshot.Readable, snapshot.isLastPriority(currentConfig()),
 		strings.Join(snapshot.startPlanIDs(), " "), diagModelAllowance(snapshot))
 	if failure := evidence.AuthFailure; failure != nil {
 		diagf("quota auth=%s auth_failure upstream_status=%d class=%s code=%s msg=%q",

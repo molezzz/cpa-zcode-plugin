@@ -139,7 +139,15 @@ func (f *managementFixture) addAccountOnly(t *testing.T, authIndex, identityID, 
 // callAction serves one action POST directly and decodes the JSON body.
 func (f *managementFixture) callAction(t *testing.T, action, authIndex string) (int, map[string]any) {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{"action": action, "auth_index": authIndex})
+	return f.callSiteAction(t, action, authIndex, "")
+}
+
+// callSiteAction is callAction with an explicit site. oauth_retry requires one:
+// the recovery has to know which site's account it is re-authorizing, so the
+// tests that exercise it use this rather than the two-argument form.
+func (f *managementFixture) callSiteAction(t *testing.T, action, authIndex, site string) (int, map[string]any) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"action": action, "auth_index": authIndex, "site": site})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1152,7 +1160,7 @@ func TestOAuthRetryStartsSessionAndCompletesThroughPlugin(t *testing.T) {
 	newToken := makeJWT(t, map[string]any{"sub": "retry-user", "exp": 9999999999})
 	oauth.queuePollReady(newToken)
 
-	status, data := fixture.callAction(t, actionOAuthRetry, "auth-retry")
+	status, data := fixture.callSiteAction(t, actionOAuthRetry, "auth-retry", siteZai)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d body %v, want 200", status, data)
 	}
@@ -1213,7 +1221,7 @@ func TestOAuthRetryUpstreamFailureIsSanitized(t *testing.T) {
 	fixture.accountDoc(t, "auth-retry2", "zcode-retry2-user", "active", "")
 
 	oauth.initStatus = http.StatusInternalServerError
-	status, data := fixture.callAction(t, actionOAuthRetry, "auth-retry2")
+	status, data := fixture.callSiteAction(t, actionOAuthRetry, "auth-retry2", siteZai)
 	if status != http.StatusBadGateway {
 		t.Fatalf("status = %d body %v, want 502", status, data)
 	}

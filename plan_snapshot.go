@@ -75,16 +75,16 @@ type StartPlanSnapshot struct {
 	Readable bool
 	// Plans are the plan rows the upstream described, in its own order. It is
 	// empty on a snapshot rebuilt from a persisted section, which carries only
-	// product ids — so the scheduling policy reads PlanIDs and LastTried rather
+	// product ids — so the scheduling policy reads PlanIDs and LastPriority rather
 	// than depending on plan rows being present.
 	Plans []quotaPlan
 	// PlanIDs are the live Start Plan products this credential holds, as the
 	// upstream named them. It is the only plan fact a persisted section carries.
 	PlanIDs []string
-	// LastTried is the scheduling decision already made for this credential's plan,
-	// so a snapshot rebuilt from a persisted section keeps it without re-deriving
-	// it from plan rows it does not have.
-	LastTried bool
+	// LastPriority is the scheduling decision already made for this credential's
+	// plan, so a snapshot rebuilt from a persisted section keeps it without
+	// re-deriving it from plan rows it does not have.
+	LastPriority bool
 	// Buckets are the Start Plan balance rows, in the upstream's order, which
 	// is its priority order.
 	Buckets []startPlanBucket
@@ -330,7 +330,7 @@ func (s StartPlanSnapshot) startPlanIDs() []string {
 	return ids
 }
 
-// startsWithLastPriority reports whether this snapshot's Start Plan is one the
+// isLastPriority reports whether this snapshot's Start Plan is one the
 // configuration reserves for last resort.
 //
 // The decision is made on the product id alone. It is tempting to also read the
@@ -347,7 +347,7 @@ func (s StartPlanSnapshot) isLastPriority(cfg Config) bool {
 	if len(ids) == 0 {
 		// A rebuilt snapshot with no plan ids keeps the decision it was stored
 		// with rather than guessing one.
-		return s.LastTried
+		return s.LastPriority
 	}
 	for _, id := range ids {
 		if !containsPlanID(last, id) {
@@ -378,13 +378,12 @@ func containsPlanID(ids []string, id string) bool {
 // planInstanceRef derives, which is all an operator needs to tell two plans of
 // one account apart.
 type planSnapshotSection struct {
-	CheckedAt  string               `json:"checked_at"`
-	Readable   bool                 `json:"readable"`
-	PlanIDs    []string             `json:"plan_ids,omitempty"`
-	Instances  []string             `json:"plan_instances,omitempty"`
-	Models     map[string]modelLine `json:"models,omitempty"`
-	LastTried  bool                 `json:"last_priority,omitempty"`
-	ReasonCode string               `json:"reason,omitempty"`
+	CheckedAt    string               `json:"checked_at"`
+	Readable     bool                 `json:"readable"`
+	PlanIDs      []string             `json:"plan_ids,omitempty"`
+	Instances    []string             `json:"plan_instances,omitempty"`
+	Models       map[string]modelLine `json:"models,omitempty"`
+	LastPriority bool                 `json:"last_priority,omitempty"`
 }
 
 // modelLine is one model's standing in a persisted snapshot.
@@ -405,9 +404,9 @@ type modelLine struct {
 // sync.
 func renderPlanSnapshot(snapshot StartPlanSnapshot, cfg Config) planSnapshotSection {
 	section := planSnapshotSection{
-		CheckedAt: snapshot.CheckedAt.UTC().Format(time.RFC3339),
-		Readable:  snapshot.Readable,
-		LastTried: snapshot.isLastPriority(cfg),
+		CheckedAt:    snapshot.CheckedAt.UTC().Format(time.RFC3339),
+		Readable:     snapshot.Readable,
+		LastPriority: snapshot.isLastPriority(cfg),
 	}
 	if !snapshot.Readable {
 		return section
@@ -547,8 +546,14 @@ func readPlanSnapshotSection(doc []byte) planSnapshotSection {
 // writePlanSnapshotSection records a snapshot on a credential document. It
 // patches rather than replaces, so a document's host-owned fields and every
 // other plugin field survive untouched.
+//
+// The credential's site is re-pinned alongside the snapshot. A plan refresh is
+// one of the two write paths that run on a record's own schedule, and the site
+// belongs to the account rather than to either write — so this is where a record
+// that predates the site field gains one even if no credential state has ever
+// changed.
 func writePlanSnapshotSection(doc []byte, section planSnapshotSection) ([]byte, error) {
-	return patchZcodeNamespace(doc, func(zcode map[string]any) error {
+	patched, err := patchZcodeNamespace(doc, func(zcode map[string]any) error {
 		rendered, err := json.Marshal(section)
 		if err != nil {
 			return err
@@ -560,4 +565,8 @@ func writePlanSnapshotSection(doc []byte, section planSnapshotSection) ([]byte, 
 		zcode["plan"] = value
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return pinCredentialSite(patched, readCredentialSite(doc))
 }

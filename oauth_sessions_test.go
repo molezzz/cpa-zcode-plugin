@@ -30,7 +30,7 @@ func newTestSession(t *testing.T, m *sessionManager, flowID string) (*authSessio
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := m.create(flowID, "https://zcode.z.ai/authorize?flow="+flowID, secret, newSessionHTTPClient(defaultConfig()), time.Duration(defaultConfig().OAuth.SessionTTLSeconds)*time.Second)
+	session, err := m.create(flowID, "https://zcode.z.ai/authorize?flow="+flowID, secret, newSessionHTTPClient(defaultConfig()), time.Duration(defaultConfig().OAuth.SessionTTLSeconds)*time.Second, siteZai)
 	if err != nil {
 		t.Fatal(err)
 	}

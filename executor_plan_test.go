@@ -25,6 +25,10 @@ type planFixture struct {
 	mu           sync.Mutex
 	balance      string
 	billingCalls int
+	// billingDevices are the X-Device-Mid values the billing endpoint saw, in
+	// order. A request-path refresh must present the credential's own device, so
+	// the test asserts on what actually reached the wire.
+	billingDevices []string
 }
 
 // billingRequests counts the billing reads, so a test can assert that a
@@ -33,6 +37,13 @@ func (f *planFixture) billingRequests() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.billingCalls
+}
+
+// billingDeviceIDs returns the device identities the billing endpoint saw.
+func (f *planFixture) billingDeviceIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.billingDevices...)
 }
 
 func newPlanFixture(t *testing.T, scripts ...upstreamScript) *planFixture {
@@ -44,10 +55,11 @@ func newPlanFixture(t *testing.T, scripts ...upstreamScript) *planFixture {
 		balance:  startPlanBalanceBody,
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc(billingBalancePath, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(billingBalancePath, func(w http.ResponseWriter, r *http.Request) {
 		fixture.mu.Lock()
 		body := fixture.balance
 		fixture.billingCalls++
+		fixture.billingDevices = append(fixture.billingDevices, r.Header.Get(deviceMidHeader))
 		fixture.mu.Unlock()
 		writeBilling(w, 0, body)
 	})
@@ -658,6 +670,34 @@ func withDeviceID(doc []byte, id string) []byte {
 		panic(err)
 	}
 	return raw
+}
+
+// The request-path refresh re-reads the balance for the credential the request is
+// running on, so it must present that credential's own device. On the
+// host-selected path there is no document to derive one from, and a fresh random
+// id would describe a second installation to the endpoint that just confirmed
+// the entitlement — the same-origin rule the Messages path already keeps.
+func TestHostSelectedRefreshPresentsTheCredentialsOwnDevice(t *testing.T) {
+	fixture := newPlanFixture(t, upstreamScript{frames: completeAnthropicSSE()})
+	const device = "33333333-3333-4333-8333-333333333333"
+	doc := planDoc(t, "zcode-refresh-device", map[string]int{"GLM-5.2": 0})
+	doc = withDeviceID(doc, device)
+	doc = withModelQuota(t, doc, "GLM-5.2", time.Now().Add(time.Hour))
+	addFakeAccount(t, fixture.store, "auth-1", "zcode-refresh-device", string(doc))
+	// The model is recorded as blocked, so the request triggers the refresh; the
+	// balance then reports it funded, so the JWT serves the request. Either way the
+	// refresh has run by the time the request returns.
+	fixture.setBalance(`{"code":0,"success":true,"data":{"plans":[{"name":"ZCode V3 Start Plan","plan_id":"zcode-v3-start-plan-trust-1003","user_plan_id":"p","status":"active"}],"balances":[{"show_name":"GLM-5.2","plan_id":"zcode-v3-start-plan-trust-1003","user_plan_id":"p","capabilities":["model:glm-5.2"],"remaining_units":40}]}}`)
+
+	callMethod(t, "executor.execute", executorRequestJSON(t, doc, glm52Payload(), "", nil))
+
+	devices := fixture.billingDeviceIDs()
+	if len(devices) != 1 {
+		t.Fatalf("billing reads = %v, want exactly one from the refresh", devices)
+	}
+	if devices[0] != device {
+		t.Fatalf("refresh presented device %q, want the credential's own %q", devices[0], device)
+	}
 }
 
 // A pooled record's own exhaustion is recorded on that record, read from that

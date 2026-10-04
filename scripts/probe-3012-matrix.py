@@ -78,7 +78,7 @@ def block(text, cache_control=None):
 
 
 def title_gen_body(b1, b2, title_system, **over):
-    """The captured 200 baseline (event 115), rebuilt field by field."""
+    """The captured 200 baseline (capture event 124), rebuilt field by field."""
     body = {
         "model": "GLM-5.3-Flash",
         "max_tokens": 5000,
@@ -92,7 +92,7 @@ def title_gen_body(b1, b2, title_system, **over):
 
 
 def bare_probe_body(**over):
-    """The shape that drew 3012 in the capture (event 124)."""
+    """The shape that drew 3012 in the capture (capture event 128)."""
     body = {
         "model": "GLM-5.3-Flash",
         "max_tokens": 16,
@@ -104,7 +104,7 @@ def bare_probe_body(**over):
 
 
 def agent_body(b1, b2, **over):
-    """The captured agent shape (event 109): official b1+b2 leading."""
+    """The captured agent shape (capture events 111/112): official b1+b2 leading."""
     body = {
         "model": "GLM-5.3-Flash",
         "max_tokens": 128000,
@@ -256,14 +256,14 @@ def build_cases(b1, b2, title_system, b3=""):
     # B4/C1/C5 show system is NECESSARY; C2/C3/C4 show the official blocks are
     # not the only accepted content. These isolate size, array shape, order.
     filler = lambda n, ch="A": block(ch * n)
-    case("F1  system = one tiny block (42B)", bare_probe_body(system=[block(b1)]))
-    case("F2  system = one 997B filler block", bare_probe_body(system=[filler(997)]))
-    case("F3  system = one 4096B filler block", bare_probe_body(system=[filler(4096)]))
-    case("F4  system = title prompt, first 500B", bare_probe_body(system=[block(title_system[:500])]))
-    case("F5  system = title prompt, last 597B", bare_probe_body(system=[block(title_system[400:])]))
+    case("F1  system = one tiny block (42 chars)", bare_probe_body(system=[block(b1)]))
+    case("F2  system = one 997-char filler block", bare_probe_body(system=[filler(997)]))
+    case("F3  system = one 4096-char filler block", bare_probe_body(system=[filler(4096)]))
+    case("F4  system = title prompt, first 500 chars", bare_probe_body(system=[block(title_system[:500])]))
+    case("F5  system = title prompt, last 597 chars", bare_probe_body(system=[block(title_system[400:])]))
     case("F6  system = title prompt as a bare STRING",
          bare_probe_body(system=title_system))
-    case("F7  system = official b1+b2, b2 cut to 500B",
+    case("F7  system = official b1+b2, b2 cut to 500 chars",
          bare_probe_body(system=[block(b1), block(b2[:500])]))
     case("F8  system = official b2+b1 swapped (#16 V3)",
          bare_probe_body(system=[block(b2), block(b1)]))
@@ -271,8 +271,8 @@ def build_cases(b1, b2, title_system, b3=""):
          bare_probe_body(system=[block("You are a helpful assistant.")] + off()))
     case("F10 system = title block BEFORE official b1+b2",
          bare_probe_body(system=[block(title_system)] + off()))
-    case("F11 system = official b1 alone, 42B", bare_probe_body(system=[block(b1)]))
-    case("F12 system = official b2 alone, 2313B", bare_probe_body(system=[block(b2)]))
+    case("F11 system = official b1 alone, 42 chars", bare_probe_body(system=[block(b1)]))
+    case("F12 system = official b2 alone, 2313 chars", bare_probe_body(system=[block(b2)]))
     case("F13 system = b1+b2 merged into one block",
          bare_probe_body(system=[block(b1 + b2)]))
 
@@ -297,25 +297,30 @@ def build_cases(b1, b2, title_system, b3=""):
     # Same text, progressively longer prefix, for two unrelated official
     # prompts. If both cross at the same length the gate reads size; if they
     # disagree it reads content.
+    # Prefix lengths are counts of CHARACTERS: the boundary is per-prompt and
+    # the matrices bracketed it in characters, not bytes (the injected text
+    # contains multi-byte characters, so the two differ).
     for n in (600, 800, 1000, 1400, 1800, 2000, 2200, 2300):
-        case(f"I-b2[:{n}] official b1 + b2 prefix ({len(b1) + n}B)",
+        case(f"I-b2[:{n}] official b1 + b2 prefix ({len(b1) + n} chars)",
              bare_probe_body(system=[block(b1), block(b2[:n])]))
     for n in (300, 500, 600, 700, 800, 900, 950, 997):
-        case(f"I-title[:{n}] title prompt prefix ({n}B)",
+        case(f"I-title[:{n}] title prompt prefix ({n} chars)",
              bare_probe_body(system=[block(title_system[:n])]))
 
-    # --- Row J: bytes or tokens? Same byte size, different token density. ---
+    # --- Row J: size or content? Same length, different token density. ---
+    # These fillers are pure ASCII, so their character and byte counts agree;
+    # the length is stated in characters for consistency with the prefix rows.
     prose = (b2 + " " + title_system)
     while len(prose) < 20000:
         prose += " " + b2
     prose = prose[:20000]
-    case("J1  20000B of 'A' (very low token density)",
+    case("J1  20000 chars of 'A' (very low token density)",
          bare_probe_body(system=[block("A" * 20000)]))
-    case("J2  20000B of natural prose (high token density)",
+    case("J2  20000 chars of natural prose (high token density)",
          bare_probe_body(system=[block(prose)]))
-    case("J3  7565B official b3 block verbatim",
+    case("J3  official b3 block verbatim (7565 chars)",
          bare_probe_body(system=[block(b3)]))
-    case("J4  7565B of 'A' (same bytes as b3, opposite density)",
+    case("J4  7565 chars of 'A' (same length as b3, opposite density)",
          bare_probe_body(system=[block("A" * len(b3))]))
     case("J5  b3 verbatim + padding blocks of 'A'",
          bare_probe_body(system=[block(b3)] + [block("A" * 4000)] * 3))
@@ -364,17 +369,14 @@ def build_cases(b1, b2, title_system, b3=""):
     # accepted after b1, so "contains a long slice" is the wrong rule. These
     # locate the real boundary and check whether position or head matters.
     for n in (1100, 1200, 1250, 1300, 1350):
-        case(f"N-b1+b2[:{n}] head boundary ({42 + n}B)",
+        case(f"N-b1+b2[:{n}] head boundary ({42 + n} chars)",
              bare_probe_body(system=[block(b1), block(b2[:n])]))
-    for n in (955, 965, 975, 985, 990):
-        case(f"N-title[:{n}] head boundary ({n}B)",
-             bare_probe_body(system=[block(title_system[:n])]))
-    for n in (991, 993, 995, 996):
-        case(f"N-title[:{n}] head boundary ({n}B)",
+    for n in (955, 965, 975, 985, 990, 991, 993, 995, 996):
+        case(f"N-title[:{n}] head boundary ({n} chars)",
              bare_probe_body(system=[block(title_system[:n])]))
     case("N1 b2[:1400] alone, caller block AFTER",
          bare_probe_body(system=[block(b2[:1400]), block("You are a helpful assistant.")]))
-    case("N2 b1 + b2[:1400] split differently (b1 truncated to 20B)",
+    case("N2 b1 + b2[:1400] split differently (b1 truncated to 20 chars)",
          bare_probe_body(system=[block(b1[:20]), block(b2[:1400])]))
     case("N3 b1 + b2[:1400] where b2 starts at 0 (b1 duplicated after)",
          bare_probe_body(system=[block(b1), block(b2[:1400]), block(b1)]))
@@ -404,7 +406,8 @@ def main():
 
     b1, b2, title_system = load("b1.txt"), load("b2.txt"), load("title_system.txt")
     b3 = load("b3.txt") if os.path.exists(os.path.join(args.blocks_dir, "b3.txt")) else ""
-    print(f"blocks: b1={len(b1)}B b2={len(b2)}B b3={len(b3)}B title_system={len(title_system)}B", flush=True)
+    print(f"blocks (characters): b1={len(b1)} b2={len(b2)} b3={len(b3)} "
+          f"title_system={len(title_system)}", flush=True)
 
     jwt = open(args.jwt_file).read().strip()
     ctx = unverified_ctx()
@@ -427,7 +430,7 @@ def main():
         results.append({
             "name": c["name"], "verdict": verdict, "status": status,
             "logid": m.group(1) if m else "",
-            "body_bytes": len(json.dumps(c["body"], separators=(",", ":"))),
+            "body_bytes": len(json.dumps(c["body"], separators=(",", ":")).encode()),
             "resp_head": text[:200].replace("\n", " "),
         })
         print(f"{verdict:>6}  HTTP {str(status):>4}  {c['name']}", flush=True)
@@ -442,7 +445,14 @@ def main():
             "messages_url": MESSAGES_URL,
             "device_mid": args.device_mid,
             "session_id": session_id,
-            "block_lengths": {"b1": len(b1), "b2": len(b2), "b3": len(b3), "title_system": len(title_system)},
+            "block_lengths": {
+                "unit": "characters",
+                "note": "len(str) in Python counts characters; the injected "
+                        "prompts contain multi-byte characters, so byte counts "
+                        "are larger",
+                "b1": len(b1), "b2": len(b2), "b3": len(b3),
+                "title_system": len(title_system),
+            },
             "buckets_before": before,
             "buckets_after": after,
             "results": results,

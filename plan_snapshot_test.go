@@ -251,7 +251,7 @@ func TestRenderPlanSnapshotCarriesOnlyRedactedFacts(t *testing.T) {
 	if len(section.PlanIDs) != 1 || section.PlanIDs[0] != "zcode-v3-start-plan-0817" {
 		t.Fatalf("plan ids = %v, want the configured last-priority product", section.PlanIDs)
 	}
-	if !section.LastTried {
+	if !section.LastPriority {
 		t.Fatal("last_priority = false, want true for the configured plan")
 	}
 	line, ok := section.Models["GLM-5.3"]
@@ -295,7 +295,7 @@ func TestPlanSnapshotSectionRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := readPlanSnapshotSection(doc); got.Readable != section.Readable || len(got.Models) != len(section.Models) || got.LastTried != section.LastTried {
+	if got := readPlanSnapshotSection(doc); got.Readable != section.Readable || len(got.Models) != len(section.Models) || got.LastPriority != section.LastPriority {
 		t.Fatalf("round trip = %+v, want %+v", got, section)
 	}
 	// A document without the section reads as the zero value, whose allowances

@@ -162,9 +162,9 @@ func buildCredentialPool(ctx context.Context, store AuthStore, hostAuthIndex, mo
 // feature existed.
 func snapshotFromSection(section planSnapshotSection) StartPlanSnapshot {
 	snapshot := StartPlanSnapshot{
-		Readable:  section.Readable,
-		PlanIDs:   section.PlanIDs,
-		LastTried: section.LastTried,
+		Readable:     section.Readable,
+		PlanIDs:      section.PlanIDs,
+		LastPriority: section.LastPriority,
 	}
 	if checked, err := time.Parse(time.RFC3339, strings.TrimSpace(section.CheckedAt)); err == nil {
 		snapshot.CheckedAt = checked
@@ -252,34 +252,13 @@ func modelRemainingUnits(snapshot StartPlanSnapshot, model string) float64 {
 	return total
 }
 
-// eligibleForModel reports whether a candidate may attempt one model now, and
-// why not when it may not.
+// candidateEligible reports whether a candidate may attempt one model now.
 //
-// Eligibility is deliberately three questions rather than one, because they have
-// different recoveries: a credential the upstream rejected recovers through a
-// refresh or a re-login, an empty allowance recovers when the bucket window
-// closes, and a plan that has no bucket for the model at all never recovers on its
-// own. Collapsing them into one boolean would hide which of the three is true from
-// the caller and from the management page.
-type poolEligibility struct {
-	Eligible bool
-	// Reason names why a candidate is not eligible, for diagnostics. It is a
-	// bounded class, never upstream prose.
-	Reason string
-}
-
-// candidateEligibility decides one candidate's standing for one model.
-func candidateEligibility(candidate poolCandidate, model string) poolEligibility {
-	allowance := candidate.Snapshot.modelAllowance(model)
-	switch allowance {
-	case allowanceFunded:
-		return poolEligibility{Eligible: true}
-	case allowanceEmpty:
-		return poolEligibility{Reason: "model_allowance_empty"}
-	default:
-		// The snapshot knows nothing about this model. That is not evidence the
-		// candidate cannot serve it — the upstream verifies every request — so the
-		// candidate stays eligible and the request settles the question.
-		return poolEligibility{Eligible: true}
-	}
+// The three-valued allowance is what carries the diagnosis: a funded bucket, an
+// empty one, and a model the snapshot says nothing about are told apart by
+// modelAllowance, and only the empty case holds the candidate out. An empty
+// allowance is the one standing the plugin can conclude from its own reading;
+// the other two leave the question to the upstream, which verifies every request.
+func candidateEligible(candidate poolCandidate, model string) bool {
+	return candidate.Snapshot.modelAllowance(model) != allowanceEmpty
 }

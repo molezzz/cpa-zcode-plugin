@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -47,7 +48,7 @@ type completedLogin struct {
 	Storage    []byte
 }
 
-// authSession is one short-lived, single-completion Z.AI OAuth flow. It owns
+// authSession is one short-lived, single-completion ZCode OAuth flow. It owns
 // an independent polling secret, HTTP client, and cookie jar so no state can
 // leak between sessions even if a future flow starts using cookies.
 type authSession struct {
@@ -56,6 +57,12 @@ type authSession struct {
 	authorizeURL string
 	pollSecret   string
 	client       *http.Client
+	// site is the site this flow authorizes against, fixed when the session was
+	// created. The ready payload's access token is read against it, so a session
+	// must not re-read a configured default: the config may change while the
+	// browser is still on the authorize page, and a token read under the other
+	// site's key belongs to an account this session never authorized.
+	site string
 
 	createdAt time.Time
 	expiresAt time.Time
@@ -73,17 +80,26 @@ type authSession struct {
 
 // newState builds a session with its own random identifiers, HTTP client,
 // and cookie jar. The caller must have validated the flow data.
-func newState(id, flowID, authorizeURL, pollSecret string, client *http.Client, now time.Time, ttl time.Duration) *authSession {
+func newState(id, flowID, authorizeURL, pollSecret string, client *http.Client, now time.Time, ttl time.Duration, site string) *authSession {
 	return &authSession{
 		id:           id,
 		flowID:       flowID,
 		authorizeURL: authorizeURL,
 		pollSecret:   pollSecret,
 		client:       client,
+		site:         site,
 		createdAt:    now,
 		expiresAt:    now.Add(ttl),
 		state:        authSessionPending,
 	}
+}
+
+// profile resolves the session's site. The site is fixed when the flow starts
+// and only ever read, so an unrecognized value falls back the same way a stored
+// credential's does: this build cannot know a site it has no profile for, and
+// reading it as the international one keeps a pending poll readable.
+func (s *authSession) profile() siteProfile {
+	return siteProfileOrDefault(strings.TrimSpace(s.site))
 }
 
 // pollUpstream performs one upstream poll using only this session's client
@@ -262,12 +278,12 @@ var activeSessions = newSessionManager()
 // create registers a new pending session that already holds its upstream
 // flow data, poll secret, and the dedicated HTTP client used for the init
 // call, and schedules its cleanup. It fails only on local randomness errors.
-func (m *sessionManager) create(flowID, authorizeURL, pollSecret string, client *http.Client, ttl time.Duration) (*authSession, error) {
+func (m *sessionManager) create(flowID, authorizeURL, pollSecret string, client *http.Client, ttl time.Duration, site string) (*authSession, error) {
 	sessionID, err := randomHexToken(sessionIDBytes)
 	if err != nil {
 		return nil, fmt.Errorf("generate authorization session id: %w", err)
 	}
-	session := newState(sessionID, flowID, authorizeURL, pollSecret, client, m.now(), ttl)
+	session := newState(sessionID, flowID, authorizeURL, pollSecret, client, m.now(), ttl, site)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sessions[sessionID] = session

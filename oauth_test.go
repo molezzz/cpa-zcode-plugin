@@ -169,13 +169,24 @@ func (f *upstreamFixture) queuePoll(status int, body string) {
 	f.pollResponses = append(f.pollResponses, func() (int, string) { return status, body })
 }
 
-// queuePollReady is shorthand for a ready poll reply carrying a JWT.
+// queuePollReady is shorthand for a ready poll reply carrying a JWT. The
+// payload names both providers' access tokens, exactly as a site that serves one
+// protocol for both would: reading the wrong one is a plugin bug, not something
+// the payload shape can prevent.
 func (f *upstreamFixture) queuePollReady(token string) {
+	f.queuePollReadyAs(token, "zai-access-token-1", "bigmodel-access-token-1")
+}
+
+// queuePollReadyAs is queuePollReady with explicit access tokens per site, for
+// the tests that assert which one the plugin took.
+func (f *upstreamFixture) queuePollReadyAs(token, zaiToken, bigmodelToken string) {
 	body, err := json.Marshal(map[string]any{
 		"data": map[string]any{
-			"status": "ready",
-			"token":  token,
-			"zai":    map[string]any{"access_token": "zai-access-token-1"},
+			"status":   "ready",
+			"token":    token,
+			"user":     map[string]any{"user_id": "u-1"},
+			"zai":      map[string]any{"access_token": zaiToken},
+			"bigmodel": map[string]any{"access_token": bigmodelToken},
 		},
 	})
 	if err != nil {
@@ -909,7 +920,7 @@ func TestAuthFileNameForIsStableAndSafe(t *testing.T) {
 func TestBuildZcodeStorageMergesLosslessly(t *testing.T) {
 	previous := []byte(`{"type":"zcode","unknown":{"n":12345678901234567890},"zcode":{"schema_version":1,"identity_id":"zcode-user-1","api_key":{"credential":"k"},"jwt":{"token":"old","status":"invalid"}}}`)
 	token := makeJWT(t, map[string]any{"sub": "user-1"})
-	doc, err := buildZcodeStorage(previous, "zcode-user-1", token, "access-1", time.Unix(0, 0).UTC())
+	doc, err := buildZcodeStorage(previous, "zcode-user-1", token, "access-1", siteZai, time.Unix(0, 0).UTC())
 	if err != nil {
 		t.Fatal(err)
 	}

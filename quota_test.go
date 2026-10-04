@@ -188,6 +188,10 @@ func newTestAccountDoc(t *testing.T, identityID, jwtToken, jwtStatus, keyMateria
 	doc, err := patchZcodeNamespace(nil, func(zcode map[string]any) error {
 		zcode["schema_version"] = json.Number("1")
 		zcode["identity_id"] = identityID
+		// The site login records on every credential, so a document built here is
+		// an already-migrated one. A test about the migration writes the document
+		// without this field itself rather than expecting one from this builder.
+		zcode[siteFieldName] = siteZai
 		zcode["jwt"] = map[string]any{
 			"token":           jwtToken,
 			"status":          jwtStatus,
@@ -611,7 +615,7 @@ func TestDeviceIdentityIsStampedOnFirstLogin(t *testing.T) {
 	token := makeJWT(t, map[string]any{"sub": "device-login"})
 	now := time.Unix(0, 0).UTC()
 
-	doc, err := buildZcodeStorage(nil, "zcode-device-user", token, "", now)
+	doc, err := buildZcodeStorage(nil, "zcode-device-user", token, "", siteZai, now)
 	if err != nil {
 		t.Fatalf("build storage: %v", err)
 	}
@@ -621,7 +625,7 @@ func TestDeviceIdentityIsStampedOnFirstLogin(t *testing.T) {
 	}
 
 	// Re-login is the same installation and must not look like a new device.
-	doc, err = buildZcodeStorage(doc, "zcode-device-user", token, "", now)
+	doc, err = buildZcodeStorage(doc, "zcode-device-user", token, "", siteZai, now)
 	if err != nil {
 		t.Fatalf("re-login: %v", err)
 	}

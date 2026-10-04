@@ -175,7 +175,7 @@ func withOAuthConfig(t *testing.T, mutate func(*Config)) {
 // as it looks right after a successful login before the api_key section.
 func freshLoginDoc(t *testing.T, previous []byte) []byte {
 	t.Helper()
-	doc, err := buildZcodeStorage(previous, "zcode-user-x", "jwt-token-x", "", time.Now())
+	doc, err := buildZcodeStorage(previous, "zcode-user-x", "jwt-token-x", "", siteZai, time.Now())
 	if err != nil {
 		t.Fatalf("build storage: %v", err)
 	}
@@ -231,7 +231,7 @@ func lastErrorStage(t *testing.T, doc []byte) (string, string) {
 
 func mustAttach(t *testing.T, doc []byte, accessToken string) []byte {
 	t.Helper()
-	return attachManagedAPIKey(doc, "identity-test", accessToken, time.Now())
+	return attachManagedAPIKey(doc, "identity-test", accessToken, zaiSiteProfile, time.Now())
 }
 
 func TestBuildManagedKeyNameUsesConfiguredPrefixAndRandomSuffix(t *testing.T) {

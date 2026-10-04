@@ -217,6 +217,8 @@ const managementPageHTML = `<!DOCTYPE html>
     <h2>账号</h2>
     <div class="actions">
       <span id="accounts-count" class="count"></span>
+      <button id="login-zai" type="button">国际站 z.ai 登录</button>
+      <button id="login-bigmodel" type="button">国内站 bigmodel 登录</button>
       <button id="reload-state" class="primary" type="button">刷新状态</button>
       <button id="batch-refresh" type="button">刷新全部账号</button>
     </div>
@@ -746,6 +748,15 @@ const managementPageHTML = `<!DOCTYPE html>
     unknown: ["未知", "pill-warn"]
   };
 
+  // SITE_NAMES label the two ZCode sites on the page. An operator may hold an
+  // account on each, and the site is the only thing that tells the two records
+  // apart: their identities, credentials, and plan views are otherwise the same
+  // shape.
+  var SITE_NAMES = {
+    zai: "国际站 z.ai",
+    bigmodel: "国内站 bigmodel"
+  };
+
   // planCard renders which Start Plan products this record holds and, per model,
   // whether an allowance is left. It is the section that tells a wrong-account
   // login and an exhausted plan apart: the JWT status alone reports both as "not
@@ -771,7 +782,7 @@ const managementPageHTML = `<!DOCTYPE html>
       var label = ALLOWANCE_STATES[line.allowance] || [line.allowance, ""];
       var parts = [statusSpan(label[0], label[1])];
       if (line.reset_at) { parts.push("恢复 " + line.reset_at); }
-      parts.push(text(el("span"), " " + line.buckets + " 个额度桶"));
+      parts.push(text(el("span"), " " + unknownNumber(line.buckets) + " 个额度桶"));
       stack.push(parts);
     });
     appendStack(dd, statusSpan(plan.plan_ids && plan.plan_ids.length ? "已识别" : "无套餐", ""), stack);
@@ -787,11 +798,19 @@ const managementPageHTML = `<!DOCTYPE html>
     return dd;
   }
 
-  function actionButton(label, action, authIndex) {
+  // siteName renders one site's name. An unrecognized site shows as itself
+  // rather than as the international one: the plugin keeps an unrecognized site
+  // verbatim, and silently relabelling it here would contradict that and promise
+  // a re-authorization the action is going to refuse.
+  function siteName(site) {
+    return SITE_NAMES[site] || site || SITE_NAMES.zai;
+  }
+
+  function actionButton(label, action, authIndex, site) {
     var button = el("button");
     text(button, label);
     button.type = "button";
-    button.addEventListener("click", function () { runAction(action, authIndex, button); });
+    button.addEventListener("click", function () { runAction(action, authIndex, button, site); });
     return button;
   }
 
@@ -802,6 +821,7 @@ const managementPageHTML = `<!DOCTYPE html>
     var card = el("article", "account");
     card.appendChild(text(el("h2"), account.label || account.auth_index || "(未命名)"));
     card.appendChild(text(el("div", "identity"), account.identity_id || "—"));
+    card.appendChild(text(el("div", "identity"), "站点 " + siteName(account.site)));
 
     if (account.read_error) {
       var note = el("div", "unreadable");
@@ -827,7 +847,10 @@ const managementPageHTML = `<!DOCTYPE html>
     group.appendChild(actionButton("刷新凭证", "refresh_credential", authIndex));
     group.appendChild(actionButton("刷新额度", "refresh_quota", authIndex));
     group.appendChild(actionButton("刷新模型", "refresh_models", authIndex));
-    group.appendChild(actionButton("重新授权", "oauth_retry", authIndex));
+    // Re-authorization names its site, because a recovery that picked one for
+    // the operator could swap a domestic credential for an international login
+    // and leave the account looking healthy until every request failed.
+    group.appendChild(actionButton("用 " + siteName(account.site) + " 重新授权", "oauth_retry", authIndex, account.site));
     card.appendChild(group);
     return card;
   }
@@ -936,6 +959,7 @@ const managementPageHTML = `<!DOCTYPE html>
     refresh_quota: "刷新额度",
     refresh_models: "刷新模型缓存",
     oauth_retry: "重新授权",
+    oauth_login: "登录",
     batch_refresh: "刷新全部账号"
   };
 
@@ -943,7 +967,7 @@ const managementPageHTML = `<!DOCTYPE html>
     return ACTION_LABELS[action] || action;
   }
 
-  function runAction(action, authIndex, button) {
+  function runAction(action, authIndex, button, site) {
     if (button.disabled) { return; }
     generation += 1;              // in-flight replies from earlier renders are void
     var localGeneration = generation;
@@ -952,7 +976,7 @@ const managementPageHTML = `<!DOCTYPE html>
       document.getElementById("reload-state").disabled = true;
     }
     show("正在执行" + actionName(action) + (authIndex ? "(" + authIndex + ")" : "") + "…", "pending");
-    apiFetch(ACTION_URL, "POST", { action: action, auth_index: authIndex || "" })
+    apiFetch(ACTION_URL, "POST", { action: action, auth_index: authIndex || "", site: site || "" })
     .then(function (outcome) {
       // A newer action or state fetch superseded this reply; rendering it
       // would put a stale result over a fresh one.
@@ -1042,6 +1066,17 @@ const managementPageHTML = `<!DOCTYPE html>
 
   document.getElementById("batch-refresh").addEventListener("click", function () {
     runAction("batch_refresh", "", document.getElementById("batch-refresh"));
+  });
+
+  // The two login entries differ only in the site they authorize against. Each
+  // names its own, so an operator with accounts on both adds the second one
+  // without changing what the first defaults to.
+  document.getElementById("login-zai").addEventListener("click", function () {
+    runAction("oauth_login", "", document.getElementById("login-zai"), "zai");
+  });
+
+  document.getElementById("login-bigmodel").addEventListener("click", function () {
+    runAction("oauth_login", "", document.getElementById("login-bigmodel"), "bigmodel");
   });
 
   document.getElementById("save-key").addEventListener("click", function () {

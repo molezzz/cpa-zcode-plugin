@@ -14,10 +14,9 @@ import (
 	"unicode/utf8"
 )
 
-// zaiAPIBase is the Z.AI business API root used to exchange the OAuth access
-// token for the managed fallback API key. It is a variable so integration
-// tests can point the plugin at a local httptest server.
-var zaiAPIBase = "https://api.z.ai"
+// The business API origins are declared in site_profile.go with the site
+// profiles that own them: the two are the same paths on different hosts, so
+// naming one here would invite the other to be assumed.
 
 // managedKeyExchangeTimeout bounds the whole managed key exchange (business
 // login, organization/project resolution, key creation, and material read).
@@ -175,6 +174,10 @@ type zaiSecretKeyResponse struct {
 // fails the login and never touches the JWT namespace: every exchange problem
 // is recorded as diagnosable state inside the api_key section instead.
 //
+// The site's profile decides which origin the whole chain runs against, so a
+// credential is never created on the other site's account: the organization,
+// project, and key all live under the site that issued the access token.
+//
 // The decision order implements the ownership rules:
 //  1. A recorded active key is reused as-is; no upstream key operation runs
 //     and no existing upstream key is searched, adopted, or modified.
@@ -184,7 +187,7 @@ type zaiSecretKeyResponse struct {
 //     ids first, then a single candidate. Anything else records a
 //     needs_selection state with the candidate list; localized display names
 //     are never used to guess.
-func attachManagedAPIKey(doc []byte, identityID, accessToken string, now time.Time) []byte {
+func attachManagedAPIKey(doc []byte, identityID, accessToken string, profile siteProfile, now time.Time) []byte {
 	prevSection, hasPrev := readAPIKeySection(doc)
 	prev := typedAPIKeyState(prevSection)
 	timestamp := now.UTC().Format(time.RFC3339)
@@ -222,7 +225,7 @@ func attachManagedAPIKey(doc []byte, identityID, accessToken string, now time.Ti
 	client := newSessionHTTPClient(cfg)
 	defer client.CloseIdleConnections()
 
-	state, err := runManagedKeyExchange(ctx, client, cfg, prev, identityID, accessToken, timestamp)
+	state, err := runManagedKeyExchange(ctx, client, cfg, prev, identityID, accessToken, profile, timestamp)
 	if err != nil {
 		if ctx.Err() != nil {
 			err = errors.New("the managed key exchange did not complete in time")
@@ -247,20 +250,27 @@ func attachManagedAPIKey(doc []byte, identityID, accessToken string, now time.Ti
 // section state. Errors carry their stage; the returned state preserves any
 // recorded key identity so failures stay recoverable without creating a
 // second key.
-func runManagedKeyExchange(ctx context.Context, client *http.Client, cfg Config, prev managedAPIKeyState, identityID, accessToken, timestamp string) (managedAPIKeyState, error) {
-	exchanged, err := exchangeBusinessTokenWithExpiry(ctx, client, accessToken)
+func runManagedKeyExchange(ctx context.Context, client *http.Client, cfg Config, prev managedAPIKeyState, identityID, accessToken string, profile siteProfile, timestamp string) (managedAPIKeyState, error) {
+	// A site that issues its business token directly has no exchange to run: the
+	// access token is already what every endpoint below accepts. Calling the
+	// exchange anyway would spend a request against a login endpoint the site
+	// does not serve, and — because the failure lands on the key's own state —
+	// report a perfectly good login as a failed managed key.
+	business, err := businessTokenFor(ctx, client, accessToken, profile)
 	if err != nil {
 		return prev, &keyStageError{Stage: apiKeyStageLogin, Err: err}
 	}
-	// The exchange it just performed is the business credential the account's
-	// own billing calls need, so it is cached for them rather than paid for
-	// again. A caller that never reaches the key stage still benefits.
-	activeBusinessTokens.put(identityID, accessToken, exchanged)
-	bizToken := exchanged.Token
+	bizToken := business.Token
+	if profile.ExchangesBusinessToken {
+		// The exchange it just performed is the business credential the account's
+		// own billing calls need, so it is cached for them rather than paid for
+		// again. A caller that never reaches the key stage still benefits.
+		activeBusinessTokens.put(identityID, accessToken, business)
+	}
 
 	orgID, projID := strings.TrimSpace(prev.OrganizationID), strings.TrimSpace(prev.ProjectID)
 	if orgID == "" || projID == "" {
-		resolvedOrg, resolvedProj, selErr := selectOrganizationProject(ctx, client, cfg, bizToken)
+		resolvedOrg, resolvedProj, selErr := selectOrganizationProject(ctx, client, cfg, bizToken, profile)
 		if selErr != nil {
 			var needed *keySelectionNeededError
 			if errors.As(selErr, &needed) {
@@ -290,14 +300,14 @@ func runManagedKeyExchange(ctx context.Context, client *http.Client, cfg Config,
 		if err != nil {
 			return prev, &keyStageError{Stage: apiKeyStageCreate, Err: err}
 		}
-		keyID, err = createManagedKey(ctx, client, bizToken, orgID, projID, name)
+		keyID, err = createManagedKey(ctx, client, bizToken, orgID, projID, name, profile)
 		if err != nil {
 			return prev, &keyStageError{Stage: apiKeyStageCreate, Err: err}
 		}
 		createdAt = timestamp
 	}
 
-	material, err := fetchManagedKeyMaterial(ctx, client, bizToken, orgID, projID, keyID)
+	material, err := fetchManagedKeyMaterial(ctx, client, bizToken, orgID, projID, keyID, profile)
 	if err != nil {
 		// The key exists upstream even though its material did not arrive.
 		// Recording the key identity keeps the retry on the refetch path
@@ -327,8 +337,8 @@ func runManagedKeyExchange(ctx context.Context, client *http.Client, cfg Config,
 // managed key. Upstream read failures surface as discovery errors; policy
 // failures surface as keySelectionError; an ambiguous choice surfaces as
 // keySelectionNeededError with the candidate list.
-func selectOrganizationProject(ctx context.Context, client *http.Client, cfg Config, bizToken string) (string, string, error) {
-	orgs, err := fetchCustomerOrganizations(ctx, client, bizToken)
+func selectOrganizationProject(ctx context.Context, client *http.Client, cfg Config, bizToken string, profile siteProfile) (string, string, error) {
+	orgs, err := fetchCustomerOrganizations(ctx, client, bizToken, profile)
 	if err != nil {
 		return "", "", err
 	}
@@ -429,9 +439,9 @@ func truncateRunes(value string, maxBytes int) string {
 }
 
 // fetchCustomerOrganizations lists the upstream organizations and their
-// projects of the logged-in customer.
-func fetchCustomerOrganizations(ctx context.Context, client *http.Client, bizToken string) ([]zaiOrganization, error) {
-	body, err := managedKeyRequest(ctx, client, http.MethodGet, zaiCustomerInfoURL(), nil, bizToken)
+// projects of the logged-in customer, on the site that issued the token.
+func fetchCustomerOrganizations(ctx context.Context, client *http.Client, bizToken string, profile siteProfile) ([]zaiOrganization, error) {
+	body, err := managedKeyRequest(ctx, client, http.MethodGet, siteCustomerInfoURL(profile), nil, bizToken)
 	if err != nil {
 		return nil, err
 	}
@@ -444,12 +454,12 @@ func fetchCustomerOrganizations(ctx context.Context, client *http.Client, bizTok
 
 // createManagedKey creates one plugin-owned key under the given name and
 // returns its upstream key identifier.
-func createManagedKey(ctx context.Context, client *http.Client, bizToken, orgID, projID, name string) (string, error) {
+func createManagedKey(ctx context.Context, client *http.Client, bizToken, orgID, projID, name string, profile siteProfile) (string, error) {
 	payload, err := json.Marshal(map[string]string{"name": name})
 	if err != nil {
 		return "", fmt.Errorf("encode key creation request: %w", err)
 	}
-	body, err := managedKeyRequest(ctx, client, http.MethodPost, zaiKeysURL(orgID, projID), payload, bizToken)
+	body, err := managedKeyRequest(ctx, client, http.MethodPost, siteKeysURL(profile, orgID, projID), payload, bizToken)
 	if err != nil {
 		return "", err
 	}
@@ -469,8 +479,8 @@ func createManagedKey(ctx context.Context, client *http.Client, bizToken, orgID,
 
 // fetchManagedKeyMaterial reads the callable secret of the recorded key and
 // renders the key material the upstream API expects.
-func fetchManagedKeyMaterial(ctx context.Context, client *http.Client, bizToken, orgID, projID, keyID string) (string, error) {
-	body, err := managedKeyRequest(ctx, client, http.MethodGet, zaiKeyMaterialURL(orgID, projID, keyID), nil, bizToken)
+func fetchManagedKeyMaterial(ctx context.Context, client *http.Client, bizToken, orgID, projID, keyID string, profile siteProfile) (string, error) {
+	body, err := managedKeyRequest(ctx, client, http.MethodGet, siteKeyMaterialURL(profile, orgID, projID, keyID), nil, bizToken)
 	if err != nil {
 		return "", err
 	}
@@ -519,24 +529,36 @@ func managedKeyRequest(ctx context.Context, client *http.Client, method, target 
 	return body, nil
 }
 
-// zaiURL joins the business API base with one observed endpoint path.
-func zaiURL(path string) string {
-	return strings.TrimRight(zaiAPIBase, "/") + path
+// zaiAPIBase is the international site's business API root. It lives in
+// site_profile.go with its domestic counterpart, because the two are the same
+// paths on different origins and naming one of them here would invite the other
+// to be assumed.
+
+// siteURL joins one site's business API base with an observed endpoint path.
+//
+// Every business endpoint the plugin calls exists on both sites at the same
+// path — the capture shows the domestic site serving /api/biz/customer/
+// getCustomerInfo and the organization/project api_keys chain — so the paths are
+// shared and only the origin is a site decision.
+func siteURL(profile siteProfile, path string) string {
+	return strings.TrimRight(profile.BusinessAPIBase(), "/") + path
 }
 
-func zaiBizLoginURL() string { return zaiURL("/api/auth/z/login") }
-
-func zaiCustomerInfoURL() string {
-	return zaiURL("/api/biz/customer/getCustomerInfo")
+func siteBusinessLoginURL(profile siteProfile) string {
+	return siteURL(profile, "/api/auth/z/login")
 }
 
-func zaiKeysURL(orgID, projID string) string {
-	return zaiURL("/api/biz/v1/organization/" +
-		url.PathEscape(orgID) + "/projects/" + url.PathEscape(projID) + "/api_keys")
+func siteCustomerInfoURL(profile siteProfile) string {
+	return siteURL(profile, "/api/biz/customer/getCustomerInfo")
 }
 
-func zaiKeyMaterialURL(orgID, projID, keyID string) string {
-	return zaiKeysURL(orgID, projID) + "/copy/" + url.PathEscape(keyID)
+func siteKeysURL(profile siteProfile, orgID, projID string) string {
+	return siteURL(profile, "/api/biz/v1/organization/"+
+		url.PathEscape(orgID)+"/projects/"+url.PathEscape(projID)+"/api_keys")
+}
+
+func siteKeyMaterialURL(profile siteProfile, orgID, projID, keyID string) string {
+	return siteKeysURL(profile, orgID, projID) + "/copy/" + url.PathEscape(keyID)
 }
 
 // readAPIKeySection extracts the current api_key section of the document's

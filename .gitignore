@@ -16,3 +16,7 @@ cpa-zcode-plugin
 
 # ZCode 会话产物（计划、临时状态），不纳入版本管理
 .zcode/
+
+# Python 探针脚本的字节码缓存
+__pycache__/
+*.pyc
