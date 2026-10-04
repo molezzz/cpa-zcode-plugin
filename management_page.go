@@ -19,7 +19,12 @@ package main
 //
 // Layout follows the workbuddy-cliproxy-plus management page: dark surfaces,
 // one card per account on a responsive grid, a remaining-quota progress bar per
-// bucket, and a status message line instead of a JSON dump area. There is no
+// bucket, and a status message line instead of a JSON dump area. Each account
+// card keeps verdicts, quota bars, a chip row and its actions on the face, and
+// collapses every reading line — quota evidence and the credential fact rows —
+// into one details block that opens by itself only when a verdict is warn or
+// bad; the operator's own open/closed choice wins until the key is dropped.
+// There is no
 // auto-refresh timer: the page paints a cached snapshot (kept in localStorage)
 // with actions disabled, then revalidates once against the live state, and
 // every later reload is operator-initiated.
@@ -137,8 +142,46 @@ const managementPageHTML = `<!DOCTYPE html>
     margin: 10px 0 0; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text);
   }
-  .link-cell { margin-top: 10px; }
-  .link-cell a { color: var(--primary); }
+  /* The authorize prompt lives outside #message on purpose. show() assigns
+     textContent, so anything rendered inside #message is destroyed by the very
+     next status line — and the refresh that follows every action writes one
+     immediately. The slot is never cleared by a status update. */
+  /* The prompt is a modal dialog, not an inline line: pressing a login button
+     must end somewhere unmissable. The full URL is rendered as selectable text
+     because an operator on a remote host may have to carry it to another
+     machine's browser. */
+  .modal-backdrop {
+    position: fixed; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.65); padding: 20px;
+  }
+  .modal {
+    width: 100%; max-width: 34rem;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.5);
+  }
+  .modal h3 { margin: 0 0 6px; font-size: 16px; color: var(--primary); }
+  .modal .modal-sub { margin: 0 0 12px; color: var(--text-muted); font-size: 13px; }
+  .modal .url-box {
+    margin: 0 0 12px; padding: 10px 12px;
+    font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--surface-raised); border: 1px solid var(--border);
+    border-radius: 7px; color: var(--text);
+    overflow-wrap: anywhere; user-select: all;
+    max-height: 8rem; overflow: auto;
+  }
+  .modal .modal-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .modal .expiry { color: var(--text-muted); font-size: 12px; margin: 12px 0 0; }
+  /* The sessions-table cancel button rides inside a status cell, so it stays
+     small and secondary next to the pill — a plain button with the base style
+     but tighter padding, and never a primary. */
+  td button.dismiss {
+    font: inherit; font-size: 11px; cursor: pointer; border-radius: 7px;
+    border: 1px solid var(--border); background: var(--surface-raised);
+    color: var(--text-muted); padding: 2px 8px; margin-left: 8px;
+  }
+  td button.dismiss:hover { border-color: var(--bad); color: var(--bad); }
 
   /* Account cards: one card per account on a responsive grid, replacing the
      wide one-row-per-account table that forced horizontal scanning. */
@@ -176,6 +219,45 @@ const managementPageHTML = `<!DOCTYPE html>
   .axis-head .axis-kind { color: var(--text); }
   .axis-head .axis-plan { color: var(--text-muted); overflow-wrap: anywhere; }
 
+  /* The collapsed reading block: everything on an account card that is only
+     evidence — quota bucket lines and the credential fact rows — lives here,
+     so the card face stays at verdict height. The block opens by itself when a
+     verdict is warn or bad; when every verdict is fine it stays shut and the
+     summary is the only thing an operator reads. */
+  details.readings {
+    margin-top: 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--surface-raised);
+  }
+  details.readings summary {
+    cursor: pointer; padding: 7px 12px; font-size: 12px; color: var(--text-muted);
+    user-select: none; list-style: none;
+  }
+  details.readings summary::-webkit-details-marker { display: none; }
+  details.readings summary::before {
+    content: "▸"; display: inline-block; margin-right: 6px;
+    transition: transform .15s ease;
+  }
+  details.readings[open] summary::before { transform: rotate(90deg); }
+  details.readings summary:hover { color: var(--text); }
+  details.readings > .readings-body { padding: 4px 12px 12px; border-top: 1px solid var(--border); }
+
+  /* Verdict chips: the one-line summary of every credential slot on the card
+     face. A chip is a pill with a term prefix; the severity hue matches the
+     verdict it abbreviates, so a bad slot is findable without opening. */
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+  .chip {
+    display: inline-flex; align-items: baseline; gap: 4px; padding: 2px 9px;
+    border-radius: 999px; font-size: 12px; line-height: 1.7; white-space: nowrap;
+    background: #26262b; color: var(--text-muted); border: 1px solid transparent;
+  }
+  .chip .pill { font-size: 12px; padding: 0; border: none; background: none; line-height: inherit; }
+  .chip-ok { background: rgba(0,191,111,.12); border-color: rgba(0,191,111,.45); }
+  .chip-ok .pill { color: var(--ok); }
+  .chip-warn { background: rgba(255,196,31,.1); border-color: rgba(255,196,31,.45); }
+  .chip-warn .pill { color: var(--warn); }
+  .chip-bad { background: rgba(255,45,85,.12); border-color: rgba(255,45,85,.45); }
+  .chip-bad .pill { color: var(--bad); }
+
   dl.facts {
     display: grid; grid-template-columns: max-content minmax(0, 1fr);
     gap: 4px 12px; margin: 12px 0 0; font-size: 12.5px;
@@ -190,6 +272,9 @@ const managementPageHTML = `<!DOCTYPE html>
 <p class="subtitle">上游身份、凭证与额度的脱敏运行状态。密钥、授权参数、上游响应原文与用户 prompt 永不展示。</p>
 
 <div id="message" role="status" aria-live="polite"></div>
+<!-- The authorize modal renders here, outside #message: show() assigns
+     textContent and would destroy anything living inside it. -->
+<div id="authorize-slot"></div>
 
 <div class="card">
   <div class="card-head">
@@ -273,6 +358,7 @@ const managementPageHTML = `<!DOCTYPE html>
   var keyState = document.getElementById("key-state");
   var keyShow = document.getElementById("key-show");
   var message = document.getElementById("message");
+  var authorizeSlot = document.getElementById("authorize-slot");
   var rawDetails = document.getElementById("raw");
   var rawBody = document.getElementById("raw-body");
 
@@ -359,7 +445,9 @@ const managementPageHTML = `<!DOCTYPE html>
     clearStoredKey();
     clearStateCache();
     generation += 1;
+    readingsOpen = {};
     keyInput.value = "";
+    authorizeSlot.replaceChildren();
     renderEmpty();
     hideRaw();
     showKeyPanel(false);
@@ -463,11 +551,28 @@ const managementPageHTML = `<!DOCTYPE html>
   // so a credential's state, its error code and its age read as one fact rather
   // than as three unrelated fragments. It returns the block so a caller can
   // append it where it belongs.
+  //
+  // A line is either a string or a node, and the two are told apart here rather
+  // than at each call site: a line built from a status pill has to keep its
+  // styling, and stringifying it would render the element itself. Passing one
+  // through String() is what makes a DOM node read as "[object HTMLSpanElement]"
+  // on the page, so the branch is the whole fix.
   function appendStack(container, pill, lines) {
     var stack = el("div", "stack");
     stack.appendChild(pill);
     (lines || []).forEach(function (line) {
-      if (line) { stack.appendChild(text(el("div", "sub"), line)); }
+      if (!line) { return; }
+      if (typeof line === "string" || typeof line === "number") {
+        stack.appendChild(text(el("div", "sub"), line));
+        return;
+      }
+      // An assembled line is a row of its own: the pill styles and the trailing
+      // facts have to sit beside each other, not be flattened into one string.
+      var row = el("div", "sub");
+      (Array.isArray(line) ? line : [line]).forEach(function (part) {
+        row.appendChild(typeof part === "string" ? text(el("span"), " " + part) : part);
+      });
+      stack.appendChild(row);
     });
     container.appendChild(stack);
     return container;
@@ -646,7 +751,9 @@ const managementPageHTML = `<!DOCTYPE html>
   // group labels come from the plugin because that is where ownership was
   // resolved — the instance-id versus product-id match lives there, and a
   // second copy of it here could disagree with the host's own quota groups.
-  function quotaAxis(group, balances) {
+  // withEvidence decides whether each bucket carries its reading lines: the
+  // card face draws bars only, and the evidence joins the collapsed readings.
+  function axisSection(group, balances, withEvidence) {
     var section = el("div", "quota-axis");
     var head = el("div", "axis-head");
     head.appendChild(text(el("span", "axis-kind"), axisReading(group.kind)));
@@ -655,6 +762,7 @@ const managementPageHTML = `<!DOCTYPE html>
     balances.forEach(function (balance) {
       var bar = quotaBar(balance);
       if (bar) { section.appendChild(bar); }
+      if (!withEvidence) { return; }
       var block = el("div", "bucket-lines");
       quotaBucket(balance).forEach(function (line) {
         block.appendChild(text(el("div"), line));
@@ -664,6 +772,13 @@ const managementPageHTML = `<!DOCTYPE html>
     return section;
   }
 
+  // quotaCard renders the quota slot of one account card: the entitlement
+  // verdict, then one section per billing axis with its buckets. The four
+  // readings an operator must tell apart — a plan with quota, an account the
+  // upstream positively reports as having no plan, a lapsed plan, and a reading
+  // the plugin could not make — stay distinct as pills before any bucket is
+  // drawn. Only verdict and bars live here; the per-bucket reading lines are
+  // evidence and render through quotaEvidence in the collapsed readings.
   function quotaCard(quota) {
     var box = el("div");
     if (!quota) {
@@ -674,8 +789,6 @@ const managementPageHTML = `<!DOCTYPE html>
     var lines = [];
     if (quota.plan) { lines.push(quota.plan); }
     else if (quota.plan_count > 0) { lines.push(quota.plan_count + " 个未命名套餐"); }
-    if (quota.reason) { lines.push(quota.reason); }
-    if (quota.checked_at) { lines.push("查询于 " + quota.checked_at); }
     appendStack(box, statusSpan(known[0], known[1]), lines);
 
     var balances = quota.balances || [];
@@ -685,7 +798,7 @@ const managementPageHTML = `<!DOCTYPE html>
       // pre-grouping snapshot cached before a reload. The buckets are still
       // real numbers, so they render under one unnamed axis rather than
       // disappearing.
-      if (balances.length) { box.appendChild(quotaAxis({ kind: "", label: "" }, balances)); }
+      if (balances.length) { box.appendChild(axisSection({ kind: "", label: "" }, balances, false)); }
       return box;
     }
     // Buckets join their axis by index, which the plugin resolved from the
@@ -693,9 +806,35 @@ const managementPageHTML = `<!DOCTYPE html>
     // happen to share a display name, and re-deriving ownership here would
     // duplicate the rule that distinguishes two instances of one product.
     groups.forEach(function (group, index) {
-      box.appendChild(quotaAxis(group, balances.filter(function (balance) {
+      box.appendChild(axisSection(group, balances.filter(function (balance) {
         return balance.group_index === index;
-      })));
+      }), false));
+    });
+    return box;
+  }
+
+  // quotaEvidence renders the per-bucket reading lines the card face leaves
+  // out: the verdict's reason and check time, then remaining/total counts, the
+  // period reading, and the labelled expiry instant. It is mounted inside the
+  // collapsed readings block — which opens by itself on a warn or bad verdict —
+  // so a healthy account never pays this height, and a troubled one still sees
+  // the reason next to its buckets.
+  function quotaEvidence(quota) {
+    if (!quota) { return null; }
+    var box = el("div");
+    if (quota.reason) { box.appendChild(text(el("div", "bucket-lines"), quota.reason)); }
+    if (quota.checked_at) { box.appendChild(text(el("div", "bucket-lines"), "查询于 " + quota.checked_at)); }
+    var balances = quota.balances || [];
+    if (!balances.length) { return box.childNodes.length ? box : null; }
+    var groups = quota.plan_groups || [];
+    if (!groups.length) {
+      box.appendChild(axisSection({ kind: "", label: "" }, balances, true));
+      return box;
+    }
+    groups.forEach(function (group, index) {
+      box.appendChild(axisSection(group, balances.filter(function (balance) {
+        return balance.group_index === index;
+      }), true));
     });
     return box;
   }
@@ -798,6 +937,122 @@ const managementPageHTML = `<!DOCTYPE html>
     return dd;
   }
 
+  // ---- Card-face summary helpers -------------------------------------------
+  // The card face answers "is anything wrong, and where" in one glance; every
+  // reading line stays inside the collapsed readings block. Each slot exposes
+  // its verdict as [label, pillClass], the same vocabulary the pills use, so a
+  // chip and its evidence row can never disagree.
+
+  function severityOf(pillClass) {
+    if (pillClass === "pill-ok") { return "ok"; }
+    if (pillClass === "pill-warn") { return "warn"; }
+    if (pillClass === "pill-bad") { return "bad"; }
+    return "";
+  }
+
+  // quotaVerdict reads the entitlement verdict for the face. The reason and
+  // the check instant are evidence and stay in the readings block.
+  function quotaVerdict(quota) {
+    if (!quota) { return ["未查询", ""]; }
+    return QUOTA_STATES[quota.state] || [quota.state || "未知", ""];
+  }
+
+  // planVerdict also scans the per-model allowances: a plan that is identified
+  // but has a model with nothing left is the finding an operator must see on
+  // the face, not behind a fold. An unknown allowance is a warn, not an empty.
+  function planVerdict(plan) {
+    if (!plan) { return ["未读取", ""]; }
+    if (!plan.readable) { return ["读取失败", "pill-warn"]; }
+    var worst = "";
+    Object.keys(plan.models || {}).forEach(function (model) {
+      var allowance = plan.models[model] && plan.models[model].allowance;
+      if (allowance === "empty") { worst = "bad"; }
+      if (allowance === "unknown" && worst !== "bad") { worst = "warn"; }
+    });
+    if (worst === "bad") { return ["模型额度用完", "pill-bad"]; }
+    if (worst === "warn") { return ["模型额度未知", "pill-warn"]; }
+    if (plan.plan_ids && plan.plan_ids.length) { return ["已识别", "pill-ok"]; }
+    return ["无套餐", "pill-warn"];
+  }
+
+  function credentialVerdict(credential) {
+    if (!credential) { return ["未记录", ""]; }
+    return CREDENTIAL_STATES[credential.status] || [credential.status || "未知", ""];
+  }
+
+  function oauthVerdict(oauth) {
+    if (!oauth) { return ["无", ""]; }
+    if (oauth.reauth_required) { return ["需重新授权", "pill-bad"]; }
+    return [oauth.has_access_token ? "材料完整" : "无材料",
+      oauth.has_access_token ? "pill-ok" : ""];
+  }
+
+  function loginVerdict(login) {
+    if (!login) { return ["未记录", ""]; }
+    return ["已关联", "pill-ok"];
+  }
+
+  // accountVerdicts fixes the summary order: the quota verdict first (already
+  // rendered on the face with its bars), then one entry per credential slot for
+  // the chip row. The quota verdict joins only the auto-open check, so a
+  // troubled bucket opens the readings even when every credential pill is calm.
+  function accountVerdicts(account) {
+    return [
+      { term: "额度", verdict: quotaVerdict(account.quota), chip: false },
+      { term: "Start Plan", verdict: planVerdict(account.plan), chip: true },
+      { term: "JWT", verdict: credentialVerdict(account.jwt), chip: true },
+      { term: "API Key", verdict: credentialVerdict(account.api_key), chip: true },
+      { term: "OAuth", verdict: oauthVerdict(account.oauth), chip: true },
+      { term: "登录", verdict: loginVerdict(account.login), chip: true }
+    ];
+  }
+
+  function accountKey(account) {
+    return account.auth_index || account.label || account.identity_hash || "";
+  }
+
+  function chipNode(entry) {
+    var severity = severityOf(entry.verdict[1]);
+    var chip = el("span", "chip" + (severity ? " chip-" + severity : ""));
+    chip.appendChild(text(el("span"), entry.term));
+    chip.appendChild(statusSpan(entry.verdict[0], ""));
+    return chip;
+  }
+
+  // readingsDetails builds the collapsed block holding everything that is only
+  // evidence: the quota reading lines and the credential fact rows. It opens by
+  // itself when any verdict — quota included — is warn or bad; otherwise it
+  // stays shut and the face alone answers. The operator's own toggle wins over
+  // the auto rule until the key is dropped.
+  function readingsDetails(key, verdicts, evidence, facts) {
+    var details = el("details", "readings");
+    var summary = el("summary");
+    text(summary, "额度读数与凭证明细");
+    details.appendChild(summary);
+    var body = el("div", "readings-body");
+    if (evidence) { body.appendChild(evidence); }
+    body.appendChild(facts);
+    details.appendChild(body);
+    var troubled = verdicts.some(function (entry) {
+      var severity = severityOf(entry.verdict[1]);
+      return severity === "warn" || severity === "bad";
+    });
+    var pinned = readingsOpen[key];
+    if (pinned === true || pinned === false) {
+      details.open = pinned;
+    } else if (troubled) {
+      details.open = true;
+    }
+    // The summary click's default action toggles open after this handler runs,
+    // so the operator's choice is the inverse of the value read here. Keying on
+    // the click instead of the toggle event keeps the auto rule from pinning
+    // itself as an operator choice.
+    summary.addEventListener("click", function () {
+      readingsOpen[key] = !details.open;
+    });
+    return details;
+  }
+
   // siteName renders one site's name. An unrecognized site shows as itself
   // rather than as the international one: the plugin keeps an unrecognized site
   // verbatim, and silently relabelling it here would contradict that and promise
@@ -814,13 +1069,15 @@ const managementPageHTML = `<!DOCTYPE html>
     return button;
   }
 
-  // renderAccount mounts one account card. Each credential builder is appended
-  // exactly once; dropping one of these lines would silently lose that
-  // credential section while the card still looks finished.
+  // renderAccount mounts one account card. The face carries the verdicts —
+  // quota verdict plus bars, the chip row, and the actions — and one collapsed
+  // readings block carries the evidence. Each credential builder is appended
+  // exactly once inside that block; dropping one of these lines would silently
+  // lose that credential section while the card still looks finished.
   function renderAccount(account) {
     var card = el("article", "account");
     card.appendChild(text(el("h2"), account.label || account.auth_index || "(未命名)"));
-    card.appendChild(text(el("div", "identity"), account.identity_id || "—"));
+    card.appendChild(text(el("div", "identity"), account.identity_hash || "—"));
     card.appendChild(text(el("div", "identity"), "站点 " + siteName(account.site)));
 
     if (account.read_error) {
@@ -834,13 +1091,21 @@ const managementPageHTML = `<!DOCTYPE html>
     quotaSlot.appendChild(quotaCard(account.quota));
     card.appendChild(quotaSlot);
 
+    var verdictList = accountVerdicts(account);
+    var chips = el("div", "chips");
+    verdictList.forEach(function (entry) {
+      if (entry.chip) { chips.appendChild(chipNode(entry)); }
+    });
+    card.appendChild(chips);
+
     var facts = el("dl", "facts");
     factRow(facts, "Start Plan", planCard(account.plan));
     factRow(facts, "JWT(主凭证)", jwtCard(account.jwt));
     factRow(facts, "API Key(回退)", apiKeyCard(account.api_key));
     factRow(facts, "OAuth", oauthCard(account.oauth));
     factRow(facts, "登录账号", loginCard(account.login));
-    card.appendChild(facts);
+    card.appendChild(readingsDetails(
+      accountKey(account), verdictList, quotaEvidence(account.quota), facts));
 
     var authIndex = account.auth_index || "";
     var group = el("div", "actions");
@@ -859,6 +1124,12 @@ const managementPageHTML = `<!DOCTYPE html>
   // fresh authenticated state response has revalidated the accounts.
   var statusVerified = false;
 
+  // The operator's own open/closed choice per readings block, keyed by account.
+  // It survives every re-render so a refresh never snaps a block the operator
+  // opened — or deliberately closed — back to the auto rule; forgetKey drops
+  // it with the rest of the page state.
+  var readingsOpen = {};
+
   function setCardButtonsDisabled(container, disabled) {
     var buttons = container.querySelectorAll("button");
     for (var i = 0; i < buttons.length; i += 1) {
@@ -872,7 +1143,11 @@ const managementPageHTML = `<!DOCTYPE html>
     }
   }
 
-  var SESSION_STATES = { pending: ["等待授权", "pill-warn"], complete: ["已完成", "pill-ok"] };
+  var SESSION_STATES = {
+    pending: ["等待授权", "pill-warn"],
+    complete: ["已完成", "pill-ok"],
+    cancelled: ["已取消", ""]
+  };
 
   var CACHE_STATES = {
     cached: ["已缓存", "pill-ok"],
@@ -932,8 +1207,18 @@ const managementPageHTML = `<!DOCTYPE html>
       var known = SESSION_STATES[session.state] || [session.state || "未知", ""];
       var td = el("td");
       td.appendChild(statusSpan(known[0], known[1]));
+      // A pending session hedges a whole TTL on the operator finishing a login
+      // somewhere else; the cancel button is how an abandoned attempt ends now
+      // instead of at expiry.
+      if (session.cancellable && session.id) {
+        var stop = el("button", "dismiss");
+        stop.setAttribute("type", "button");
+        text(stop, "取消等待");
+        stop.addEventListener("click", function () { cancelSession(session.id); });
+        td.appendChild(stop);
+      }
       row.appendChild(td);
-      cell(row, session.identity_id || "—");
+      cell(row, session.identity_hash || "—");
       cell(row, session.created_at || "—");
       cell(row, session.expires_at || "—");
       cell(row, session.message || "—");
@@ -1013,17 +1298,116 @@ const managementPageHTML = `<!DOCTYPE html>
     }
   }
 
+  // cancelSession stops one pending authorization by session id and refreshes
+  // the page state afterwards, so the sessions table and the quota evidence
+  // both reflect the cancellation. onDone runs on success only — the modal's
+  // button uses it to close itself, since a cancelled login has nothing left
+  // to wait for.
+  function cancelSession(sessionID, onDone) {
+    apiFetch(ACTION_URL, "POST", { action: "oauth_cancel", auth_index: "", site: "", session_id: sessionID })
+    .then(function (outcome) {
+      if (outcome.ok) {
+        show("已取消本次授权等待。", "");
+        if (onDone) { onDone(); }
+      } else {
+        var error = (outcome.data && outcome.data.error) || {};
+        show("取消失败:" + (error.message || error.code || "未知错误"), "error");
+      }
+      loadState({ silent: true });
+    }).catch(function (failure) {
+      var reason = describeFailure(failure);
+      if (reason) { show("取消未能执行:" + reason, "error"); }
+    });
+  }
+
+  // renderAuthorizeLink turns a started authorization into an unmissable modal:
+  // the operator just pressed a login button, and the flow cannot continue
+  // until this link is opened somewhere. The modal carries the full URL as
+  // selectable text (an operator on a headless or remote host may need to copy
+  // it to another machine's browser), a primary open button, and a copy action.
+  // It is rendered into authorizeSlot, which show() never touches, so no status
+  // line can wipe it — and "稍后再说" dismisses only the dialog, never the
+  // session: the plugin keeps polling either way, and the sessions table below
+  // still lists it.
   function renderAuthorizeLink(session) {
     var url = session.authorize_url;
     if (typeof url !== "string" || url.slice(0, 8) !== "https://") { return; }
-    var line = el("p", "link-cell");
-    var anchor = document.createElement("a");
-    anchor.setAttribute("href", url);
-    anchor.setAttribute("target", "_blank");
-    anchor.setAttribute("rel", "noopener noreferrer");
-    text(anchor, "打开授权页面以完成登录");
-    line.appendChild(anchor);
-    message.appendChild(line);
+    var backdrop = el("div", "modal-backdrop");
+    var modal = el("div", "modal");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.appendChild(text(el("h3"), "打开授权链接完成登录"));
+    modal.appendChild(text(el("p", "modal-sub"),
+      "点击下方按钮在新标签页打开授权页面；若需要在其他设备上登录，请复制完整链接。"));
+    var urlBox = el("div", "url-box");
+    text(urlBox, url);
+    modal.appendChild(urlBox);
+    var actions = el("div", "modal-actions");
+    var open = el("button", "primary");
+    open.setAttribute("type", "button");
+    text(open, "打开授权页面");
+    open.addEventListener("click", function () {
+      var tab = window.open(url, "_blank", "noopener");
+      if (!tab) {
+        // A blocked popup is not a dead end: the URL stays on screen to copy.
+        show("浏览器拦截了弹出窗口，请直接点击或复制上方完整链接。", "error");
+      }
+    });
+    actions.appendChild(open);
+    var copy = el("button");
+    copy.setAttribute("type", "button");
+    text(copy, "复制链接");
+    copy.addEventListener("click", function () {
+      var done = function (ok) {
+        text(copy, ok ? "已复制" : "复制失败，请手动选择链接复制");
+        setTimeout(function () { text(copy, "复制链接"); }, 2000);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(function () { done(true); }, function () { done(false); });
+      } else {
+        var range = document.createRange();
+        range.selectNodeContents(urlBox);
+        var selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        done(document.execCommand("copy"));
+        selection.removeAllRanges();
+      }
+    });
+    actions.appendChild(copy);
+    var later = el("button");
+    later.setAttribute("type", "button");
+    text(later, "稍后再说");
+    // Dismissing clears only the dialog. The session lives on: the plugin keeps
+    // polling and the sessions table still names it, so nothing is stranded.
+    later.addEventListener("click", function () { authorizeSlot.replaceChildren(); });
+    actions.appendChild(later);
+    // A login abandoned on purpose should not have to sit out its whole TTL:
+    // cancelling stops the plugin's poll loop and marks the session cancelled,
+    // and the host's own add-account poll (if one is waiting) observes the
+    // terminal verdict instead of waiting out the clock.
+    if (session.session_id) {
+      var cancelBtn = el("button");
+      cancelBtn.setAttribute("type", "button");
+      text(cancelBtn, "取消本次授权");
+      cancelBtn.addEventListener("click", function () {
+        cancelSession(session.session_id, function () {
+          authorizeSlot.replaceChildren();
+        });
+      });
+      actions.appendChild(cancelBtn);
+    }
+    modal.appendChild(actions);
+    if (session.expires_at) {
+      var expiry = el("p", "expiry");
+      var when = new Date(session.expires_at);
+      text(expiry, "授权链接 " + (isNaN(when.getTime())
+        ? "有效期 " + session.expires_at
+        : "有效至 " + when.toLocaleString()));
+      modal.appendChild(expiry);
+    }
+    backdrop.appendChild(modal);
+    authorizeSlot.replaceChildren(backdrop);
   }
 
   // loadState is the page's only refresh path, and it runs when an operator

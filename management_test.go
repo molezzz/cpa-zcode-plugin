@@ -151,14 +151,14 @@ func (f *managementFixture) callSiteAction(t *testing.T, action, authIndex, site
 	if err != nil {
 		t.Fatal(err)
 	}
-	response := serveManagementHTTP(http.MethodPost, "/v0/management/zcode/action", body)
+	response := serveManagementHTTP(http.MethodPost, "/v0/management/zcode/action", nil, body)
 	return decodeManagementResponse(t, response)
 }
 
 // callState serves the state route and decodes the JSON body.
 func (f *managementFixture) callState(t *testing.T) map[string]any {
 	t.Helper()
-	response := serveManagementHTTP(http.MethodGet, "/v0/management/zcode/state", nil)
+	response := serveManagementHTTP(http.MethodGet, "/v0/management/zcode/state", nil, nil)
 	_, data := decodeManagementResponse(t, response)
 	return data
 }
@@ -251,14 +251,24 @@ func TestManagementRegisterDeclaresRoutes(t *testing.T) {
 		}
 	}
 
-	// Exactly one resource route, and it must carry the Menu label: an empty one
-	// is discarded by the host and yields no navigation entry at all.
-	if len(response.Resources) != 1 {
-		t.Fatalf("resources = %d, want exactly 1 (the page shell): %+v", len(response.Resources), response.Resources)
+	// The chooser is a second resource route and must carry no Menu: a Menu is
+	// what produces a navigation entry, and a login step is not a page an
+	// operator browses to — the host reaches it by opening the URL that
+	// auth.login.start returned. An empty Menu is discarded by the host, which is
+	// exactly right here.
+	if len(response.Resources) != 2 {
+		t.Fatalf("resources = %d, want the page shell and the login chooser: %+v", len(response.Resources), response.Resources)
 	}
 	shell := response.Resources[0]
 	if strings.TrimSpace(shell.Menu) != managementResourceMenu {
 		t.Errorf("resource Menu = %q, want %q", shell.Menu, managementResourceMenu)
+	}
+	chooser := response.Resources[1]
+	if chooser.Path != loginChooserPath {
+		t.Errorf("chooser resource path = %q, want %q", chooser.Path, loginChooserPath)
+	}
+	if strings.TrimSpace(chooser.Menu) != "" {
+		t.Errorf("chooser Menu = %q, want empty so it yields no navigation entry", chooser.Menu)
 	}
 	if strings.TrimSpace(shell.Path) == "" {
 		t.Error("resource route declares no path")
@@ -364,6 +374,10 @@ func TestManagementResourcePathNeverServesData(t *testing.T) {
 // return value is dropped — the card renders plausible but missing a whole
 // section. The assertion is therefore that every builder's result is consumed
 // by the fact-row mount (or the quota slot), not merely invoked.
+//
+// Since the card-face fold (#20): the fact rows are evidence and mount inside
+// the collapsed readings block, so the mount assertions pin the same calls
+// inside renderAccount regardless of which container they land in.
 func TestManagementPageAlignsEveryAccountCard(t *testing.T) {
 	page := managementPageHTML
 	scriptStart := strings.Index(page, "<script>")
@@ -398,6 +412,12 @@ func TestManagementPageAlignsEveryAccountCard(t *testing.T) {
 	if !strings.Contains(script, "appendChild(quotaCard(account.quota))") {
 		t.Error("quotaCard is not appended to the account card; the card loses the quota section")
 	}
+	// The quota evidence is a separate render, not a second quotaCard pass:
+	// dropping its mount would empty the readings block of the per-bucket
+	// reading lines while the card face still looks finished.
+	if !strings.Contains(script, "quotaEvidence(account.quota)") {
+		t.Error("quotaEvidence is not mounted into the readings block; the card loses the quota reading lines")
+	}
 	// appendStack must close by appending to the container and returning that
 	// container: returning the inner stack would strand the verdict outside
 	// the slot it belongs to.
@@ -413,6 +433,83 @@ func TestManagementPageAlignsEveryAccountCard(t *testing.T) {
 		line := call[:min(len(call), 80)]
 		if strings.Contains(line, "text(el(") {
 			t.Errorf("appendStack is handed a built element: %s", strings.TrimSpace(line))
+		}
+	}
+}
+
+// TestManagementPageFoldsEvidenceBehindTheVerdicts pins the card-face fold
+// (#20): an account card must answer "is anything wrong" at face height, with
+// every reading line collapsed into one details block.
+func TestManagementPageFoldsEvidenceBehindTheVerdicts(t *testing.T) {
+	page := managementPageHTML
+	scriptStart := strings.Index(page, "<script>")
+	scriptEnd := strings.LastIndex(page, "</script>")
+	if scriptStart < 0 || scriptEnd < scriptStart {
+		t.Fatal("page carries no script body")
+	}
+	script := page[scriptStart:scriptEnd]
+
+	// The readings block exists, names its contents, and holds both kinds of
+	// evidence: the quota reading lines and the credential fact rows.
+	for _, want := range []string{
+		`el("details", "readings")`,
+		"额度读数与凭证明细",
+		"body.appendChild(evidence)",
+		"body.appendChild(facts)",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the page is missing the readings-block contract: %q", want)
+		}
+	}
+
+	// Auto-open follows the verdicts, not nothing: a warn or bad verdict —
+	// including the quota verdict, which has no chip — must open the block by
+	// itself, so a troubled account is never hidden behind a fold the operator
+	// does not know to look behind.
+	if !strings.Contains(script, "severity === \"warn\" || severity === \"bad\"") {
+		t.Error("the readings block must open by itself on a warn or bad verdict")
+	}
+	// The chip row carries the per-credential verdicts, so the face still says
+	// which slot is troubled without opening anything.
+	for _, want := range []string{`el("div", "chips")`, "chipNode("} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the page is missing the chip-row contract: %q", want)
+		}
+	}
+
+	// The operator's own toggle wins over the auto rule and survives a refresh:
+	// the choice is recorded per account on summary click, replayed before the
+	// auto rule runs, and dropped with the rest of the page state when the key
+	// is forgotten.
+	for _, want := range []string{
+		"var readingsOpen = {};",
+		"readingsOpen[key] = !details.open;",
+		"if (pinned === true || pinned === false) {\n      details.open = pinned;",
+		"readingsOpen = {};",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the page is missing the operator-toggle contract: %q", want)
+		}
+	}
+	// The toggle is read at click time, before the browser flips the open
+	// attribute: keying on the toggle event instead would let the auto rule
+	// pin itself as an operator choice.
+	if !strings.Contains(script, `summary.addEventListener("click"`) {
+		t.Error("the operator's toggle must be captured on the summary click, not on the toggle event")
+	}
+
+	// The quota verdict joins the auto-open check even though it has no chip:
+	// a troubled bucket must open the readings on its own.
+	if !strings.Contains(script, "quotaVerdict(account.quota)") ||
+		!strings.Contains(script, "{ term: \"额度\", verdict: quotaVerdict(account.quota), chip: false }") {
+		t.Error("the quota verdict must join the auto-open check with chip: false")
+	}
+
+	// The face keeps the actions and the summary, so the fold does not cost an
+	// operator the controls.
+	for _, want := range []string{`"refresh_credential"`, `"oauth_retry"`} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the card face lost the action %q behind the fold", want)
 		}
 	}
 }
@@ -665,6 +762,94 @@ func TestManagementPageOffersAKeyResetEntry(t *testing.T) {
 	}
 }
 
+// TestManagementPageKeepsTheAuthorizeLinkOutOfTheStatusLine pins the reason the
+// login buttons appeared to do nothing (#26), and the reason the link then
+// became a modal: a one-line link under the status bar was missed by the very
+// operators it was rendered for.
+//
+// The authorize link was appended into #message, and show() assigns textContent
+// to that element. The refresh that follows every action writes a status line of
+// its own, which destroyed the link microseconds after it was rendered — so the
+// link was created, briefly present in the DOM, and never seen or clicked. The
+// link must therefore live in a container show() never touches, and it must be
+// reachable without depending on any one status line surviving.
+func TestManagementPageKeepsTheAuthorizeLinkOutOfTheStatusLine(t *testing.T) {
+	page := managementPageHTML
+	// The slot is a sibling of the status line, not a child of it.
+	if !strings.Contains(page, `<div id="authorize-slot"></div>`) {
+		t.Error("the page must carry a dedicated authorize-slot container")
+	}
+	slotAt := strings.Index(page, `id="authorize-slot"`)
+	messageAt := strings.Index(page, `id="message"`)
+	if slotAt < 0 || messageAt < 0 {
+		t.Fatal("the page must carry both the status line and the authorize slot")
+	}
+	if strings.Contains(page, `<div id="message" role="status" aria-live="polite"><div id="authorize-slot">`) {
+		t.Error("the authorize slot must not be nested inside #message")
+	}
+	// The render must target the slot. Appending to message.appendChild is the
+	// exact defect, so it is forbidden by name rather than by behaviour.
+	if strings.Contains(page, "message.appendChild(") {
+		t.Error("the authorize link must not be appended into #message; show() assigns textContent and wipes it")
+	}
+	if !strings.Contains(page, "authorizeSlot.replaceChildren(backdrop)") {
+		t.Error("renderAuthorizeLink must render the modal into the authorize slot")
+	}
+	// show() must remain a plain text writer, and loadState must keep writing one:
+	// the fix is the link's location, not a change to how statuses are shown.
+	if !strings.Contains(page, "message.textContent = text_;") {
+		t.Error("show() must keep assigning textContent; the slot is what keeps the link safe")
+	}
+	// A dismissed prompt must not come back on the next refresh, and a forgotten
+	// key must take the prompt with it rather than leave it on screen.
+	if !strings.Contains(page, "authorizeSlot.replaceChildren(); }") {
+		t.Error("dismissing the prompt must clear the slot")
+	}
+	if !strings.Contains(page, "forgetKey") || !strings.Contains(page, "authorizeSlot.replaceChildren();\n    renderEmpty();") {
+		t.Error("forgetKey must clear the authorize slot along with the rest of the page")
+	}
+	// The prompt is the whole point of pressing a login button: it must be
+	// unmissable (a modal dialog), show the full URL as text an operator on a
+	// remote host can carry to another browser, offer both an open button and a
+	// copy action, and survive every status line the page can write.
+	for _, want := range []string{
+		`modal.setAttribute("role", "dialog")`,
+		`modal.setAttribute("aria-modal", "true")`,
+		"text(urlBox, url);",
+		"打开授权页面",
+		"复制链接",
+		"navigator.clipboard.writeText(url)",
+		"session.authorize_url",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing the authorize-modal contract: %q", want)
+		}
+	}
+}
+
+// TestManagementPageOffersCancellingAPendingLogin pins the cancel affordance:
+// an authorization abandoned on purpose must be stoppable now, not at its TTL.
+// The modal carries the button when the action reply names its session, the
+// sessions table carries one for every pending row, and both go through one
+// cancelSession helper that posts oauth_cancel and refreshes the state.
+func TestManagementPageOffersCancellingAPendingLogin(t *testing.T) {
+	page := managementPageHTML
+	for _, want := range []string{
+		"function cancelSession(",
+		`action: "oauth_cancel"`,
+		"session_id: sessionID",
+		"取消本次授权",            // the modal's button label
+		"session.session_id", // the modal button binds to the action reply's handle
+		"取消等待",               // the sessions-table button label
+		"session.cancellable", // only pending rows offer the button
+		"已取消",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page is missing the cancel contract: %q", want)
+		}
+	}
+}
+
 func TestManagementHandleServesPageAndUnknownRoutes(t *testing.T) {
 	request, err := json.Marshal(managementHandleRPC{Method: http.MethodGet, Path: "/v0/management/zcode/page"})
 	if err != nil {
@@ -780,8 +965,17 @@ func TestManagementStateRedactsSecrets(t *testing.T) {
 		t.Fatalf("accounts = %v, want exactly the one plugin account", state["accounts"])
 	}
 	account := accounts[0].(map[string]any)
-	if account["auth_index"] != "auth-redacted" || account["identity_id"] != "zcode-redacted-user" {
+	if account["auth_index"] != "auth-redacted" {
 		t.Fatalf("account identity fields = %+v", account)
+	}
+	// The identity is rendered only as the shared digest: the raw value must not
+	// survive into management data, and the digest must be the same one the
+	// diagnostic lines show.
+	if account["identity_hash"] != identityDiag("zcode-redacted-user") {
+		t.Fatalf("identity_hash = %v, want the shared account digest", account["identity_hash"])
+	}
+	if _, raw := account["identity_id"]; raw {
+		t.Fatalf("account view carries a raw identity_id: %+v", account)
 	}
 	jwtView := account["jwt"].(map[string]any)
 	if jwtView["status"] != "exhausted" || jwtView["last_error_code"] != "upstream_quota_exhausted" {
@@ -852,7 +1046,7 @@ func TestManagementActionValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			response := serveManagementHTTP(http.MethodPost, "/v0/management/zcode/action", []byte(tc.body))
+			response := serveManagementHTTP(http.MethodPost, "/v0/management/zcode/action", nil, []byte(tc.body))
 			status, data := decodeManagementResponse(t, response)
 			if status != tc.status {
 				t.Fatalf("status = %d body %v, want %d", status, data, tc.status)
@@ -865,7 +1059,7 @@ func TestManagementActionValidation(t *testing.T) {
 	}
 
 	// A body that is not JSON at all is a request error, not a panic.
-	response := serveManagementHTTP(http.MethodPost, "/v0/management/zcode/action", []byte("{not json"))
+	response := serveManagementHTTP(http.MethodPost, "/v0/management/zcode/action", nil, []byte("{not json"))
 	if status, _ := decodeManagementResponse(t, response); status != http.StatusBadRequest {
 		t.Fatalf("malformed body status = %d, want 400", status)
 	}
@@ -1227,6 +1421,125 @@ func TestOAuthRetryUpstreamFailureIsSanitized(t *testing.T) {
 	}
 	if data["error"].(map[string]any)["code"] != "oauth_upstream_failed" {
 		t.Fatalf("error = %v, want oauth_upstream_failed", data["error"])
+	}
+}
+
+// callSessionAction is callAction with an explicit session_id; it is how the
+// tests speak to oauth_cancel, which names a session rather than an account.
+func (f *managementFixture) callSessionAction(t *testing.T, action, sessionID string) (int, map[string]any) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"action": action, "auth_index": "", "site": "", "session_id": sessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveManagementHTTP(http.MethodPost, "/v0/management/zcode/action", nil, body)
+	return decodeManagementResponse(t, response)
+}
+
+// TestOAuthCancelStopsPendingSession pins the operator's way out of an
+// abandoned login: the started session turns terminal "cancelled" immediately
+// instead of sitting out its TTL, the state view reflects it, and a second
+// cancel finds nothing left to stop.
+func TestOAuthCancelStopsPendingSession(t *testing.T) {
+	oauth := newUpstreamFixture(t)
+	fixture := newManagementFixtureOver(t, oauth)
+	fixture.accountDoc(t, "auth-cancel", "zcode-cancel-user", "invalid", "key-old")
+
+	// The poll stays pending forever: without a cancel, this session would sit
+	// out its whole TTL while the plugin polls every interval.
+	oauth.queuePoll(http.StatusOK, `{"data":{"status":"pending"}}`)
+
+	status, data := fixture.callSiteAction(t, actionOAuthRetry, "auth-cancel", siteZai)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body %v, want 200", status, data)
+	}
+	session := data["session"].(map[string]any)
+	sessionID, ok := session["session_id"].(string)
+	if !ok || sessionID == "" {
+		t.Fatalf("action reply session = %v, want a session_id", session)
+	}
+
+	// The pending session appears in the state view as cancellable, and the
+	// session id is the only handle the page needs.
+	state := fixture.callState(t)
+	var pending map[string]any
+	for _, raw := range state["sessions"].([]any) {
+		entry := raw.(map[string]any)
+		if entry["id"] == sessionID {
+			pending = entry
+		}
+	}
+	if pending == nil {
+		t.Fatal("the started session is missing from the state view")
+	}
+	if pending["state"] != string(authSessionPending) || pending["cancellable"] != true {
+		t.Fatalf("pending session view = %v, want pending+cancellable", pending)
+	}
+
+	// The cancel itself.
+	status, data = fixture.callSessionAction(t, actionOAuthCancel, sessionID)
+	if status != http.StatusOK {
+		t.Fatalf("cancel status = %d body %v, want 200", status, data)
+	}
+	cancelled := data["cancelled"].(map[string]any)
+	if cancelled["session_id"] != sessionID || cancelled["state"] != string(authSessionCancelled) {
+		t.Fatalf("cancel reply = %v", cancelled)
+	}
+
+	// The state view now reads cancelled and nothing is cancellable.
+	state = fixture.callState(t)
+	rendered, err := json.Marshal(state["sessions"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionsJSON := string(rendered)
+	if strings.Contains(sessionsJSON, `"cancellable"`) {
+		t.Errorf("no session may remain cancellable after the cancel: %s", sessionsJSON)
+	}
+	if !strings.Contains(sessionsJSON, string(authSessionCancelled)) {
+		t.Fatalf("sessions = %s, want a cancelled entry", sessionsJSON)
+	}
+
+	// A second cancel finds an already-terminal session and says so.
+	status, data = fixture.callSessionAction(t, actionOAuthCancel, sessionID)
+	if status != http.StatusNotFound {
+		t.Fatalf("second cancel status = %d body %v, want 404", status, data)
+	}
+	if data["error"].(map[string]any)["code"] != "unknown_session" {
+		t.Fatalf("second cancel error = %v, want unknown_session", data["error"])
+	}
+
+	// oauth_cancel names a session, not an account: an auth_index is refused
+	// before anything is looked up.
+	status, data = fixture.callSessionActionWithIndex(t, actionOAuthCancel, sessionID, "auth-cancel")
+	if status != http.StatusBadRequest {
+		t.Fatalf("cancel with auth_index status = %d, want 400", status)
+	}
+	_ = data
+}
+
+// callSessionActionWithIndex is callSessionAction with an auth_index injected,
+// for asserting the cancel route's refusal of account-granular spellings.
+func (f *managementFixture) callSessionActionWithIndex(t *testing.T, action, sessionID, authIndex string) (int, map[string]any) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"action": action, "auth_index": authIndex, "site": "", "session_id": sessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveManagementHTTP(http.MethodPost, "/v0/management/zcode/action", nil, body)
+	return decodeManagementResponse(t, response)
+}
+
+// TestOAuthCancelRequiresSessionID pins the shape error: a cancel without a
+// session id names nothing and must be refused before any lookup.
+func TestOAuthCancelRequiresSessionID(t *testing.T) {
+	fixture := newManagementFixture(t)
+	status, data := fixture.callSessionAction(t, actionOAuthCancel, "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d body %v, want 400", status, data)
+	}
+	if data["error"].(map[string]any)["code"] != "invalid_request" {
+		t.Fatalf("error = %v, want invalid_request", data["error"])
 	}
 }
 

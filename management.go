@@ -50,6 +50,8 @@ var managementResourcePagePath = managementResourcePrefix + pluginID + managemen
 // The fixed action vocabulary of the management plane. Account-granular
 // actions require an explicit auth_index; the login and batch actions require
 // none, because each works from a site or over every account instead of from one.
+// oauth_cancel names a session instead of an account, so it alone carries
+// session_id and is routed before the auth_index validation.
 const (
 	actionRefreshCredential = "refresh_credential"
 	actionRefreshQuota      = "refresh_quota"
@@ -57,6 +59,7 @@ const (
 	actionOAuthRetry        = "oauth_retry"
 	actionOAuthLogin        = "oauth_login"
 	actionBatchRefresh      = "batch_refresh"
+	actionOAuthCancel       = "oauth_cancel"
 )
 
 // handleManagementRegister declares the plugin's management routes. The
@@ -93,6 +96,10 @@ func handleManagementRegister(request []byte) ([]byte, error) {
 				Menu:        managementResourceMenu,
 				Description: "ZCode provider management page",
 			},
+			{
+				Path:        loginChooserPath,
+				Description: "Choose the ZCode site for one host-driven login",
+			},
 		},
 	})
 }
@@ -116,7 +123,7 @@ func handleManagementHandle(request []byte) ([]byte, error) {
 			return errorEnvelope("invalid_request", "decode management.handle request: "+err.Error(), http.StatusBadRequest), nil
 		}
 	}
-	response := serveManagementHTTP(strings.ToUpper(strings.TrimSpace(req.Method)), strings.TrimSpace(req.Path), req.Body)
+	response := serveManagementHTTP(strings.ToUpper(strings.TrimSpace(req.Method)), strings.TrimSpace(req.Path), req.Query, req.Body)
 	return okEnvelope(response)
 }
 
@@ -127,14 +134,21 @@ func handleManagementHandle(request []byte) ([]byte, error) {
 // /v0/resource/plugins/<id>/ path and no body, which is why the resource
 // surface is settled before the management routes rather than as one more case
 // among them.
-func serveManagementHTTP(method, path string, body []byte) pluginapi.ManagementResponse {
+func serveManagementHTTP(method, path string, query map[string][]string, body []byte) pluginapi.ManagementResponse {
 	if isResourcePath(path) {
-		// A resource path is unauthenticated by construction. Only the shell may
-		// answer one: the suffix matches below would otherwise serve account
-		// state to any anonymous GET, which is the boundary this route exists to
-		// keep intact rather than to erode.
-		if method == http.MethodGet && strings.HasSuffix(path, managementResourcePagePath) {
+		// A resource path is unauthenticated by construction. Only the shell and
+		// the login chooser may answer one: the suffix matches below would
+		// otherwise serve account state to any anonymous GET, which is the
+		// boundary this route exists to keep intact rather than to erode.
+		//
+		// The chooser earns its place here because it renders no account state:
+		// its whole input is the one-time token the host was just handed, and
+		// that token is the entire capability it acts on.
+		switch {
+		case method == http.MethodGet && strings.HasSuffix(path, managementResourcePagePath):
 			return managementPageResponse()
+		case method == http.MethodGet && strings.HasSuffix(path, loginChooserPath):
+			return handleLoginChooser(query)
 		}
 		return managementErrorResponse(http.StatusNotFound, "unknown_route", "this management route does not exist")
 	}
@@ -267,10 +281,14 @@ func (s managementService) state(ctx context.Context, now time.Time) managementS
 // credential states, the OAuth material's presence, and the last quota
 // observation.
 type accountView struct {
-	AuthIndex  string `json:"auth_index"`
-	FileName   string `json:"file_name,omitempty"`
-	Label      string `json:"label,omitempty"`
-	IdentityID string `json:"identity_id,omitempty"`
+	AuthIndex string `json:"auth_index"`
+	FileName  string `json:"file_name,omitempty"`
+	Label     string `json:"label,omitempty"`
+	// IdentityHash is the record's account identity as the shared digest, never
+	// the raw value: the raw identity is the host auth file's primary key, and
+	// the management plane — like the diagnostic log — renders only the digest
+	// the same record shows in log lines.
+	IdentityHash string `json:"identity_hash,omitempty"`
 	// Site is the ZCode site this account belongs to. An operator with accounts
 	// on both sites sees them as the same kind of record otherwise, and the only
 	// way to tell a domestic account's plan apart from an international one is to
@@ -450,7 +468,7 @@ func (s managementService) accountView(ctx context.Context, entry pluginapi.Host
 		view.ReadError = "auth document is not a readable ZCode record"
 		return view
 	}
-	view.IdentityID = namespace.IdentityID
+	view.IdentityHash = identityDiag(namespace.IdentityID)
 	view.Site = namespace.Site
 	view.JWT = namespace.JWT
 	view.APIKey = namespace.APIKey
@@ -673,6 +691,12 @@ type managementActionRequest struct {
 	// working account with a login to the wrong one. Every other action ignores
 	// it, because a record's site is its own, not something an action chooses.
 	Site string `json:"site"`
+	// SessionID names the authorization session an oauth_cancel targets. It is
+	// the session's own handle as the state view exposes it — the same 256-bit
+	// random token the host holds as login State — and only oauth_cancel reads
+	// it. An unknown or already-terminal id answers "not cancellable" rather
+	// than being silently accepted.
+	SessionID string `json:"session_id"`
 }
 
 // runManagementAction dispatches one action POST. Malformed input, unknown
@@ -706,6 +730,7 @@ func (s managementService) action(ctx context.Context, body []byte, now time.Tim
 	// upstream accepts. An unrecognized spelling is reported as one, which is
 	// more useful than quietly authorizing at the other site.
 	req.Site = strings.TrimSpace(req.Site)
+	req.SessionID = strings.TrimSpace(req.SessionID)
 
 	if req.Action == actionBatchRefresh {
 		if req.AuthIndex != "" {
@@ -726,6 +751,16 @@ func (s managementService) action(ctx context.Context, body []byte, now time.Tim
 				"oauth_login requires site to be one of: "+strings.Join(knownSites, ", "))
 		}
 		return s.oauthLogin(req.Site)
+	}
+
+	// Cancelling names a session, not an account: it must be routed before the
+	// auth_index validation, whose 404 speaks in accounts. It takes no site —
+	// the session already knows where it was headed.
+	if req.Action == actionOAuthCancel {
+		if req.AuthIndex != "" {
+			return managementErrorResponse(http.StatusBadRequest, "invalid_request", "oauth_cancel takes session_id, not auth_index")
+		}
+		return s.oauthCancel(req.SessionID)
 	}
 
 	switch req.Action {
@@ -994,6 +1029,50 @@ func (s managementService) oauthLogin(site string) pluginapi.ManagementResponse 
 	})
 }
 
+// oauthCancel stops one pending authorization session at the operator's
+// request. Both halves of the wait must end: the management poll loop is
+// cancelled, and the session itself moves to the terminal "cancelled" state so
+// the host-driven poll path (a native add-account flow still waiting on this
+// session id) observes a final verdict instead of polling until the TTL. A
+// session that already completed or failed keeps that outcome — cancel can
+// never overwrite a landed credential.
+func (s managementService) oauthCancel(sessionID string) pluginapi.ManagementResponse {
+	if sessionID == "" {
+		return managementErrorResponse(http.StatusBadRequest, "invalid_request", "oauth_cancel requires session_id")
+	}
+	// Stop the loop first: a cancelled loop cannot observe the state change
+	// mid-flight, and the poll goroutine's deferred cleanup then never re-mints
+	// an entry for a session that is already terminal.
+	managementOAuth.stop(sessionID)
+	if !activeSessions.cancel(sessionID) {
+		return managementErrorResponse(http.StatusNotFound, "unknown_session",
+			"no pending authorization session matches this id; it may have already finished, expired, or been cancelled")
+	}
+	diagf("oauth_cancel session=%s cancelled=true", sessionDiag(sessionID))
+	return actionResult(map[string]any{
+		"action": actionOAuthCancel,
+		"cancelled": map[string]any{
+			"session_id": sessionID,
+			"state":      string(authSessionCancelled),
+		},
+	})
+}
+
+// sessionDiag renders one session id for a diagnostic line. The session id is
+// the flow's own capability — it names the session to the host's poll loop —
+// so the log carries only a fixed prefix of it, enough to correlate lines but
+// not enough to hijack a live flow from the log file alone.
+func sessionDiag(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return "(none)"
+	}
+	if len(sessionID) < 12 {
+		return "(short-id)"
+	}
+	return sessionID[:8] + "…"
+}
+
 // oauthSessionStart creates an authorization session for one site and hands it to
 // the plugin's own bounded poll loop, which completes the login into the host
 // auth store — the step the host performs for native logins. It creates a session
@@ -1017,6 +1096,11 @@ func (s managementService) oauthSessionStart(site string, payload map[string]any
 	managementOAuth.start(session, s.store, s.cfg)
 	payload["site"] = site
 	payload["session"] = map[string]any{
+		// The session id is the handle the page's cancel button sends back.
+		// It is the session's own unguessable token, safe to expose on the
+		// authenticated management plane: it opens no URL and reads no data,
+		// and only oauth_cancel consumes it.
+		"session_id":    session.id,
 		"state":         string(authSessionPending),
 		"authorize_url": session.authorizeURL,
 		"expires_at":    session.expiresAt.UTC().Format(time.RFC3339),
@@ -1026,10 +1110,10 @@ func (s managementService) oauthSessionStart(site string, payload map[string]any
 
 // batchOutcomeView is one account's line in a batch summary.
 type batchOutcomeView struct {
-	AuthIndex  string `json:"auth_index"`
-	IdentityID string `json:"identity_id,omitempty"`
-	Outcome    string `json:"outcome"` // "ok" | "failed" | "skipped"
-	Message    string `json:"message,omitempty"`
+	AuthIndex    string `json:"auth_index"`
+	IdentityHash string `json:"identity_hash,omitempty"`
+	Outcome      string `json:"outcome"` // "ok" | "failed" | "skipped"
+	Message      string `json:"message,omitempty"`
 }
 
 // batchRefresh snapshots every account first, then refreshes credentials and
@@ -1109,7 +1193,7 @@ func (s managementService) batchRefresh(ctx context.Context, now time.Time) plug
 // when a JWT exists, its quota. A busy identity lock is a skip, not an
 // error — the batch reports it and moves on.
 func (s managementService) batchRefreshOne(ctx context.Context, authIndex, identityID string, doc []byte, now time.Time) batchOutcomeView {
-	result := batchOutcomeView{AuthIndex: authIndex, IdentityID: identityID}
+	result := batchOutcomeView{AuthIndex: authIndex, IdentityHash: identityDiag(identityID)}
 	if len(bytes.TrimSpace(doc)) == 0 {
 		result.Outcome = "failed"
 		result.Message = "the account's credential record could not be read"
